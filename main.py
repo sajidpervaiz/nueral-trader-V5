@@ -133,6 +133,10 @@ async def main() -> None:
     await stop_event.wait()
     logger.info("Initiating graceful shutdown…")
 
+    # Close executors first
+    for executor in executors:
+        await executor.close()
+
     for task in tasks:
         task.cancel()
 
