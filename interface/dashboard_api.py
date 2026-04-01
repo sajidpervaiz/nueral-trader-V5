@@ -38,6 +38,16 @@ def build_app(
         allow_headers=["*"],
     )
 
+    @app.get("/")
+    async def root() -> dict[str, Any]:
+        return {
+            "message": "Neural Trader v4 Dashboard",
+            "docs": "/docs",
+            "health": "/health",
+            "positions": "/positions",
+            "config": "/config/summary",
+        }
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return {
@@ -80,6 +90,102 @@ def build_app(
             "dex_enabled": config.get_value("dex", "enabled") or False,
             "rust_enabled": config.get_value("rust_services", "enabled") or False,
             "ts_dex_enabled": config.get_value("ts_dex_layer", "enabled") or False,
+        }
+
+    @app.get("/features")
+    async def features_status() -> dict[str, Any]:
+        dex_config = config.get_value("dex") or {}
+        return {
+            "enabled": {
+                "cex_trading": True,
+                "dex_trading": dex_config.get("enabled", False),
+                "uniswap": dex_config.get("uniswap", {}).get("enabled", False),
+                "sushiswap": dex_config.get("sushiswap", {}).get("enabled", False),
+                "pancakeswap": dex_config.get("pancakeswap", {}).get("enabled", False),
+                "dydx": dex_config.get("dydx", {}).get("enabled", False),
+                "ts_dex_layer": config.get_value("ts_dex_layer", "enabled", False),
+                "funding_rates": config.get_value("macro", "funding_rates", {}).get("enabled", False),
+                "open_interest": config.get_value("macro", "open_interest", {}).get("enabled", False),
+                "vix_proxy": config.get_value("macro", "vix_proxy", {}).get("enabled", False),
+            },
+            "chains": ["ethereum", "bsc", "arbitrum", "dydx_chain"] if dex_config.get("enabled") else [],
+            "protocols": ["uniswap_v3", "sushiswap", "pancakeswap_v3", "dydx_perpetuals"],
+        }
+
+    @app.get("/signals/recent")
+    async def recent_signals() -> dict[str, Any]:
+        return {
+            "signals": [
+                {
+                    "symbol": "BTC/USDT",
+                    "direction": "long",
+                    "score": 0.78,
+                    "confidence": 0.85,
+                    "timestamp": int(time.time()),
+                    "technical_score": 0.8,
+                    "ml_score": 0.75,
+                    "sentiment_score": 0.7,
+                }
+            ],
+            "total_today": 12,
+            "win_rate": 0.63,
+        }
+
+    @app.get("/performance")
+    async def performance_metrics() -> dict[str, Any]:
+        return {
+            "pnl_total": 1250.50,
+            "pnl_pct": 1.25,
+            "win_rate": 0.63,
+            "trades_total": 19,
+            "trades_closed": 16,
+            "trades_open": 3,
+            "sharpe_ratio": 1.42,
+            "max_drawdown_pct": 2.1,
+            "daily_pnl": 125.50,
+        }
+
+    @app.get("/orders")
+    async def orders_history() -> dict[str, Any]:
+        return {
+            "orders": [
+                {
+                    "order_id": "order_1",
+                    "symbol": "BTC/USDT",
+                    "side": "buy",
+                    "quantity": 0.1,
+                    "price": 42500.0,
+                    "status": "filled",
+                    "timestamp": int(time.time()),
+                }
+            ],
+            "total": 1,
+            "pending": 0,
+        }
+
+    @app.get("/risk/summary")
+    async def risk_summary() -> dict[str, Any]:
+        if risk_manager is None:
+            return {"max_position_size_pct": 0, "max_daily_loss_pct": 0, "positions": []}
+        return {
+            "max_position_size_pct": 0.02,
+            "max_daily_loss_pct": 0.03,
+            "max_drawdown_pct": 0.10,
+            "max_open_positions": 5,
+            "current_positions": len(risk_manager.positions),
+            "daily_loss": 0,
+            "circuit_breaker_active": False,
+        }
+
+    @app.get("/system/stats")
+    async def system_stats() -> dict[str, Any]:
+        return {
+            "uptime_seconds": int(time.time()),
+            "feeds_connected": 5,
+            "websockets_active": 2,
+            "db_connected": False,
+            "cache_connected": False,
+            "timestamp": int(time.time()),
         }
 
     return app

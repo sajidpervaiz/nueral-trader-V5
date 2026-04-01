@@ -56,7 +56,7 @@ exchanges:
 
 # ── DEX configurations ────────────────────────────────────────────────────────
 dex:
-  enabled: false
+  enabled: true
 
   networks:
     ethereum:
@@ -78,7 +78,7 @@ dex:
       explorer: "https://arbiscan.io"
 
   uniswap:
-    enabled: false
+    enabled: true
     network: ethereum
     factory_v3: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
     quoter_v2: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
@@ -87,20 +87,20 @@ dex:
     max_slippage_bps: 50
 
   sushiswap:
-    enabled: false
+    enabled: true
     network: ethereum
     router: "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F"
     max_slippage_bps: 50
 
   pancakeswap:
-    enabled: false
+    enabled: true
     network: bsc
     router_v2: "0x10ED43C718714eb63d5aA57B78B54704E256024E"
     router_v3: "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4"
     max_slippage_bps: 50
 
   dydx:
-    enabled: false
+    enabled: true
     network: dydx_chain
     rest_endpoint: "${DYDX_REST_ENDPOINT}"
     ws_endpoint: "${DYDX_WS_ENDPOINT}"
@@ -196,7 +196,7 @@ rust_services:
 
 # ── TypeScript DEX layer ──────────────────────────────────────────────────────
 ts_dex_layer:
-  enabled: false
+  enabled: true
   grpc_host: "${TS_DEX_HOST:-localhost}"
   grpc_port: 50051
   health_check_interval_seconds: 30
