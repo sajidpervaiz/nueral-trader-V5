@@ -1,0 +1,161 @@
+version: "3.9"
+
+x-common-env: &common-env
+  POSTGRES_HOST: postgres
+  POSTGRES_USER: trader
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trader123}
+  REDIS_HOST: redis
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+  TZ: UTC
+
+services:
+  # ── Core infrastructure ────────────────────────────────────────────────────
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: neural_trader
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trader123}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d neural_trader"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes ${REDIS_PASSWORD:+--requirepass} ${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Python trading engine ──────────────────────────────────────────────────
+  trader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET:-}
+      BYBIT_API_KEY: ${BYBIT_API_KEY:-}
+      BYBIT_API_SECRET: ${BYBIT_API_SECRET:-}
+      OKX_API_KEY: ${OKX_API_KEY:-}
+      OKX_API_SECRET: ${OKX_API_SECRET:-}
+      OKX_PASSPHRASE: ${OKX_PASSPHRASE:-}
+      KRAKEN_API_KEY: ${KRAKEN_API_KEY:-}
+      KRAKEN_API_SECRET: ${KRAKEN_API_SECRET:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    ports:
+      - "8000:8000"
+      - "9090:9090"
+    volumes:
+      - ./logs:/app/logs
+      - ./models:/app/models
+      - ./config:/app/config:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── TypeScript DEX layer ───────────────────────────────────────────────────
+  dex-layer:
+    build:
+      context: ./ts/dex-layer
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+      HTTP_PORT: "3001"
+      ETH_RPC_HTTP: ${ETH_RPC_HTTP:-}
+      ETH_RPC_WS: ${ETH_RPC_WS:-}
+      BSC_RPC_HTTP: ${BSC_RPC_HTTP:-}
+      ARB_RPC_HTTP: ${ARB_RPC_HTTP:-}
+      WALLET_PRIVATE_KEY: ${WALLET_PRIVATE_KEY:-}
+      MAX_SLIPPAGE_BPS: "50"
+      LOG_LEVEL: info
+    ports:
+      - "3001:3001"
+    profiles:
+      - dex
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Jupyter research environment ────────────────────────────────────────────
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: python-base
+    command: >
+      jupyter lab
+        --ip=0.0.0.0
+        --port=8888
+        --no-browser
+        --NotebookApp.token=${JUPYTER_TOKEN:-}
+        --NotebookApp.allow_root=True
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./research:/app/research
+      - ./:/app:ro
+      - jupyter_data:/root/.jupyter
+    profiles:
+      - research
+
+  # ── Grafana dashboard ──────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.3
+    restart: unless-stopped
+    depends_on:
+      - trader
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    profiles:
+      - monitoring
+
+volumes:
+  postgres_data:
+  redis_data:
+  grafana_data:
+  jupyter_data:

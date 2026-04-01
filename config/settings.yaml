@@ -1,0 +1,223 @@
+system:
+  name: neural-trader-v4
+  version: "4.0.0"
+  paper_mode: true
+  log_level: INFO
+  log_dir: logs
+  timezone: UTC
+
+# ── Exchange configurations ───────────────────────────────────────────────────
+exchanges:
+  binance:
+    enabled: true
+    api_key: "${BINANCE_API_KEY}"
+    api_secret: "${BINANCE_API_SECRET}"
+    type: futures
+    testnet: true
+    symbols:
+      - BTC/USDT:USDT
+      - ETH/USDT:USDT
+      - SOL/USDT:USDT
+    rate_limit_rpm: 1200
+
+  bybit:
+    enabled: false
+    api_key: "${BYBIT_API_KEY}"
+    api_secret: "${BYBIT_API_SECRET}"
+    type: future
+    testnet: true
+    symbols:
+      - BTC/USDT:USDT
+      - ETH/USDT:USDT
+    rate_limit_rpm: 600
+
+  okx:
+    enabled: false
+    api_key: "${OKX_API_KEY}"
+    api_secret: "${OKX_API_SECRET}"
+    passphrase: "${OKX_PASSPHRASE}"
+    type: swap
+    testnet: true
+    symbols:
+      - BTC-USDT-SWAP
+      - ETH-USDT-SWAP
+    rate_limit_rpm: 600
+
+  kraken:
+    enabled: false
+    api_key: "${KRAKEN_API_KEY}"
+    api_secret: "${KRAKEN_API_SECRET}"
+    type: future
+    testnet: true
+    symbols:
+      - PF_XBTUSD
+      - PF_ETHUSD
+    rate_limit_rpm: 300
+
+# ── DEX configurations ────────────────────────────────────────────────────────
+dex:
+  enabled: false
+
+  networks:
+    ethereum:
+      rpc_http: "${ETH_RPC_HTTP}"
+      rpc_ws: "${ETH_RPC_WS}"
+      chain_id: 1
+      explorer: "https://etherscan.io"
+
+    bsc:
+      rpc_http: "${BSC_RPC_HTTP}"
+      rpc_ws: "${BSC_RPC_WS}"
+      chain_id: 56
+      explorer: "https://bscscan.com"
+
+    arbitrum:
+      rpc_http: "${ARB_RPC_HTTP}"
+      rpc_ws: "${ARB_RPC_WS}"
+      chain_id: 42161
+      explorer: "https://arbiscan.io"
+
+  uniswap:
+    enabled: false
+    network: ethereum
+    factory_v3: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+    quoter_v2: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+    swap_router_02: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
+    fee_tiers: [100, 500, 3000, 10000]
+    max_slippage_bps: 50
+
+  sushiswap:
+    enabled: false
+    network: ethereum
+    router: "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F"
+    max_slippage_bps: 50
+
+  pancakeswap:
+    enabled: false
+    network: bsc
+    router_v2: "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+    router_v3: "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4"
+    max_slippage_bps: 50
+
+  dydx:
+    enabled: false
+    network: dydx_chain
+    rest_endpoint: "${DYDX_REST_ENDPOINT}"
+    ws_endpoint: "${DYDX_WS_ENDPOINT}"
+    mnemonic: "${DYDX_MNEMONIC}"
+
+# ── Macro data feeds ──────────────────────────────────────────────────────────
+macro:
+  funding_rates:
+    enabled: true
+    sources:
+      - binance
+      - bybit
+      - okx
+    fetch_interval_seconds: 300
+    arbitrage_threshold_bps: 20
+
+  open_interest:
+    enabled: true
+    sources:
+      - binance
+      - bybit
+      - okx
+    fetch_interval_seconds: 300
+
+  vix_proxy:
+    enabled: true
+    method: realized_vol
+    lookback_periods: [7, 14, 30]
+    deribit_enabled: false
+    deribit_api: "${DERIBIT_API_KEY}"
+
+# ── Risk management ───────────────────────────────────────────────────────────
+risk:
+  max_position_size_pct: 0.02
+  max_daily_loss_pct: 0.03
+  max_drawdown_pct: 0.10
+  max_open_positions: 5
+  default_leverage: 1.0
+  stop_loss_pct: 0.015
+  take_profit_pct: 0.03
+  kelly_fraction: 0.25
+  min_liquidity_usd: 100000
+
+# ── Signal engine ─────────────────────────────────────────────────────────────
+signals:
+  timeframes: [1m, 5m, 15m, 1h, 4h, 1d]
+  primary_timeframe: 15m
+  confirmation_timeframes: [1h, 4h]
+  min_score_threshold: 0.65
+  ml_weight: 0.4
+  technical_weight: 0.4
+  sentiment_weight: 0.1
+  macro_weight: 0.1
+
+# ── Backtester ────────────────────────────────────────────────────────────────
+backtest:
+  initial_capital: 100000
+  commission_pct: 0.0004
+  slippage_pct: 0.0002
+  use_rust_engine: true
+  wfo_splits: 5
+  monte_carlo_runs: 1000
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+storage:
+  postgres:
+    host: "${POSTGRES_HOST:-localhost}"
+    port: 5432
+    database: neural_trader
+    user: "${POSTGRES_USER:-trader}"
+    password: "${POSTGRES_PASSWORD}"
+    pool_size: 10
+    timescaledb: true
+
+  redis:
+    host: "${REDIS_HOST:-localhost}"
+    port: 6379
+    db: 0
+    password: "${REDIS_PASSWORD:-}"
+    pool_size: 20
+    default_ttl_seconds: 300
+
+# ── Rust hot-path services ────────────────────────────────────────────────────
+rust_services:
+  enabled: true
+  fallback_to_python: true
+  tick_parser:
+    batch_size: 1000
+    channel: "ticks:raw"
+  order_matcher:
+    max_depth: 500
+    channel: "orders:matches"
+
+# ── TypeScript DEX layer ──────────────────────────────────────────────────────
+ts_dex_layer:
+  enabled: false
+  grpc_host: "${TS_DEX_HOST:-localhost}"
+  grpc_port: 50051
+  health_check_interval_seconds: 30
+  quote_cache_ttl_seconds: 10
+
+# ── Jupyter research ──────────────────────────────────────────────────────────
+jupyter:
+  enabled: false
+  port: 8888
+  token: "${JUPYTER_TOKEN:-}"
+  allow_root: false
+
+# ── Observability ─────────────────────────────────────────────────────────────
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+  dashboard_api:
+    host: "0.0.0.0"
+    port: 8000
+  telegram:
+    enabled: false
+    token: "${TELEGRAM_BOT_TOKEN}"
+    chat_id: "${TELEGRAM_CHAT_ID}"

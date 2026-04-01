@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+from typing import Any
+
+from loguru import logger
+
+from core.config import Config
+from core.event_bus import EventBus
+from execution.cex_executor import CEXExecutor
+from execution.bybit_executor import BybitExecutor
+from execution.okx_executor import OKXExecutor
+from execution.kraken_executor import KrakenExecutor
+from execution.risk_manager import RiskManager
+
+
+_EXECUTOR_MAP: dict[str, type[CEXExecutor]] = {
+    "binance": CEXExecutor,
+    "bybit": BybitExecutor,
+    "okx": OKXExecutor,
+    "kraken": KrakenExecutor,
+}
+
+
+def create_executor(
+    exchange_id: str,
+    config: Config,
+    event_bus: EventBus,
+    risk_manager: RiskManager,
+) -> CEXExecutor | None:
+    cls = _EXECUTOR_MAP.get(exchange_id.lower())
+    if cls is None:
+        logger.warning("No executor class for exchange '{}'", exchange_id)
+        return None
+
+    cfg = config.get_value("exchanges", exchange_id) or {}
+    if not cfg.get("enabled", False):
+        logger.debug("Exchange '{}' is disabled — skipping executor creation", exchange_id)
+        return None
+
+    if exchange_id == "binance":
+        executor = CEXExecutor(config, event_bus, risk_manager, exchange_id="binance")
+    else:
+        executor = cls(config, event_bus, risk_manager)
+
+    logger.info("Created executor for '{}'", exchange_id)
+    return executor
+
+
+def create_all_executors(
+    config: Config,
+    event_bus: EventBus,
+    risk_manager: RiskManager,
+) -> list[CEXExecutor]:
+    exchanges_cfg = config.get_value("exchanges") or {}
+    executors = []
+    for exchange_id in exchanges_cfg:
+        executor = create_executor(exchange_id, config, event_bus, risk_manager)
+        if executor is not None:
+            executors.append(executor)
+    logger.info("Created {} CEX executor(s)", len(executors))
+    return executors
