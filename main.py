@@ -34,6 +34,7 @@ from engine.signal_generator import SignalGenerator
 from execution.risk_manager import RiskManager
 from execution.order_manager import OrderManager
 from execution.exchange_factory import create_all_executors
+from execution.smart_order_router import SmartOrderRouter
 
 from storage.db_handler import DBHandler
 from storage.cache import Cache
@@ -89,6 +90,14 @@ async def main() -> None:
     order_mgr = OrderManager(config, event_bus, risk_mgr._circuit_breaker)
 
     executors = create_all_executors(config, event_bus, risk_mgr)
+
+    by_exchange = {getattr(executor, "exchange_id", ""): executor for executor in executors}
+    smart_router = SmartOrderRouter(
+        binance_executor=by_exchange.get("binance"),
+        bybit_executor=by_exchange.get("bybit"),
+        okx_executor=by_exchange.get("okx"),
+    )
+    order_mgr.attach_router(smart_router)
 
     telegram = TelegramNotifier(config, event_bus)
 

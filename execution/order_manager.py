@@ -8,7 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from core.config import Config
@@ -179,9 +179,88 @@ class OrderManager:
         # Audit trail
         self.audit_log: List[Dict] = []
         self.max_audit_log_size = 100000
+        self.smart_router: Any = None
         
         self._lock = asyncio.Lock()
         self._running = False
+
+    def attach_router(self, router: Any) -> None:
+        """Attach an optional smart order router for auto venue selection."""
+        self.smart_router = router
+
+    def _default_exchange(self) -> str:
+        exchanges = self.config.get_value("exchanges") or {}
+        for exchange_id, cfg in exchanges.items():
+            if isinstance(cfg, dict) and cfg.get("enabled", False):
+                return str(exchange_id)
+        return "binance"
+
+    async def _resolve_exchange(
+        self,
+        exchange: str,
+        symbol: str,
+        side: OrderSide,
+        quantity: float,
+        metadata: Dict,
+    ) -> tuple[str, Dict]:
+        requested = (exchange or "").lower().strip()
+        if requested not in {"auto", "best", "router"}:
+            return exchange, metadata
+
+        if self.smart_router is None:
+            fallback = self._default_exchange()
+            metadata["routing_mode"] = "fallback_no_router"
+            metadata["requested_exchange"] = exchange
+            return fallback, metadata
+
+        try:
+            from execution.binance_executor import OrderSide as RouterOrderSide
+
+            router_side = RouterOrderSide.BUY if side == OrderSide.BUY else RouterOrderSide.SELL
+            decision = await self.smart_router.route_order(
+                symbol=symbol,
+                side=router_side,
+                quantity=quantity,
+                max_venues=3,
+                min_score_threshold=0.1,
+            )
+            if decision is None:
+                fallback = self._default_exchange()
+                metadata["routing_mode"] = "fallback_no_decision"
+                metadata["requested_exchange"] = exchange
+                return fallback, metadata
+
+            selected_exchange = str(getattr(decision.recommended_venue, "value", "") or "")
+            if not selected_exchange:
+                fallback = self._default_exchange()
+                metadata["routing_mode"] = "fallback_invalid_decision"
+                metadata["requested_exchange"] = exchange
+                return fallback, metadata
+
+            metadata["routing_mode"] = "smart_router"
+            metadata["requested_exchange"] = exchange
+            metadata["routing_decision"] = {
+                "recommended_venue": selected_exchange,
+                "confidence": float(getattr(decision, "confidence", 0.0)),
+                "expected_avg_price": float(getattr(decision, "expected_avg_price", 0.0)),
+                "routes": [
+                    {
+                        "venue": str(getattr(getattr(route, "venue", None), "value", "")),
+                        "quantity": float(getattr(route, "quantity", 0.0)),
+                        "expected_fill_price": float(getattr(route, "expected_fill_price", 0.0)),
+                        "score": float(getattr(route, "score", 0.0)),
+                    }
+                    for route in list(getattr(decision, "routes", []))
+                ],
+            }
+            return selected_exchange, metadata
+        except Exception as exc:
+            fallback = self._default_exchange()
+            logger.warning("Smart routing failed: {} — falling back to {}", exc, fallback)
+            metadata["routing_mode"] = "fallback_error"
+            metadata["routing_error"] = str(exc)
+            metadata["requested_exchange"] = exchange
+            return fallback, metadata
 
     def generate_client_order_id(self, exchange: str, symbol: str, side: OrderSide) -> str:
         """Generate unique client order ID"""
@@ -223,6 +302,8 @@ class OrderManager:
                     return True, cached_order, "idempotent_retry"
 
             # Self-trade prevention
+            metadata = dict(metadata or {})
+            exchange, metadata = await self._resolve_exchange(exchange, symbol, side, quantity, metadata)
             self_trade_reason = self._check_self_trade(exchange, symbol, side)
             if self_trade_reason:
                 logger.warning(f"Self-trade prevented for {symbol}: {self_trade_reason}")
@@ -241,7 +322,7 @@ class OrderManager:
                 status=OrderStatus.PENDING,
                 exchange_order_id=None,
                 venue=exchange,
-                metadata=metadata or {},
+                metadata=metadata,
             )
 
             # Store order
