@@ -1,7 +1,7 @@
 # Production-ready multi-stage Dockerfile for Neural Trader v4
 
 # Stage 1: Rust build
-FROM rust:1.75 as rust-builder
+FROM rust:1.85 AS rust-builder
 
 WORKDIR /build
 
@@ -11,17 +11,20 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     clang \
     cmake \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Rust workspace and build
 COPY rust/ ./rust/
+COPY proto/ ./rust/proto/
+COPY proto/ ./rust/gateway/proto/
 WORKDIR /build/rust
 
 # Build Rust components
 RUN cargo build --workspace --release
 
 # Stage 2: TypeScript build
-FROM node:20-alpine as ts-builder
+FROM node:20-alpine AS ts-builder
 
 WORKDIR /build
 
@@ -33,7 +36,7 @@ WORKDIR /build/ts/dex-layer
 RUN npm ci && npm run build
 
 # Stage 3: Python base
-FROM python:3.12-slim as python-base
+FROM python:3.12-slim AS python-base
 
 WORKDIR /app
 
@@ -60,7 +63,7 @@ RUN curl -L http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz | 
     && rm -rf ta-lib/
 
 # Stage 4: Python gateway service
-FROM python-base as python-gateway
+FROM python-base AS python-gateway
 
 WORKDIR /app
 
@@ -88,7 +91,7 @@ EXPOSE 8000
 CMD ["python", "main.py"]
 
 # Stage 5: Rust gateway service
-FROM gcr.io/distroless/python3-debian12 as rust-gateway
+FROM gcr.io/distroless/python3-debian12 AS rust-gateway
 
 WORKDIR /app
 
@@ -106,7 +109,7 @@ EXPOSE 50051 8001
 CMD ["/app/gateway"]
 
 # Stage 6: Full application
-FROM python-base as full
+FROM python-base AS full
 
 WORKDIR /app
 
@@ -143,7 +146,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 CMD ["python", "main.py"]
 
 # Stage 7: Development environment
-FROM python-base as dev
+FROM python-base AS dev
 
 WORKDIR /app
 

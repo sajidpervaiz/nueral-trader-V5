@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tick_parser::{TickParser as RustTickParser, MultiSymbolParser, RawTick, Candle, RingBuffer};
-use order_matcher::{Order, OrderBook as RustOrderBook, OrderBookManager, Side, OrderType, TimeInForce, MatchResult};
-use risk_engine::{RiskEngine, RiskLimits, Position, RiskError};
+use order_matcher::{Order, OrderBook as RustOrderBook, Side as OMSide, TimeInForce, MatchResult};
+use risk_engine::{RiskEngine, RiskLimits, Side as RiskSide};
 
 #[pyclass]
 struct TickParser {
@@ -59,7 +59,7 @@ impl TickParser {
 
     #[staticmethod]
     fn parse_batch(py: Python<'_>, exchange: String, raw_json: String) -> PyResult<PyObject> {
-        let parser = RustTickParser::new(60, 10000, 1000);
+        let mut parser = RustTickParser::new(60, 10000, 1000);
         let ticks = parser.parse_batch(&exchange, &raw_json);
         let list = PyList::empty_bound(py);
         for tick in ticks {
@@ -141,7 +141,7 @@ impl OrderBook {
         quantity: f64,
         timestamp: i64,
     ) -> PyResult<PyObject> {
-        let order_side = if side == "buy" { Side::Buy } else { Side::Sell };
+        let order_side = if side == "buy" { OMSide::Buy } else { OMSide::Sell };
         let order = Order::new_limit(order_id, order_side, price, quantity, timestamp, TimeInForce::GTC);
         let result = self.inner.add_order(order);
         fills_to_pylist(py, &result)
@@ -155,14 +155,14 @@ impl OrderBook {
         quantity: f64,
         timestamp: i64,
     ) -> PyResult<PyObject> {
-        let order_side = if side == "buy" { Side::Buy } else { Side::Sell };
+        let order_side = if side == "buy" { OMSide::Buy } else { OMSide::Sell };
         let order = Order::new_market(order_id, order_side, quantity, timestamp);
         let result = self.inner.add_order(order);
         fills_to_pylist(py, &result)
     }
 
     fn cancel_order(&mut self, order_id: u64, side: &str) -> bool {
-        let order_side = if side == "buy" { Side::Buy } else { Side::Sell };
+        let order_side = if side == "buy" { OMSide::Buy } else { OMSide::Sell };
         self.inner.cancel_order(order_id, order_side)
     }
 
@@ -205,7 +205,7 @@ fn fills_to_pylist(py: Python<'_>, result: &MatchResult) -> PyResult<PyObject> {
         dict.set_item("taker_id", fill.taker_id)?;
         dict.set_item("price", fill.price)?;
         dict.set_item("quantity", fill.quantity)?;
-        dict.set_item("side", if fill.side == Side::Buy { "buy" } else { "sell" })?;
+        dict.set_item("side", if fill.side == OMSide::Buy { "buy" } else { "sell" })?;
         dict.set_item("timestamp", fill.timestamp)?;
         dict.set_item("trade_id", fill.trade_id)?;
         list.append(dict)?;
@@ -249,7 +249,7 @@ impl RiskManager {
         quantity: f64,
         price: f64,
     ) -> PyResult<PyObject> {
-        let order_side = if side == "buy" { Side::Buy } else { Side::Sell };
+        let order_side = if side == "buy" { RiskSide::Buy } else { RiskSide::Sell };
 
         match self.inner.pre_trade_check(&symbol, order_side, quantity, price) {
             Ok(()) => {
@@ -268,7 +268,7 @@ impl RiskManager {
     }
 
     fn update_position(&self, symbol: String, side: String, quantity: f64, price: f64) {
-        let order_side = if side == "buy" { Side::Buy } else { Side::Sell };
+        let order_side = if side == "buy" { RiskSide::Buy } else { RiskSide::Sell };
         self.inner.update_position(&symbol, order_side, quantity, price);
     }
 
@@ -277,7 +277,7 @@ impl RiskManager {
             Some(pos) => {
                 let dict = PyDict::new_bound(py);
                 dict.set_item("symbol", &pos.symbol)?;
-                dict.set_item("side", if pos.side == Side::Buy { "buy" } else { "sell" })?;
+                dict.set_item("side", if pos.side == RiskSide::Buy { "buy" } else { "sell" })?;
                 dict.set_item("quantity", pos.quantity)?;
                 dict.set_item("avg_price", pos.avg_price)?;
                 dict.set_item("unrealized_pnl", pos.unrealized_pnl)?;
@@ -304,7 +304,7 @@ impl RiskManager {
     }
 
     fn update_order_book_price(&self, symbol: String, side: String, price: f64, quantity: f64) {
-        let order_side = if side == "buy" { Side::Buy } else { Side::Sell };
+        let order_side = if side == "buy" { RiskSide::Buy } else { RiskSide::Sell };
         self.inner.update_order_book_price(&symbol, order_side, price, quantity);
     }
 

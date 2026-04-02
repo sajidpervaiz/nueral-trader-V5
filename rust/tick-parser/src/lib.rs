@@ -1,12 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_utils::CachePadded;
-use parking_lot::RwLock;
 use dashmap::DashMap;
-use smallvec::SmallVec;
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,7 +127,7 @@ impl RingBuffer {
         }
     }
 
-    pub fn push(&self, tick: RawTick) -> bool {
+    pub fn push(&mut self, tick: RawTick) -> bool {
         let head = self.head.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tail = self.tail.load(std::sync::atomic::Ordering::Acquire);
 
@@ -140,7 +137,7 @@ impl RingBuffer {
         }
 
         unsafe {
-            let ptr = self.buffer.as_ptr().add(head % self.capacity);
+            let ptr = self.buffer.as_mut_ptr().add(head % self.capacity);
             std::ptr::write(ptr, tick);
         }
         true
@@ -172,9 +169,9 @@ pub struct TickParser {
     timeframe_ns: i64,
     accumulators: DashMap<String, CandleAccumulator>,
     ring_buffer: RingBuffer,
-    batch_sender: Sender<TickBatch>,
+    _batch_sender: Sender<TickBatch>,
     batch_receiver: Receiver<TickBatch>,
-    batch_size: usize,
+    _batch_size: usize,
 }
 
 impl TickParser {
@@ -184,9 +181,9 @@ impl TickParser {
             timeframe_ns: timeframe_seconds * 1_000_000_000,
             accumulators: DashMap::new(),
             ring_buffer: RingBuffer::new(ring_capacity),
-            batch_sender,
+            _batch_sender: batch_sender,
             batch_receiver,
-            batch_size,
+            _batch_size: batch_size,
         }
     }
 
@@ -208,7 +205,7 @@ impl TickParser {
         volume: f64,
     ) -> Option<Candle> {
         let key = format!("{}:{}", exchange, symbol);
-        let (start_ns, end_ns) = self.bucket_for(timestamp_ns);
+        let (start_ns, _end_ns) = self.bucket_for(timestamp_ns);
 
         match self.accumulators.get_mut(&key) {
             Some(mut acc) if acc.start_time_ns == start_ns => {
@@ -217,7 +214,7 @@ impl TickParser {
             }
             Some(mut acc) => {
                 let timeframe_name = format!("{}s", self.timeframe_ns / 1_000_000_000);
-                let completed = acc.finalize(timeframe_name);
+                let mut completed = acc.finalize(timeframe_name);
                 completed.exchange = exchange.to_string();
                 completed.symbol = symbol.to_string();
                 *acc = CandleAccumulator::new(start_ns, self.timeframe_ns, price, volume);
@@ -233,7 +230,7 @@ impl TickParser {
         }
     }
 
-    pub fn add_tick_to_buffer(&self, tick: RawTick) -> bool {
+    pub fn add_tick_to_buffer(&mut self, tick: RawTick) -> bool {
         self.ring_buffer.push(tick)
     }
 
@@ -356,7 +353,6 @@ fn parse_tick_from_value(v: &serde_json::Value, exchange: &str) -> Option<RawTic
     })
 }
 
-#[derive(Debug, Clone)]
 pub struct MultiSymbolParser {
     parsers: HashMap<String, TickParser>,
     default_timeframe: i64,
@@ -387,16 +383,16 @@ impl MultiSymbolParser {
         price: f64,
         volume: f64,
     ) -> Option<Candle> {
-        if let Some(parser) self.parsers.get_mut(symbol) {
+        if let Some(parser) = self.parsers.get_mut(symbol) {
             parser.add_tick(exchange, symbol, timestamp_ns, price, volume)
         } else {
             None
         }
     }
 
-    pub fn get_all_candles(&self) -> Vec<Candle> {
+    pub fn get_all_candles(&mut self) -> Vec<Candle> {
         let mut candles = Vec::new();
-        for parser in self.parsers.values() {
+        for parser in self.parsers.values_mut() {
             let completed = parser.flush_buffer();
             candles.extend(completed);
         }
@@ -405,17 +401,12 @@ impl MultiSymbolParser {
 }
 
 pub struct TickNormalizer {
-    base_timestamp_ns: i64,
     exchange_offsets: HashMap<String, i64>,
 }
 
 impl TickNormalizer {
     pub fn new() -> Self {
         Self {
-            base_timestamp_ns: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as i64,
             exchange_offsets: HashMap::new(),
         }
     }
@@ -466,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_ring_buffer() {
-        let buffer = RingBuffer::new(10);
+        let mut buffer = RingBuffer::new(10);
         let tick = RawTick {
             exchange: "test".to_string(),
             symbol: "BTC/USDT".to_string(),

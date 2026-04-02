@@ -17,6 +17,7 @@ ahash = { workspace = true }
 smallvec = { workspace = true }
 memmap2 = { workspace = true }
 rayon = { workspace = true }
+log = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
