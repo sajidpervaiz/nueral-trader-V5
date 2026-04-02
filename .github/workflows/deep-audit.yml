@@ -31,7 +31,8 @@ jobs:
           wget -qO- http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz | tar xz
           cd ta-lib
           ./configure --prefix=/usr
-          make -j"$(nproc)"
+          # TA-Lib 0.4.0's build scripts can race under parallel make on CI runners.
+          make -j1
           sudo make install
 
       - name: Install dependencies
