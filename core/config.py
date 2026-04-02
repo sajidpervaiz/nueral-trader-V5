@@ -9,15 +9,21 @@ import yaml
 from loguru import logger
 
 
-_ENV_PATTERN = re.compile(r"\$\{([^}:]+)(?::([^}]*))?\}")
+_ENV_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
 
 def _interpolate(value: Any) -> Any:
     if isinstance(value, str):
         def replace(m: re.Match) -> str:
-            var_name = m.group(1)
-            default = m.group(2) if m.group(2) is not None else ""
-            return os.environ.get(var_name, default)
+            expr = m.group(1)
+            if ":-" in expr:
+                var_name, default = expr.split(":-", 1)
+                env_value = os.environ.get(var_name)
+                return env_value if env_value not in (None, "") else default
+            if "-" in expr:
+                var_name, default = expr.split("-", 1)
+                return os.environ.get(var_name, default)
+            return os.environ.get(expr, "")
         return _ENV_PATTERN.sub(replace, value)
     if isinstance(value, dict):
         return {k: _interpolate(v) for k, v in value.items()}

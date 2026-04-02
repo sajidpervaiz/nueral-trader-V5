@@ -92,7 +92,7 @@ async def main() -> None:
 
     telegram = TelegramNotifier(config, event_bus)
 
-    app = build_app(config, event_bus, risk_mgr, data_manager, order_mgr)
+    app = build_app(config, event_bus, risk_mgr, data_manager, order_mgr, db, cache)
 
     dispatcher = Dispatcher(
         config=config,

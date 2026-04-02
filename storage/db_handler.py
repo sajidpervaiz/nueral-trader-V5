@@ -211,3 +211,7 @@ class DBHandler:
         if self._pool:
             await self._pool.close()
             logger.info("Database pool closed")
+
+    @property
+    def available(self) -> bool:
+        return self._pool is not None

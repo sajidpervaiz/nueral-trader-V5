@@ -41,8 +41,8 @@ warning() {
 
 check_bot_running() {
     log "CHECK 1: Bot process running..."
-    
-    BOT_PID=$(pgrep -f "python3 main.py" | head -1 || echo "")
+
+    BOT_PID=$(pgrep -f "python(3)?[[:space:]].*main\.py" | head -1 || echo "")
     
     if [ -z "$BOT_PID" ]; then
         error "Bot process not running"
@@ -96,9 +96,9 @@ check_paper_mode() {
 
 check_order_manager() {
     log "CHECK 4: Order manager operational..."
-    
-    RESPONSE=$(curl -s -m 5 "http://127.0.0.1:8000/orders" 2>/dev/null || echo '{}')
-    
+
+    RESPONSE=$(curl -s -L -m 5 "http://127.0.0.1:8000/orders/" 2>/dev/null || echo '{}')
+
     if [[ "$RESPONSE" == \[*\] ]]; then
         TOTAL=$(echo "$RESPONSE" | grep -o '"order_id"' | wc -l)
         success "Order manager operational (orders returned: $TOTAL)"
@@ -115,8 +115,8 @@ check_order_manager() {
 
 check_idempotency() {
     log "CHECK 5: Idempotency (duplicate detection)..."
-    
-    RESPONSE=$(curl -s -m 5 "http://127.0.0.1:8000/orders" 2>/dev/null || echo '{}')
+
+    RESPONSE=$(curl -s -L -m 5 "http://127.0.0.1:8000/orders/" 2>/dev/null || echo '{}')
 
     if [[ "$RESPONSE" != \[*\] ]]; then
         error "Cannot validate idempotency: orders payload is not a JSON array"

@@ -29,6 +29,8 @@ def build_app(
     risk_manager: Any = None,
     data_manager: Any = None,
     order_manager: Any = None,
+    db_handler: Any = None,
+    cache: Any = None,
 ) -> Any:
     if not _FASTAPI:
         return None
@@ -38,6 +40,7 @@ def build_app(
         description="Hybrid Rust+TypeScript+Python trading engine",
         version="4.0.0",
     )
+    app.state.started_at = int(time.time())
 
     dashboard_cfg = config.get_value("monitoring", "dashboard_api", default={}) or {}
     cors_origins = dashboard_cfg.get("allow_origins") or ["http://localhost", "http://127.0.0.1"]
@@ -209,13 +212,17 @@ def build_app(
 
     @app.get("/system/stats")
     async def system_stats() -> dict[str, Any]:
+        db_connected = bool(getattr(db_handler, "available", False))
+        cache_connected = bool(getattr(cache, "available", False))
+        now = int(time.time())
+        started_at = int(getattr(app.state, "started_at", now))
         return {
-            "uptime_seconds": int(time.time()),
+            "uptime_seconds": max(0, now - started_at),
             "feeds_connected": 5,
             "websockets_active": 2,
-            "db_connected": False,
-            "cache_connected": False,
-            "timestamp": int(time.time()),
+            "db_connected": db_connected,
+            "cache_connected": cache_connected,
+            "timestamp": now,
         }
 
     return app
