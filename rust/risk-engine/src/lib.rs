@@ -1,11 +1,31 @@
-use std::sync::atomic::{AtomicU64, AtomicF64, Ordering};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use crossbeam_epoch::{self as epoch, Atomic, Owned, Shared};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crossbeam_utils::CachePadded;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+struct AtomicF64 {
+    inner: RwLock<f64>,
+}
+
+impl AtomicF64 {
+    fn new(value: f64) -> Self {
+        Self {
+            inner: RwLock::new(value),
+        }
+    }
+
+    fn load(&self, _ordering: Ordering) -> f64 {
+        *self.inner.read()
+    }
+
+    fn fetch_add(&self, value: f64, _ordering: Ordering) -> f64 {
+        let mut guard = self.inner.write();
+        let prev = *guard;
+        *guard += value;
+        prev
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side { Buy, Sell }
@@ -61,57 +81,29 @@ impl Default for RiskLimits {
     }
 }
 
-pub struct PriceLevel {
-    price: u64,
-    total_quantity: AtomicF64,
-    order_count: AtomicU64,
-}
-
-impl PriceLevel {
-    fn new(price: u64) -> Self {
-        Self {
-            price,
-            total_quantity: AtomicF64::new(0.0),
-            order_count: AtomicU64::new(0),
-        }
-    }
-}
-
-struct OrderNode {
-    id: u64,
-    side: Side,
-    quantity: f64,
-    remaining: f64,
-    price: u64,
-    timestamp: i64,
-    next: Atomic<OrderNode>,
-}
-
 struct LockFreeOrderBook {
-    symbol: String,
     bids: crossbeam_skiplist::SkipMap<u64, CachePadded<AtomicF64>>,
     asks: crossbeam_skiplist::SkipMap<u64, CachePadded<AtomicF64>>,
-    best_bid: CachePadded<Atomic<u64>>,
-    best_ask: CachePadded<Atomic<u64>>,
+    best_bid: CachePadded<AtomicU64>,
+    best_ask: CachePadded<AtomicU64>,
 }
 
 impl LockFreeOrderBook {
-    fn new(symbol: String) -> Self {
+    fn new(_symbol: String) -> Self {
         Self {
-            symbol,
             bids: crossbeam_skiplist::SkipMap::new(),
             asks: crossbeam_skiplist::SkipMap::new(),
-            best_bid: CachePadded::new(Atomic::new(0)),
-            best_ask: CachePadded::new(Atomic::new(u64::MAX)),
+            best_bid: CachePadded::new(AtomicU64::new(0)),
+            best_ask: CachePadded::new(AtomicU64::new(u64::MAX)),
         }
     }
 
     fn best_bid(&self) -> Option<u64> {
-        self.bids.peek_max().map(|entry| *entry.key())
+        self.bids.back().map(|entry| *entry.key())
     }
 
     fn best_ask(&self) -> Option<u64> {
-        self.asks.peek_min().map(|entry| *entry.key())
+        self.asks.front().map(|entry| *entry.key())
     }
 
     fn mid_price(&self) -> Option<f64> {
@@ -206,7 +198,7 @@ impl RiskEngine {
     }
 
     pub fn update_position(&self, symbol: &str, side: Side, quantity: f64, price: f64) {
-        let entry = self.positions.entry(symbol.to_string()).or_insert_with(|| Position {
+        let mut entry = self.positions.entry(symbol.to_string()).or_insert_with(|| Position {
             symbol: symbol.to_string(),
             side,
             quantity: 0.0,
@@ -214,7 +206,7 @@ impl RiskEngine {
             unrealized_pnl: 0.0,
         });
 
-        let mut pos = entry.value_mut();
+        let pos = entry.value_mut();
         let qty_change = match side {
             Side::Buy => quantity,
             Side::Sell => -quantity,
@@ -265,12 +257,7 @@ impl RiskEngine {
             let price_key = (price * 1_000_000.0) as u64;
             let map = if side == Side::Buy { &book.bids } else { &book.asks };
 
-            if let Some(entry) = map.get(&price_key) {
-                entry.value().store(quantity, Ordering::Relaxed);
-            } else {
-                let entry = map.entry(price_key).or_insert_with(|| CachePadded::new(AtomicF64::new(0.0)));
-                entry.value().store(quantity, Ordering::Relaxed);
-            }
+            map.insert(price_key, CachePadded::new(AtomicF64::new(quantity)));
 
             if side == Side::Buy {
                 if let Some(best) = book.best_bid() {

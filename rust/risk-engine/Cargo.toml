@@ -12,6 +12,8 @@ anyhow = { workspace = true }
 crossbeam = { workspace = true }
 crossbeam-epoch = { workspace = true }
 crossbeam-channel = { workspace = true }
+crossbeam-utils = { workspace = true }
+crossbeam-skiplist = { workspace = true }
 parking_lot = { workspace = true }
 atomic = { workspace = true }
 dashmap = { workspace = true }

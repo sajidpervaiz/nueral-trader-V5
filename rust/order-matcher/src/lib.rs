@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
-use crossbeam_skiplist::{SkipList, map::Entry};
 use parking_lot::RwLock;
-use dashmap::DashMap;
 use smallvec::SmallVec;
 use thiserror::Error;
 
@@ -132,14 +130,12 @@ pub type Result<T> = std::result::Result<T, OrderError>;
 
 #[derive(Debug, Clone)]
 struct PriceLevel {
-    price: u64,
     orders: Vec<Order>,
 }
 
 impl PriceLevel {
-    fn new(price: u64) -> Self {
+    fn new(_price: u64) -> Self {
         Self {
-            price,
             orders: Vec::with_capacity(16),
         }
     }
@@ -148,26 +144,22 @@ impl PriceLevel {
         self.orders.iter().map(|o| o.remaining).sum()
     }
 
-    fn order_count(&self) -> usize {
-        self.orders.len()
-    }
 }
 
+#[derive(Debug)]
 struct ShardedOrderBook {
-    shard_id: usize,
-    bids: SkipList<u64, PriceLevel>,
-    asks: SkipList<u64, PriceLevel>,
+    bids: BTreeMap<u64, PriceLevel>,
+    asks: BTreeMap<u64, PriceLevel>,
     max_depth: usize,
     trade_counter: AtomicU64,
     self_trade_prevention: bool,
 }
 
 impl ShardedOrderBook {
-    fn new(shard_id: usize, max_depth: usize) -> Self {
+    fn new(_shard_id: usize, max_depth: usize) -> Self {
         Self {
-            shard_id,
-            bids: SkipList::new(),
-            asks: SkipList::new(),
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
             max_depth,
             trade_counter: AtomicU64::new(0),
             self_trade_prevention: true,
@@ -175,11 +167,11 @@ impl ShardedOrderBook {
     }
 
     fn best_bid(&self) -> Option<f64> {
-        self.bids.peek_max().map(|entry| entry.key() as f64 / 1_000_000.0)
+        self.bids.iter().next_back().map(|(k, _)| *k as f64 / 1_000_000.0)
     }
 
     fn best_ask(&self) -> Option<f64> {
-        self.asks.peek_min().map(|entry| entry.key() as f64 / 1_000_000.0)
+        self.asks.iter().next().map(|(k, _)| *k as f64 / 1_000_000.0)
     }
 
     fn spread(&self) -> Option<f64> {
@@ -196,7 +188,7 @@ impl ShardedOrderBook {
         }
     }
 
-    fn add_order(&mut self, mut order: Order) -> MatchResult {
+    fn add_order(&mut self, order: Order) -> MatchResult {
         match order.order_type {
             OrderType::Market => self.match_market(order),
             OrderType::Limit => self.match_limit(order),
@@ -206,12 +198,11 @@ impl ShardedOrderBook {
     }
 
     fn match_market(&mut self, mut taker: Order) -> MatchResult {
-        let mut fills = SmallVec::new();
+        let mut fills: SmallVec<[Fill; 16]> = SmallVec::new();
         let mut filled_qty = 0.0;
         let mut fill_value = 0.0;
 
         let book = if taker.side == Side::Buy { &mut self.asks } else { &mut self.bids };
-
         let keys: Vec<u64> = if taker.side == Side::Buy {
             book.keys().copied().collect()
         } else {
@@ -223,19 +214,19 @@ impl ShardedOrderBook {
                 break;
             }
 
-            if let Some(entry) = book.get(&key) {
+            if let Some(level) = book.get_mut(&key) {
                 let fill_price = key as f64 / 1_000_000.0;
 
                 if self.self_trade_prevention {
                     if let Some(user_id) = taker.user_id {
-                        if entry.value().orders.iter().any(|o| o.user_id == Some(user_id)) {
+                        if level.orders.iter().any(|o| o.user_id == Some(user_id)) {
                             continue;
                         }
                     }
                 }
 
                 let mut to_remove = false;
-                for maker in entry.value().orders.iter_mut() {
+                for maker in level.orders.iter_mut() {
                     if taker.remaining <= f64::EPSILON {
                         break;
                     }
@@ -267,8 +258,8 @@ impl ShardedOrderBook {
                     fill_value += fill_qty * fill_price;
                 }
 
-                entry.value().orders.retain(|o| o.remaining > f64::EPSILON);
-                if entry.value().orders.is_empty() {
+                level.orders.retain(|o| o.remaining > f64::EPSILON);
+                if level.orders.is_empty() {
                     to_remove = true;
                 }
 
@@ -289,23 +280,22 @@ impl ShardedOrderBook {
     }
 
     fn match_limit(&mut self, mut taker: Order) -> MatchResult {
-        let mut fills = SmallVec::new();
+        let mut fills: SmallVec<[Fill; 16]> = SmallVec::new();
         let mut filled_qty = 0.0;
         let mut fill_value = 0.0;
         let max_price = (taker.price * 1_000_000.0) as u64;
         let min_price = max_price;
 
-        let (book, should_take): (&mut SkipList<u64, PriceLevel>, Box<dyn Fn(u64) -> bool>) =
-            if taker.side == Side::Buy {
-                (&mut self.asks, Box::new(move |k| k <= max_price))
-            } else {
-                (&mut self.bids, Box::new(move |k| k >= min_price))
-            };
+        let book: &mut BTreeMap<u64, PriceLevel> = if taker.side == Side::Buy {
+            &mut self.asks
+        } else {
+            &mut self.bids
+        };
 
         let keys: Vec<u64> = if taker.side == Side::Buy {
-            book.keys().take_while(|&k| k <= max_price).copied().collect()
+            book.keys().take_while(|&k| *k <= max_price).copied().collect()
         } else {
-            book.keys().rev().take_while(|&k| k >= min_price).copied().collect()
+            book.keys().rev().take_while(|&k| *k >= min_price).copied().collect()
         };
 
         for key in keys {
@@ -313,15 +303,15 @@ impl ShardedOrderBook {
                 break;
             }
 
-            if let Some(entry) = book.get(&key) {
+            if let Some(level) = book.get_mut(&key) {
                 let fill_price = key as f64 / 1_000_000.0;
 
-                if self.self_trade_prevention && entry.value().orders.iter().any(|o| o.user_id == taker.user_id) {
+                if self.self_trade_prevention && level.orders.iter().any(|o| o.user_id == taker.user_id) {
                     continue;
                 }
 
                 let mut to_remove = false;
-                for maker in entry.value().orders.iter_mut() {
+                for maker in level.orders.iter_mut() {
                     if taker.remaining <= f64::EPSILON {
                         break;
                     }
@@ -353,8 +343,8 @@ impl ShardedOrderBook {
                     fill_value += fill_qty * fill_price;
                 }
 
-                entry.value().orders.retain(|o| o.remaining > f64::EPSILON);
-                if entry.value().orders.is_empty() {
+                level.orders.retain(|o| o.remaining > f64::EPSILON);
+                if level.orders.is_empty() {
                     to_remove = true;
                 }
 
@@ -368,8 +358,7 @@ impl ShardedOrderBook {
             let resting = if taker.side == Side::Buy { &mut self.bids } else { &mut self.asks };
             let key = max_price;
 
-            if let Some(mut entry) = resting.get(&key) {
-                let level = entry.value_mut();
+            if let Some(level) = resting.get_mut(&key) {
                 if level.orders.len() < self.max_depth {
                     level.orders.push(taker.clone());
                 }
@@ -437,15 +426,19 @@ impl ShardedOrderBook {
     fn cancel_order(&mut self, order_id: u64, side: Side) -> bool {
         let book = if side == Side::Buy { &mut self.bids } else { &mut self.asks };
 
-        for entry in book.iter() {
-            if let Some(pos) = entry.value().orders.iter().position(|o| o.id == order_id) {
-                let mut level = entry.value_mut();
+        let mut remove_key: Option<u64> = None;
+        for (key, level) in book.iter_mut() {
+            if let Some(pos) = level.orders.iter().position(|o| o.id == order_id) {
                 level.orders.remove(pos);
                 if level.orders.is_empty() {
-                    return book.remove(&entry.key()).is_some();
+                    remove_key = Some(*key);
                 }
-                return true;
+                break;
             }
+        }
+        if let Some(k) = remove_key {
+            book.remove(&k);
+            return true;
         }
         false
     }
@@ -454,12 +447,12 @@ impl ShardedOrderBook {
         let mut bids = Vec::with_capacity(depth);
         let mut asks = Vec::with_capacity(depth);
 
-        for entry in self.bids.iter().rev().take(depth) {
-            bids.push((entry.key() as f64 / 1_000_000.0, entry.value().total_quantity()));
+        for (key, level) in self.bids.iter().rev().take(depth) {
+            bids.push((*key as f64 / 1_000_000.0, level.total_quantity()));
         }
 
-        for entry in self.asks.iter().take(depth) {
-            asks.push((entry.key() as f64 / 1_000_000.0, entry.value().total_quantity()));
+        for (key, level) in self.asks.iter().take(depth) {
+            asks.push((*key as f64 / 1_000_000.0, level.total_quantity()));
         }
 
         (bids, asks)
@@ -470,7 +463,6 @@ impl ShardedOrderBook {
 pub struct OrderBookManager {
     shards: Vec<RwLock<ShardedOrderBook>>,
     num_shards: usize,
-    max_depth: usize,
     self_trade_prevention: bool,
 }
 
@@ -483,7 +475,6 @@ impl OrderBookManager {
         Self {
             shards,
             num_shards,
-            max_depth,
             self_trade_prevention: true,
         }
     }

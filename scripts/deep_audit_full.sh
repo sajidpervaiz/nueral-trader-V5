@@ -10,13 +10,13 @@ echo "Repo: CTO-TEST-AI-trading-Bot"
 echo "Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
 echo "============================================="
 
-echo "[1/5] Running Tier 1 gate (includes Tier 0 gate)..."
-bash scripts/deep_audit_tier1.sh
+echo "[1/6] Running Tier 2 gate (includes Tier 1 and Tier 0 gates)..."
+bash scripts/deep_audit_tier2.sh
 
-echo "[2/5] Running full regression suite..."
+echo "[2/6] Running full regression suite..."
 pytest -q
 
-echo "[3/5] Verifying critical feature files exist..."
+echo "[3/6] Verifying critical feature files exist..."
 required_files=(
   "core/idempotency.py"
   "core/circuit_breaker.py"
@@ -31,6 +31,7 @@ required_files=(
   "interface/dashboard_api.py"
   "scripts/deep_audit_tier0.sh"
   "scripts/deep_audit_tier1.sh"
+  "scripts/deep_audit_tier2.sh"
 )
 
 for f in "${required_files[@]}"; do
@@ -41,7 +42,7 @@ for f in "${required_files[@]}"; do
   echo "OK: $f"
 done
 
-echo "[4/5] Verifying API route retention..."
+echo "[4/6] Verifying API route retention..."
 python - <<'PY'
 from core.config import Config
 from core.event_bus import EventBus
@@ -64,13 +65,21 @@ if missing:
 print(f"ROUTE_RETENTION_OK routes={len(routes)} verified={len(required)}")
 PY
 
-echo "[5/5] Guardrail: ensure no tracked feature file deletions in working tree..."
+echo "[5/6] Guardrail: ensure no tracked feature file deletions in working tree..."
 if git diff --name-status --diff-filter=D | grep -q .; then
   echo "DELETION_DETECTED"
   git diff --name-status --diff-filter=D
   exit 1
 fi
 echo "NO_TRACKED_DELETIONS"
+
+echo "[6/6] Checking Tier 2 recall artifact..."
+if [[ -f "TIER2_DEEP_AUDIT_RECALL.md" ]]; then
+  echo "RECALL_AUDIT_OK TIER2_DEEP_AUDIT_RECALL.md"
+else
+  echo "RECALL_AUDIT_MISSING TIER2_DEEP_AUDIT_RECALL.md"
+  exit 1
+fi
 
 echo "============================================="
 echo "FULL REPOSITORY DEEP AUDIT: PASS"
