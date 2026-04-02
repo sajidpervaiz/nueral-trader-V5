@@ -3,6 +3,7 @@ Comprehensive test suite for TIER 0 (Production-Safe) components.
 Tests idempotency, order manager, circuit breaker, and risk controls.
 """
 
+from pathlib import Path
 import pytest
 import asyncio
 import time
@@ -12,6 +13,9 @@ from core.idempotency import IdempotencyManager
 from core.circuit_breaker import CircuitBreaker, CircuitState
 from core.retry import RetryPolicy
 from execution.order_manager import Order, OrderManager, OrderStatus, OrderSide, OrderType
+
+
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "settings.yaml"
 
 
 class TestIdempotencyManager:
@@ -217,7 +221,7 @@ class TestOrderManager:
         from core.config import Config
         from core.event_bus import EventBus
 
-        config = Config(config_path="/workspaces/CTO-TEST-AI-trading-Bot/config/settings.yaml")
+        config = Config(config_path=CONFIG_PATH)
         event_bus = EventBus()
         breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
         manager = OrderManager(config, event_bus, breaker)
@@ -242,7 +246,7 @@ class TestOrderManager:
         from core.config import Config
         from core.event_bus import EventBus
 
-        config = Config(config_path="/workspaces/CTO-TEST-AI-trading-Bot/config/settings.yaml")
+        config = Config(config_path=CONFIG_PATH)
         event_bus = EventBus()
         breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
         manager = OrderManager(config, event_bus, breaker)
@@ -277,7 +281,7 @@ class TestOrderManager:
         from core.config import Config
         from core.event_bus import EventBus
 
-        config = Config(config_path="/workspaces/CTO-TEST-AI-trading-Bot/config/settings.yaml")
+        config = Config(config_path=CONFIG_PATH)
         event_bus = EventBus()
         breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
         manager = OrderManager(config, event_bus, breaker)
@@ -311,7 +315,7 @@ class TestOrderManager:
         from core.config import Config
         from core.event_bus import EventBus
 
-        config = Config(config_path="/workspaces/CTO-TEST-AI-trading-Bot/config/settings.yaml")
+        config = Config(config_path=CONFIG_PATH)
         event_bus = EventBus()
         breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
         manager = OrderManager(config, event_bus, breaker)
@@ -360,7 +364,7 @@ class TestOrderManager:
         from core.config import Config
         from core.event_bus import EventBus
 
-        config = Config(config_path="/workspaces/CTO-TEST-AI-trading-Bot/config/settings.yaml")
+        config = Config(config_path=CONFIG_PATH)
         event_bus = EventBus()
         breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
         manager = OrderManager(config, event_bus, breaker)
@@ -388,7 +392,7 @@ class TestOrderManager:
         from core.config import Config
         from core.event_bus import EventBus
 
-        config = Config(config_path="/workspaces/CTO-TEST-AI-trading-Bot/config/settings.yaml")
+        config = Config(config_path=CONFIG_PATH)
         event_bus = EventBus()
         breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
         manager = OrderManager(config, event_bus, breaker)

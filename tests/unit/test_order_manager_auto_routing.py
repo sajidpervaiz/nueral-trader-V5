@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,9 @@ from core.circuit_breaker import CircuitBreaker
 from core.config import Config
 from core.event_bus import EventBus
 from execution.order_manager import OrderManager, OrderSide
+
+
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "settings.yaml"
 
 
 class _FakeRouter:
@@ -29,7 +33,7 @@ class _FakeRouter:
 
 @pytest.mark.asyncio
 async def test_place_order_uses_smart_router_for_auto_exchange() -> None:
-    config = Config(config_path="/workspaces/CTO-TEST-AI-trading-Bot/config/settings.yaml")
+    config = Config(config_path=CONFIG_PATH)
     bus = EventBus()
     breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
     manager = OrderManager(config, bus, breaker)
@@ -53,7 +57,7 @@ async def test_place_order_uses_smart_router_for_auto_exchange() -> None:
 
 @pytest.mark.asyncio
 async def test_place_order_auto_exchange_falls_back_when_router_missing() -> None:
-    config = Config(config_path="/workspaces/CTO-TEST-AI-trading-Bot/config/settings.yaml")
+    config = Config(config_path=CONFIG_PATH)
     bus = EventBus()
     breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
     manager = OrderManager(config, bus, breaker)
