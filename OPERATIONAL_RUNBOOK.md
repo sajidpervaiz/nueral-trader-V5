@@ -12,6 +12,7 @@
 5. [Maintenance Schedule](#maintenance-schedule)
 6. [Escalation Procedures](#escalation-procedures)
 7. [Emergency Contacts](#emergency-contacts)
+8. [CI Governance](#ci-governance)
 
 ---
 
@@ -218,6 +219,54 @@ These require **immediate action:**
 | Daily loss limit breached | 🔴 CRITICAL | Pause all new orders immediately |
 | API timeout (>5) | 🟠 HIGH | Switch to paper mode, restart |
 | Audit trail missing | 🟠 HIGH | Stop trading, data integrity issue |
+
+---
+
+## ✅ CI Governance
+
+### Mandatory Gate Policy
+
+All merges to main must pass the Deep Audit pipeline:
+- Deep Audit Gate / Tier 0/1 + Full Audit
+
+PRs also receive an automatic failure comment when this gate fails:
+- Workflow: Audit Failure PR Comment
+
+### Apply Branch Protection (GitHub)
+
+```bash
+cd /workspaces/CTO-TEST-AI-trading-Bot
+bash scripts/enforce_branch_protection.sh --apply
+```
+
+### One-Command Full Governance Validation
+
+```bash
+cd /workspaces/CTO-TEST-AI-trading-Bot
+bash scripts/professional_governance_all.sh
+```
+
+To also attempt branch protection apply in the same run:
+
+```bash
+cd /workspaces/CTO-TEST-AI-trading-Bot
+bash scripts/professional_governance_all.sh --apply-branch-protection
+```
+
+### Dry-Run Branch Protection Payload
+
+```bash
+cd /workspaces/CTO-TEST-AI-trading-Bot
+bash scripts/enforce_branch_protection.sh
+```
+
+### Verification Command
+
+```bash
+gh api \
+    /repos/sajidpervaiz/CTO-TEST-AI-trading-Bot/branches/main/protection/required_status_checks \
+    -q '.contexts'
+```
 | Paper mode disabled | 🔴 CRITICAL | Restart bot immediately |
 
 ### Automated Alerts (Every 6 Hours)
