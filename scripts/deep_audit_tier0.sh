@@ -7,8 +7,8 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="/workspaces/CTO-TEST-AI-trading-Bot"
-cd "$PROJECT_ROOT"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
 
 if [[ -f ".venv/bin/activate" ]]; then
   # shellcheck disable=SC1091
@@ -35,7 +35,7 @@ from execution.risk_manager import RiskManager
 from core.circuit_breaker import CircuitBreaker
 from interface.dashboard_api import build_app
 
-repo = Path('/workspaces/CTO-TEST-AI-trading-Bot')
+repo = Path.cwd()
 cfg = Config(config_path=repo / 'config/settings.yaml')
 bus = EventBus()
 risk = RiskManager(cfg, bus)
