@@ -22,6 +22,17 @@ class FundingRate:
     timestamp: int
 
 
+@dataclass
+class FundingArbitrageOpportunity:
+    symbol: str
+    long_exchange: str
+    short_exchange: str
+    long_rate: float
+    short_rate: float
+    spread_bps: float
+    timestamp: int
+
+
 FUNDING_URLS: dict[str, str] = {
     "binance": "https://fapi.binance.com/fapi/v1/premiumIndex",
     "bybit": "https://api.bybit.com/v5/market/funding/history",
@@ -36,6 +47,49 @@ class FundingRateFeed:
         self._running = False
         self._session: aiohttp.ClientSession | None = None
         self._cache: dict[str, FundingRate] = {}
+
+    def detect_arbitrage_opportunities(
+        self,
+        rates: list[FundingRate],
+        min_spread_bps: float = 2.0,
+    ) -> list[FundingArbitrageOpportunity]:
+        """Find cross-venue funding spread opportunities for same symbol."""
+        if not rates:
+            return []
+
+        by_symbol: dict[str, list[FundingRate]] = {}
+        for r in rates:
+            key = self._normalize_symbol(r.symbol)
+            by_symbol.setdefault(key, []).append(r)
+
+        opportunities: list[FundingArbitrageOpportunity] = []
+        now_ts = int(time.time())
+
+        for symbol, symbol_rates in by_symbol.items():
+            if len(symbol_rates) < 2:
+                continue
+
+            min_rate = min(symbol_rates, key=lambda x: x.rate)
+            max_rate = max(symbol_rates, key=lambda x: x.rate)
+
+            spread_bps = (max_rate.rate - min_rate.rate) * 10000.0
+            if spread_bps < min_spread_bps:
+                continue
+
+            opportunities.append(
+                FundingArbitrageOpportunity(
+                    symbol=symbol,
+                    long_exchange=min_rate.exchange,
+                    short_exchange=max_rate.exchange,
+                    long_rate=min_rate.rate,
+                    short_rate=max_rate.rate,
+                    spread_bps=spread_bps,
+                    timestamp=now_ts,
+                )
+            )
+
+        opportunities.sort(key=lambda x: x.spread_bps, reverse=True)
+        return opportunities
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -132,10 +186,26 @@ class FundingRateFeed:
             tasks.append(self._fetch_okx(syms))
 
         all_results: list[FundingRate] = []
-        for coro in tasks:
-            results = await coro
-            all_results.extend(results)
+        if not tasks:
+            return all_results
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                logger.debug("Funding source task failed: {}", r)
+                continue
+            all_results.extend(r)
         return all_results
+
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        s = symbol.upper().replace("/", "").replace(":", "").replace("-", "")
+        # Normalize common perp suffixes to canonical spot-like key for cross-venue compare.
+        for suffix in ("USDTUSDT", "USDTSWAP", "PERP", "SWAP"):
+            if s.endswith(suffix):
+                s = s[: -len(suffix)] + "USDT"
+                break
+        return s
 
     def get_latest(self, exchange: str, symbol: str) -> FundingRate | None:
         return self._cache.get(f"{exchange}:{symbol}")
@@ -161,6 +231,12 @@ class FundingRateFeed:
                     key = f"{rate.exchange}:{rate.symbol}"
                     self._cache[key] = rate
                 await self.event_bus.publish("FUNDING_RATE", rates)
+                macro_cfg = self.config.get_value("macro", "funding_rates") or {}
+                min_spread_bps = float(macro_cfg.get("arbitrage_min_spread_bps", 2.0))
+                opportunities = self.detect_arbitrage_opportunities(rates, min_spread_bps=min_spread_bps)
+                if opportunities:
+                    await self.event_bus.publish("FUNDING_ARBITRAGE", opportunities)
+                    logger.info("Detected {} funding arbitrage opportunities", len(opportunities))
                 logger.debug("Fetched {} funding rates", len(rates))
             except Exception as exc:
                 logger.exception("Funding rate feed error: {}", exc)

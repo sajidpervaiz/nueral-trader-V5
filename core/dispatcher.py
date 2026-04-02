@@ -87,7 +87,34 @@ class Dispatcher:
     async def run_forever(self) -> None:
         await self.start()
         try:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            pending: set[asyncio.Task] = set(self._tasks)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_EXCEPTION,
+                )
+
+                fatal_error: Exception | None = None
+                for task in done:
+                    try:
+                        exc = task.exception()
+                    except asyncio.CancelledError:
+                        continue
+                    if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                        logger.error(
+                            "Dispatcher detected fatal component crash in '{}': {}",
+                            task.get_name(),
+                            exc,
+                        )
+                        fatal_error = exc
+                        break
+
+                if fatal_error is not None:
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    raise RuntimeError("Dispatcher stopped due to component failure") from fatal_error
         except asyncio.CancelledError:
             pass
         finally:

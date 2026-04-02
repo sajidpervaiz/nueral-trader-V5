@@ -51,6 +51,15 @@ def build_app(
     require_api_key = bool(auth_cfg.get("require_api_key", False))
     api_key = str(auth_cfg.get("api_key", "") or "").strip()
     rate_limit_per_min = int(auth_cfg.get("rate_limit_per_min", 120))
+    allow_unauthenticated_non_paper = bool(auth_cfg.get("allow_unauthenticated_non_paper", False))
+
+    # Secure-by-default posture: non-paper mode requires API auth unless explicitly overridden.
+    if not config.paper_mode and not require_api_key and not allow_unauthenticated_non_paper:
+        require_api_key = True
+        logger.warning(
+            "Enabling API key requirement automatically for non-paper mode; "
+            "set monitoring.dashboard_api.auth.allow_unauthenticated_non_paper=true to override"
+        )
     exempt_paths = {
         "/",
         "/health",
@@ -85,6 +94,8 @@ def build_app(
                         provided = auth_header[7:].strip()
                 if provided != api_key:
                     return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+            elif require_api_key and not api_key:
+                return JSONResponse(status_code=503, content={"detail": "api_auth_misconfigured"})
 
         return await call_next(request)
 
