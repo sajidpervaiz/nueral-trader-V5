@@ -29,7 +29,10 @@ def _interpolate(value: Any) -> Any:
 class Config:
     _instance: Config | None = None
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(self, path: str | Path | None = None, config_path: str | Path | None = None) -> None:
+        # Backward compatibility: prefer explicit config_path if provided.
+        if config_path is not None:
+            path = config_path
         if path is None:
             path = Path(__file__).parent.parent / "config" / "settings.yaml"
         with open(path, "r") as fh:

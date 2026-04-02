@@ -1,0 +1,359 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                    🚀 QUICK REFERENCE CHEAT SHEET 🚀                          ║
+║                  TIER 0 Production Deployment Commands                         ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+ONE-TIME SETUP (Run Once, Never Again)
+
+1. Deploy to Production (10 minutes)
+   $ bash scripts/deploy_tier0.sh
+   
+   Expected output:
+   ════════════════════════════════════════════════════════════
+             🚀 PRODUCTION DEPLOYMENT SUCCESSFUL 🚀
+   ════════════════════════════════════════════════════════════
+
+2. Install Auto-Monitoring (1 minute)
+   $ bash scripts/setup_cron.sh
+   
+   Expected output:
+   ✓ Cron job installed
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+DAILY CHECKS (Run Every Morning)
+
+1. Health Check
+   $ bash scripts/health_check.sh
+   
+   Expected output:
+   ✓ API health endpoint responding
+   ✓ Paper mode: ENABLED
+   ✓ Order manager operational
+   ✓ Idempotency working (0 duplicates)
+   ...
+   ✅ STATUS: HEALTHY
+
+2. View Daily P&L
+   $ curl -s http://127.0.0.1:8000/performance | jq '.daily_pnl'
+   
+   Expected: Number (positive = good, negative = losing)
+
+3. Check Current Orders
+   $ curl -s http://127.0.0.1:8000/orders | jq '.total_orders'
+   
+   Expected: Number of active orders
+
+4. View Recent Filled Orders
+   $ curl -s http://127.0.0.1:8000/orders | jq '.filled_orders[-3:]'
+   
+   Expected: Last 3 filled orders with prices
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+RISK MANAGEMENT (Check Multiple Times Per Day)
+
+1. Circuit Breaker Status
+   $ curl -s http://127.0.0.1:8000/risk/summary | jq '.circuit_breaker'
+   
+   Expected: "CLOSED" (if "OPEN", wait 60 seconds for recovery)
+
+2. Position Limits
+   $ curl -s http://127.0.0.1:8000/risk/summary | jq '{total_positions, at_position_limit}'
+   
+   Expected: "at_position_limit": false
+
+3. Daily Loss Check
+   $ curl -s http://127.0.0.1:8000/risk/summary | jq '.daily_pnl_pct'
+   
+   Expected: > -3% (if < -3%, trading pauses automatically)
+
+4. Drawdown Check
+   $ curl -s http://127.0.0.1:8000/risk/summary | jq '.max_drawdown_pct'
+   
+   Expected: < 5% (max allowed)
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+EMERGENCY PROCEDURES (Use Only If Something Breaks)
+
+1. Bot Not Responding?
+   $ curl -s http://127.0.0.1:8000/health
+   
+   If error, restart:
+   $ pkill -9 -f "python3 main.py"
+   $ sleep 5
+   $ python3 main.py > logs/bot.log 2>&1 &
+   $ sleep 10
+   $ curl -s http://127.0.0.1:8000/health
+   
+   Expected: status = "ok"
+
+2. High Error Rate?
+   $ tail -50 logs/bot.log | grep -i error | wc -l
+   
+   If > 10 errors, check:
+   $ curl https://api.binance.com/api/v3/exchangeInfo
+   
+   If exchange is down, stop trading and wait for recovery
+
+3. Duplicate Orders Detected?
+   $ curl -s http://127.0.0.1:8000/orders | jq '.orders | group_by(.client_order_id) | map(select(length > 1)) | length'
+   
+   If > 0, STOP IMMEDIATELY:
+   $ pkill -9 -f "python3 main.py"
+   
+   Then contact support before restarting
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+LOG MONITORING (Troubleshooting)
+
+1. View Recent Logs
+   $ tail -20 logs/bot.log
+   
+   Look for: WARN, ERROR, CRITICAL
+
+2. View Orders In Audit Trail
+   $ tail -20 logs/audit.log
+   
+   Look for: ORDER_CREATED, ORDER_SUBMITTED, ORDER_FILLED
+
+3. View Alerts
+   $ tail -20 logs/alerts.log
+   
+   Look for: Any anomalies detected
+
+4. Check Full Error Count Today
+   $ grep -c ERROR logs/bot.log
+   
+   Expected: < 10 (< 1% error rate)
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+DOCUMENTATION QUICK ACCESS
+
+Question: "How do I deploy?"
+Answer: $ cat PRODUCTION_DEPLOYMENT_GUIDE.md
+
+Question: "What do I do every day?"
+Answer: $ cat OPERATIONAL_RUNBOOK.md
+
+Question: "How do I test this?"
+Answer: $ cat TESTING_GUIDE.md
+
+Question: "What safety features are in?"
+Answer: $ cat DEPLOYMENT_SUMMARY.md
+
+Question: "How do I activate this?"
+Answer: $ cat DEPLOYMENT_CHECKLIST.md
+
+Question: "What commands do I need?"
+Answer: $ cat QUICK_REFERENCE.txt (This file)
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+MONITORING SCHEDULE (Automated)
+
+6:00 AM   ├─ Auto health check
+12:00 PM  ├─ Auto health check
+6:00 PM   ├─ Auto health check
+12:00 AM  └─ Auto health check (overnight)
+
+Each check:
+✓ Tests bot is running
+✓ Verifies API responding
+✓ Checks paper mode is on
+✓ Confirms no duplicates
+✓ Verifies circuit breaker OK
+✓ Checks position limits
+✓ Checks daily loss limit
+✓ Verifies audit trail complete
+✓ Analyzes error logs
+✓ Generates alerts if issues found
+
+Auto-alerts saved to: logs/alerts.log
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+POSITION SIZING (Automatic)
+
+Position size = Equity × Max_Position_Percent × Leverage
+Default: $100,000 × 1% × 1 = $1,000 per signal
+
+Examples with $100,000 account:
+├─ BTC ($42,000): Can buy 0.024 BTC per signal
+├─ ETH ($2,500): Can buy 0.4 ETH per signal
+└─ USDC: Can use up to $1,000 notional
+
+Limits enforced automatically by risk_manager
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+RISK LIMITS (Never Exceed)
+
+Daily Loss Limit: -3% of account
+├─ Triggers automatic order cancellation
+└─ Resume trading next day
+
+Max Drawdown Limit: -5% of account
+├─ Position size reduced by 50%
+└─ Gradually restored over time
+
+Position Limit: 1% of equity per signal
+├─ Prevents overconcentration
+└─ Spreads risk across assets
+
+Circuit Breaker: 5 consecutive API failures
+├─ Stops all new orders
+├─ Waits 60 seconds
+└─ Automatically recovers when API returns
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+SUCCESS METRICS (Track These Week 1)
+
+Uptime
+$ curl -s http://127.0.0.1:8000/health | jq '.uptime_seconds'
+Goal: > 86,000 seconds (99.5%) over 7 days
+
+Duplicates
+$ curl -s http://127.0.0.1:8000/orders | jq '.total_orders'
+Goal: Every order ID appears exactly once
+
+Errors
+$ grep -c ERROR logs/bot.log
+Goal: < 10 errors per day
+
+Circuit Breaker
+$ curl -s http://127.0.0.1:8000/risk/summary | jq '.circuit_breaker'
+Goal: Always "CLOSED"
+
+Paper Mode
+$ curl -s http://127.0.0.1:8000/health | jq '.paper_mode'
+Goal: Always true
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+SCALING UP (After Week 1)
+
+If all success metrics pass:
+
+1. Increase Position Size
+   Edit config/settings.yaml:
+   max_position_pct: 0.02  # 2% instead of 1%
+
+2. Enable Paper → Real Money
+   (Instructions in OPERATIONAL_RUNBOOK.md)
+
+3. Scale Exchanges
+   Add: Kraken, OKX, Coinbase
+
+4. Enable ML Signals
+   Add: Signal scoring + ensemble voting
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+TROUBLESHOOTING FLOWCHART
+
+Bot not responding?
+├─ Is it running? → ps aux | grep python3 main.py
+├─ If no: → pkill -9 -f python3 && python3 main.py &
+└─ Still no? → Check logs/bot.log for errors
+
+High error rate?
+├─ Check exchange status: curl https://api.binance.com/api/v3/exchangeInfo
+├─ Check network: ping api.binance.com
+├─ If both OK: Restart bot
+└─ If still failing: Switch to paper mode
+
+Duplicate orders found?
+├─ STOP: pkill -9 -f python3 main.py
+├─ INVESTIGATE: Check logs/audit.log
+├─ MANUAL REVIEW REQUIRED
+└─ Contact support before restarting
+
+Circuit breaker open?
+├─ Status: OPEN (cascade detected)
+├─ Wait 60 seconds for recovery
+├─ Check: curl http://127.0.0.1:8000/risk/summary
+├─ If still OPEN: Check exchange status
+└─ If exchange OK: Contact support
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+KEYBOARD SHORTCUTS (If Using Terminal)
+
+Start bot:
+$ python3 main.py > logs/bot.log 2>&1 &
+
+Stop bot gracefully:
+$ pkill -TERM -f "python3 main.py"
+
+Stop bot forcefully:
+$ pkill -9 -f "python3 main.py"
+
+Check bot is running:
+$ ps aux | grep "[p]ython3 main.py"
+
+View bot PID:
+$ cat .bot.pid
+
+View live logs (follow mode):
+$ tail -f logs/bot.log
+
+View just errors:
+$ grep ERROR logs/bot.log
+
+Count errors today:
+$ grep -c ERROR logs/bot.log
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+BACKING UP YOUR DATA
+
+Every day at end of trading:
+$ cp logs/audit.log logs/backups/audit.$(date +%Y%m%d).log
+$ cp logs/bot.log logs/backups/bot.$(date +%Y%m%d).log
+
+Or use automatic backup:
+$ find logs -name "*.log" -mtime +7 -exec gzip {} \;
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+LIVE TRADING FIRST STEPS
+
+Day 1-2: Paper Trading Only
+├─ Just observe
+├─ Run 5-10 orders
+└─ Verify audit trail
+
+Day 3-7: Small Real Positions
+├─ Trade 0.001-0.01 BTC
+├─ Monitor daily P&L
+└─ Track success metrics
+
+Week 2+: Scale to Full Allocation
+├─ If week 1 metrics all pass
+├─ Gradually increase position size
+└─ Add secondary exchanges
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+EMERGENCY CONTACTS
+
+On-Call Engineer: __________________________
+DevOps Support:   __________________________
+Compliance:       __________________________
+
+Save these numbers!
+
+═══════════════════════════════════════════════════════════════════════════════════
+
+Print this page and keep by your desk. You'll reference it often.
+
+Questions? See OPERATIONAL_RUNBOOK.md for detailed answers.
+
+Good luck! 🚀

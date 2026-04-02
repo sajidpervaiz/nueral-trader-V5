@@ -74,6 +74,7 @@ class OKXExecutor:
 
         self.orderbook_cache: Dict[str, OrderbookSnapshot] = {}
         self.balance_cache: Dict[str, float] = {}
+        self.position_cache: Dict[str, Dict] = {}
 
         self._running = False
 
@@ -250,7 +251,7 @@ class OKXExecutor:
     async def get_positions(self) -> List[Dict]:
         """Get all open positions."""
         if self.paper_trading:
-            return []
+            return list(self.position_cache.values())
 
         try:
             positions_data = await self.exchange.fetch_positions()
@@ -267,11 +268,13 @@ class OKXExecutor:
                         "leverage": int(pos['leverage'] or 1),
                     })
 
+            self.position_cache = {p["symbol"]: p for p in positions}
+
             return positions
 
         except Exception as e:
             logger.error(f"Failed to fetch positions: {e}")
-            return []
+            return list(self.position_cache.values())
 
     async def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Set leverage for a symbol."""

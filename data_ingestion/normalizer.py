@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 import time
+from loguru import logger
 
 
 @dataclass
@@ -132,24 +133,45 @@ class Normalizer:
                     trade_id=str(data.get("tradeId", "")),
                 )
             if exchange == "kraken":
-                trades = raw if isinstance(raw, list) else []
-                if trades:
-                    t = trades[0]
-                    return Tick(
-                        exchange=exchange,
-                        symbol=self._unify_symbol(exchange, str(t[0])),
-                        timestamp_us=int(float(t[2]) * 1_000_000),
-                        price=float(t[0]) if len(t) > 0 else 0.0,
-                        volume=float(t[1]) if len(t) > 1 else 0.0,
-                        side="buy" if len(t) > 3 and t[3] == "b" else "sell",
-                        trade_id=str(t[5]) if len(t) > 5 else "",
-                    )
-        except (KeyError, ValueError, IndexError):
-            pass
+                # Canonical Kraken trade payload shape:
+                # [channel_id, [[price, volume, time, side, order_type, misc], ...], "trade", "XBT/USD"]
+                if isinstance(raw, list) and len(raw) >= 2:
+                    symbol_raw = str(raw[-1]) if len(raw) >= 4 else ""
+                    trades = raw[1] if isinstance(raw[1], list) else []
+
+                    if trades:
+                        first_trade = trades[0]
+                        if isinstance(first_trade, list):
+                            t = first_trade
+                        else:
+                            # Backward compatibility for any flattened list-like shape.
+                            t = raw
+
+                        return Tick(
+                            exchange=exchange,
+                            symbol=self._unify_symbol(exchange, symbol_raw),
+                            timestamp_us=int(float(t[2]) * 1_000_000) if len(t) > 2 else int(time.time_ns() // 1000),
+                            price=float(t[0]) if len(t) > 0 else 0.0,
+                            volume=float(t[1]) if len(t) > 1 else 0.0,
+                            side="buy" if len(t) > 3 and t[3] == "b" else "sell",
+                            trade_id=str(t[5]) if len(t) > 5 else "",
+                        )
+        except (KeyError, ValueError, IndexError) as exc:
+            logger.debug("normalize_tick failed for exchange {}: {}", exchange, exc)
         return None
 
     def _unify_symbol(self, exchange: str, symbol: str) -> str:
         mapping = self.EXCHANGE_SYMBOL_MAP.get(exchange, {})
-        return mapping.get(symbol, symbol.replace("-USDT-SWAP", "/USDT:USDT")
-                                          .replace("USDT", "/USDT:USDT")
-                                          .rstrip(":USDT"))
+        if symbol in mapping:
+            return mapping[symbol]
+
+        if exchange == "okx" and symbol.endswith("-USDT-SWAP"):
+            base = symbol[: -len("-USDT-SWAP")]
+            return f"{base}/USDT:USDT"
+
+        if exchange in {"binance", "bybit"} and symbol.endswith("USDT") and "/" not in symbol:
+            base = symbol[: -len("USDT")]
+            if base:
+                return f"{base}/USDT:USDT"
+
+        return symbol

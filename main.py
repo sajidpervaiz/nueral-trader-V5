@@ -32,6 +32,7 @@ from analysis.sentiment import SentimentManager
 from engine.signal_generator import SignalGenerator
 
 from execution.risk_manager import RiskManager
+from execution.order_manager import OrderManager
 from execution.exchange_factory import create_all_executors
 
 from storage.db_handler import DBHandler
@@ -85,12 +86,13 @@ async def main() -> None:
     data_manager = DataManager(config, event_bus)
     signal_gen = SignalGenerator(config, event_bus, data_manager)
     risk_mgr = RiskManager(config, event_bus)
+    order_mgr = OrderManager(config, event_bus, risk_mgr._circuit_breaker)
 
     executors = create_all_executors(config, event_bus, risk_mgr)
 
     telegram = TelegramNotifier(config, event_bus)
 
-    app = build_app(config, event_bus, risk_mgr, data_manager)
+    app = build_app(config, event_bus, risk_mgr, data_manager, order_mgr)
 
     dispatcher = Dispatcher(
         config=config,
@@ -122,6 +124,7 @@ async def main() -> None:
         asyncio.create_task(vix_proxy.run(), name="vix"),
         asyncio.create_task(sentiment.run(), name="sentiment"),
         asyncio.create_task(telegram.run(), name="telegram"),
+        asyncio.create_task(order_mgr.run(), name="order_manager"),
     ]
 
     for executor in executors:
@@ -133,6 +136,10 @@ async def main() -> None:
     await stop_event.wait()
     logger.info("Initiating graceful shutdown…")
 
+    # Close executors first
+    for executor in executors:
+        await executor.close()
+
     for task in tasks:
         task.cancel()
 
@@ -143,6 +150,7 @@ async def main() -> None:
     await oi_feed.stop()
     await sentiment.stop()
     await telegram.stop()
+    await order_mgr.stop()
 
     logger.info("Shutdown complete")
 

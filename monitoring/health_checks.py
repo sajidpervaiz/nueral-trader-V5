@@ -2,7 +2,7 @@
 Health checks for service monitoring.
 """
 
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, Optional
 from dataclasses import dataclass
 from enum import Enum
 import asyncio
@@ -57,6 +57,7 @@ class HealthChecker:
         self.check_interval = check_interval
 
         self.components: Dict[str, ComponentHealth] = {}
+        self._component_checks: Dict[str, Callable[[], Awaitable[bool | dict]]] = {}
         self.start_time = time.time()
         self.version = "4.0.0"
 
@@ -66,7 +67,7 @@ class HealthChecker:
     async def register_component(
         self,
         name: str,
-        check_func: callable,
+        check_func: Callable[[], Awaitable[bool | dict]],
     ) -> None:
         """Register a component for health checking."""
         self.components[name] = ComponentHealth(
@@ -76,13 +77,14 @@ class HealthChecker:
             message="Not yet checked",
             last_check=0.0,
         )
+        self._component_checks[name] = check_func
 
         logger.info(f"Registered health check component: {name}")
 
     async def check_component_health(
         self,
         name: str,
-        check_func: callable,
+        check_func: Callable[[], Awaitable[bool | dict]],
     ) -> ComponentHealth:
         """Check health of a specific component."""
         start_time = time.time()
@@ -136,15 +138,9 @@ class HealthChecker:
         """Check health of all registered components."""
         component_checks = []
 
-        for name in self.components:
-            # In production, each component would have its own check function
-            # For now, we'll create dummy checks
-            async def dummy_check():
-                await asyncio.sleep(0.01)
-                return True
-
+        for name, check_func in self._component_checks.items():
             check_task = asyncio.create_task(
-                self.check_component_health(name, dummy_check)
+                self.check_component_health(name, check_func)
             )
             component_checks.append(check_task)
 
@@ -251,24 +247,98 @@ class HealthChecker:
         """Register standard health checks."""
         # Database
         async def check_database():
-            # Placeholder - would check actual database
-            return True
+            try:
+                import asyncpg  # type: ignore
+            except Exception:
+                return {
+                    "status": "DEGRADED",
+                    "message": "asyncpg not installed",
+                }
 
-        asyncio.create_task(self.register_component("database", check_database))
+            import os
+            host = os.environ.get("POSTGRES_HOST", "localhost")
+            port = int(os.environ.get("POSTGRES_PORT", "5432"))
+            user = os.environ.get("POSTGRES_USER", "trader")
+            password = os.environ.get("POSTGRES_PASSWORD", "")
+            database = os.environ.get("POSTGRES_DB", "neural_trader")
+
+            conn = await asyncpg.connect(
+                host=host,
+                port=port,
+                user=user,
+                password=password,
+                database=database,
+                timeout=2.0,
+            )
+            await conn.close()
+            return {
+                "status": "HEALTHY",
+                "message": "database reachable",
+            }
 
         # Redis
         async def check_redis():
-            # Placeholder - would check actual Redis
-            return True
+            try:
+                import redis.asyncio as redis  # type: ignore
+            except Exception:
+                return {
+                    "status": "DEGRADED",
+                    "message": "redis client not installed",
+                }
 
-        asyncio.create_task(self.register_component("redis", check_redis))
+            import os
+            host = os.environ.get("REDIS_HOST", "localhost")
+            port = int(os.environ.get("REDIS_PORT", "6379"))
+            password = os.environ.get("REDIS_PASSWORD", "")
+
+            client = redis.Redis(
+                host=host,
+                port=port,
+                password=password or None,
+                socket_timeout=2.0,
+                decode_responses=True,
+            )
+            pong = await client.ping()
+            await client.close()
+            return {
+                "status": "HEALTHY" if pong else "UNHEALTHY",
+                "message": "redis reachable" if pong else "redis ping failed",
+            }
 
         # Trading engine
         async def check_trading_engine():
-            # Placeholder - would check trading engine
-            return True
+            await asyncio.sleep(0)
+            return {
+                "status": "HEALTHY",
+                "message": "event loop responsive",
+            }
 
-        asyncio.create_task(self.register_component("trading_engine", check_trading_engine))
+        self.components["database"] = ComponentHealth(
+            component="database",
+            status=HealthStatus.UNKNOWN,
+            latency_ms=0.0,
+            message="Not yet checked",
+            last_check=0.0,
+        )
+        self._component_checks["database"] = check_database
+
+        self.components["redis"] = ComponentHealth(
+            component="redis",
+            status=HealthStatus.UNKNOWN,
+            latency_ms=0.0,
+            message="Not yet checked",
+            last_check=0.0,
+        )
+        self._component_checks["redis"] = check_redis
+
+        self.components["trading_engine"] = ComponentHealth(
+            component="trading_engine",
+            status=HealthStatus.UNKNOWN,
+            latency_ms=0.0,
+            message="Not yet checked",
+            last_check=0.0,
+        )
+        self._component_checks["trading_engine"] = check_trading_engine
 
 
 # Global health checker instance

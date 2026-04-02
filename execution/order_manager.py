@@ -1,25 +1,47 @@
 """
-Order Manager with idempotent orders, lifecycle tracking, and self-trade prevention.
+Production-grade Order Manager with idempotency, lifecycle tracking,
+and self-trade prevention.
 """
 
 import asyncio
 import time
 import uuid
-from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Dict, List, Optional, Tuple
 from loguru import logger
+
+from core.config import Config
+from core.event_bus import EventBus
+from core.circuit_breaker import CircuitBreaker
+from core.idempotency import IdempotencyManager
+from core.retry import RetryPolicy
 
 
 class OrderStatus(Enum):
-    PENDING = "PENDING"
-    SUBMITTED = "SUBMITTED"
-    PARTIALLY_FILLED = "PARTIALLY_FILLED"
-    FILLED = "FILLED"
-    CANCELLED = "CANCELLED"
-    REJECTED = "REJECTED"
-    FAILED = "FAILED"
-    EXPIRED = "EXPIRED"
+    """Order lifecycle states"""
+    PENDING = "pending"
+    SUBMITTED = "submitted"
+    OPEN = "open"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
+class OrderSide(Enum):
+    """Order side (buy/sell)"""
+    BUY = "buy"
+    SELL = "sell"
+
+
+class OrderType(Enum):
+    """Order type"""
+    LIMIT = "limit"
+    MARKET = "market"
+    POST_ONLY = "post_only"
+    IOC = "ioc"
 
 
 class OrderLifecycleStage(Enum):
@@ -41,20 +63,41 @@ class OrderStage:
 
 
 @dataclass
+class OrderFill:
+    """Represents a partial or complete fill"""
+    fill_id: str
+    timestamp: int
+    quantity: float
+    price: float
+    fee: float = 0.0
+    fee_currency: str = "USDT"
+
+    @property
+    def total_value(self) -> float:
+        """Total value of fill (quantity * price)"""
+        return self.quantity * self.price
+
+
+@dataclass
 class Order:
     order_id: str
     client_order_id: Optional[str]
     symbol: str
-    side: str
-    order_type: str
+    side: OrderSide
+    order_type: OrderType
     quantity: float
     price: Optional[float]
     status: OrderStatus
     filled_quantity: float = 0.0
     remaining_quantity: float = 0.0
     avg_fill_price: float = 0.0
+    cumulative_quantity: float = 0.0
+    average_fill_price: float = 0.0
+    total_fee: float = 0.0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    submitted_at: Optional[int] = None
+    filled_at: Optional[int] = None
     exchange_order_id: Optional[str] = None
     venue: Optional[str] = None
     time_in_force: str = "GTC"
@@ -62,6 +105,7 @@ class Order:
     user_id: Optional[str] = None
     tags: List[str] = field(default_factory=list)
     stages: List[OrderStage] = field(default_factory=list)
+    fills: List[OrderFill] = field(default_factory=list)
     error_message: Optional[str] = None
     metadata: Dict = field(default_factory=dict)
 
@@ -100,48 +144,92 @@ class Order:
 class OrderManager:
     """
     Production-grade order manager with:
-    - Idempotency keys
+    - Idempotent order placement
     - Lifecycle tracking
     - Self-trade prevention
-    - Order state management
-    - Venue abstraction
+    - Order amend/cancel with retry logic
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        config: Config,
+        event_bus: EventBus,
+        circuit_breaker: CircuitBreaker,
+    ):
+        self.config = config
+        self.event_bus = event_bus
+        self.circuit_breaker = circuit_breaker
+        
+        # Order storage
         self.orders: Dict[str, Order] = {}
         self.client_order_map: Dict[str, Order] = {}
         self.exchange_order_map: Dict[str, Order] = {}
         self.pending_orders: Dict[str, Order] = {}
         self.user_orders: Dict[str, Dict[str, Order]] = {}
-
+        
+        # Idempotency manager
+        self.idempotency = IdempotencyManager(ttl=86400, max_size=50000)
+        
+        # Retry policy
+        self.retry_policy = RetryPolicy(max_attempts=3, base_delay=0.1)
+        
+        # Self-trade prevention window
+        self.self_trade_window_ms = 60000
+        
+        # Audit trail
+        self.audit_log: List[Dict] = []
+        self.max_audit_log_size = 100000
+        
         self._lock = asyncio.Lock()
+        self._running = False
 
-    async def create_order(
+    def generate_client_order_id(self, exchange: str, symbol: str, side: OrderSide) -> str:
+        """Generate unique client order ID"""
+        timestamp_ms = int(time.time() * 1000)
+        unique_part = str(uuid.uuid4())[:8]
+        return f"{exchange}-{symbol}-{side.value[0]}-{timestamp_ms}-{unique_part}"
+
+    async def place_order(
         self,
+        exchange: str,
         symbol: str,
-        side: str,
-        order_type: str,
+        side: OrderSide,
         quantity: float,
-        price: Optional[float] = None,
-        venue: Optional[str] = None,
+        price: float,
+        order_type: OrderType = OrderType.LIMIT,
         client_order_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-        reduce_only: bool = False,
-        time_in_force: str = "GTC",
-        tags: Optional[List[str]] = None,
         metadata: Optional[Dict] = None,
-    ) -> Order:
-        """Create a new order with idempotency key."""
+    ) -> Tuple[bool, Optional[Order], str]:
+        """
+        Place order with idempotency and self-trade prevention.
+        
+        Returns:
+            (success: bool, order: Order, reason: str)
+        """
         async with self._lock:
-            order_id = f"ord_{uuid.uuid4().hex[:12]}_{int(time.time() * 1000)}"
+            # Check circuit breaker
+            if self.circuit_breaker.get_state().value == "OPEN":
+                return False, None, "circuit_breaker_open"
 
+            # Use caller-provided client order ID when supplied; otherwise generate one.
             if not client_order_id:
-                client_order_id = f"cli_{uuid.uuid4().hex[:12]}"
+                client_order_id = self.generate_client_order_id(exchange, symbol, side)
+            
+            # Check idempotency
+            if self.idempotency.check_and_set(client_order_id):
+                cached_order = self.client_order_map.get(client_order_id)
+                if cached_order:
+                    logger.info(f"Order {client_order_id} already placed (idempotent retry)")
+                    return True, cached_order, "idempotent_retry"
 
-            if client_order_id in self.client_order_map:
-                logger.warning(f"Duplicate client_order_id detected: {client_order_id}")
-                return self.client_order_map[client_order_id]
+            # Self-trade prevention
+            self_trade_reason = self._check_self_trade(exchange, symbol, side)
+            if self_trade_reason:
+                logger.warning(f"Self-trade prevented for {symbol}: {self_trade_reason}")
+                return False, None, self_trade_reason
 
+            # Create order
+            order_id = f"ord_{uuid.uuid4().hex[:12]}_{int(time.time() * 1000)}"
             order = Order(
                 order_id=order_id,
                 client_order_id=client_order_id,
@@ -151,193 +239,202 @@ class OrderManager:
                 quantity=quantity,
                 price=price,
                 status=OrderStatus.PENDING,
-                venue=venue,
-                user_id=user_id,
-                reduce_only=reduce_only,
-                time_in_force=time_in_force,
-                tags=tags or [],
+                exchange_order_id=None,
+                venue=exchange,
                 metadata=metadata or {},
             )
 
-            order.add_stage(OrderLifecycleStage.VALIDATION)
-
+            # Store order
             self.orders[order_id] = order
             self.client_order_map[client_order_id] = order
             self.pending_orders[order_id] = order
+            self.idempotency.set_result(client_order_id, order)
+            self._record_audit("ORDER_CREATED", order)
 
-            if user_id:
-                if user_id not in self.user_orders:
-                    self.user_orders[user_id] = {}
-                self.user_orders[user_id][order_id] = order
+            logger.info(
+                f"Order created: {client_order_id} {side.value} {quantity} {symbol} @ {price}"
+            )
+            
+            return True, order, "created"
 
-            logger.info(f"Order created: {order_id} for {symbol}")
-            return order
-
-    async def submit_order(self, order: Order, exchange_order_id: str) -> bool:
-        """Mark order as submitted to exchange."""
-        async with self._lock:
-            if order.order_id not in self.orders:
-                logger.error(f"Order not found: {order.order_id}")
-                return False
-
-            order.status = OrderStatus.SUBMITTED
-            order.exchange_order_id = exchange_order_id
-            order.add_stage(OrderLifecycleStage.SUBMISSION)
-
-            if exchange_order_id:
-                self.exchange_order_map[exchange_order_id] = order
-
-            if order.order_id in self.pending_orders:
-                del self.pending_orders[order.order_id]
-
-            logger.info(f"Order submitted: {order.order_id} -> {exchange_order_id}")
-            return True
-
-    async def update_order_status(
-        self,
-        order_id: str,
-        status: OrderStatus,
-        error_message: Optional[str] = None,
-    ) -> bool:
-        """Update order status."""
-        async with self._lock:
-            order = self.get_order(order_id)
-            if not order:
-                return False
-
-            old_status = order.status
-            order.status = status
-            order.error_message = error_message
-            order.updated_at = time.time()
-
-            if status in [OrderStatus.CANCELLED, OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.FAILED]:
-                if order.order_id in self.pending_orders:
-                    del self.pending_orders[order.order_id]
-
-            logger.info(f"Order status updated: {order_id} {old_status} -> {status}")
-            return True
-
-    async def update_order_fill(
-        self,
-        order_id: str,
-        fill_qty: float,
-        fill_price: float,
-    ) -> bool:
-        """Update order with fill information."""
-        async with self._lock:
-            order = self.get_order(order_id)
-            if not order:
-                return False
-
-            order.update_fill(fill_qty, fill_price)
-            logger.debug(f"Order fill updated: {order_id} +{fill_qty} @ {fill_price}")
-            return True
-
-    async def cancel_order(self, order_id: str) -> bool:
-        """Cancel an order."""
-        async with self._lock:
-            order = self.get_order(order_id)
-            if not order:
-                logger.error(f"Order not found: {order_id}")
-                return False
-
-            order.status = OrderStatus.CANCELLED
-            order.add_stage(OrderLifecycleStage.CANCELLATION)
-
-            if order.order_id in self.pending_orders:
-                del self.pending_orders[order.order_id]
-
-            logger.info(f"Order cancelled: {order_id}")
-            return True
-
-    def get_order(self, order_id: str) -> Optional[Order]:
-        """Get order by order ID."""
-        return self.orders.get(order_id)
-
-    def get_order_by_client_id(self, client_order_id: str) -> Optional[Order]:
-        """Get order by client order ID."""
-        return self.client_order_map.get(client_order_id)
-
-    def get_order_by_exchange_id(self, exchange_order_id: str) -> Optional[Order]:
-        """Get order by exchange order ID."""
-        return self.exchange_order_map.get(exchange_order_id)
-
-    def get_user_orders(self, user_id: str) -> List[Order]:
-        """Get all orders for a user."""
-        return list(self.user_orders.get(user_id, {}).values())
-
-    def get_pending_orders(self) -> List[Order]:
-        """Get all pending orders."""
-        return list(self.pending_orders.values())
-
-    def get_orders_by_symbol(self, symbol: str) -> List[Order]:
-        """Get all orders for a symbol."""
-        return [o for o in self.orders.values() if o.symbol == symbol]
-
-    async def check_self_trade_prevention(
-        self,
-        user_id: str,
-        symbol: str,
-        side: str,
-    ) -> bool:
-        """
-        Check if order would result in self-trade.
-
-        Returns True if self-trade would occur.
-        """
-        user_orders = self.get_user_orders(user_id)
-        pending_orders = [
-            o for o in user_orders
-            if o.symbol == symbol
-            and o.side != side
-            and o.status in [OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED]
+    def _check_self_trade(self, exchange: str, symbol: str, side: OrderSide) -> Optional[str]:
+        """Check for self-trade risk"""
+        open_orders = [
+            o for o in self.orders.values()
+            if o.venue == exchange 
+            and o.symbol == symbol
+            and o.status in [OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
         ]
 
-        if pending_orders:
-            logger.warning(
-                f"Self-trade prevention triggered for user {user_id} "
-                f"on {symbol}. Opposing orders: {[o.order_id for o in pending_orders]}"
+        for order in open_orders:
+            if order.side != side:
+                age_ms = int(time.time() * 1000) - int(order.created_at * 1000)
+                if age_ms < self.self_trade_window_ms:
+                    return f"opposing_order_open ({order.client_order_id})"
+
+        return None
+
+    async def confirm_order_submission(
+        self,
+        client_order_id: str,
+        exchange_order_id: str,
+    ) -> Optional[Order]:
+        """Confirm order submitted to exchange"""
+        async with self._lock:
+            order = self.client_order_map.get(client_order_id)
+            if not order:
+                logger.error(f"Order {client_order_id} not found for confirmation")
+                return None
+
+            order.exchange_order_id = exchange_order_id
+            order.status = OrderStatus.SUBMITTED
+            order.submitted_at = int(time.time() * 1000)
+            
+            self.exchange_order_map[(order.venue, exchange_order_id)] = order
+            self._record_audit("ORDER_SUBMITTED", order)
+            logger.debug(f"Order {client_order_id} submitted")
+
+            return order
+
+    async def record_fill(
+        self,
+        client_order_id: str,
+        fill_id: str,
+        quantity: float,
+        price: float,
+        fee: float = 0.0,
+    ) -> Optional[Order]:
+        """Record a fill for an order"""
+        async with self._lock:
+            order = self.client_order_map.get(client_order_id)
+            if not order:
+                logger.error(f"Order {client_order_id} not found for fill")
+                return None
+
+            fill = OrderFill(
+                fill_id=fill_id,
+                timestamp=int(time.time() * 1000),
+                quantity=quantity,
+                price=price,
+                fee=fee,
             )
-            return True
 
-        return False
+            order.fills.append(fill)
+            order.cumulative_quantity += quantity
+            order.total_fee += fee
+            
+            total_value = sum(f.quantity * f.price for f in order.fills)
+            order.average_fill_price = total_value / order.cumulative_quantity if order.cumulative_quantity > 0 else 0.0
+            
+            if abs(order.cumulative_quantity - order.quantity) < 1e-8:
+                order.status = OrderStatus.FILLED
+                order.filled_at = fill.timestamp
+            elif order.cumulative_quantity > 0:
+                order.status = OrderStatus.PARTIALLY_FILLED
 
-    async def cleanup_old_orders(self, max_age_hours: int = 24) -> int:
-        """Clean up old completed orders."""
-        cutoff_time = time.time() - (max_age_hours * 3600)
-        orders_to_remove = []
+            self._record_audit("ORDER_FILL", order)
+            logger.info(
+                f"Fill recorded for {client_order_id}: {quantity} @ {price} (fee={fee})"
+            )
 
-        for order_id, order in self.orders.items():
-            if (
-                order.status in [OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED]
-                and order.updated_at < cutoff_time
-            ):
-                orders_to_remove.append(order_id)
+            return order
 
-        for order_id in orders_to_remove:
-            order = self.orders.pop(order_id)
-            if order.client_order_id:
-                self.client_order_map.pop(order.client_order_id, None)
-            if order.exchange_order_id:
-                self.exchange_order_map.pop(order.exchange_order_id, None)
-            if order.order_id in self.pending_orders:
-                del self.pending_orders[order.order_id]
-            if order.user_id and order.user_id in self.user_orders:
-                self.user_orders[order.user_id].pop(order.order_id, None)
+    async def cancel_order(
+        self,
+        client_order_id: str,
+        reason: str = "",
+    ) -> Tuple[bool, Optional[Order], str]:
+        """Cancel an open order"""
+        async with self._lock:
+            order = self.client_order_map.get(client_order_id)
+            if not order:
+                return False, None, "order_not_found"
 
-        logger.info(f"Cleaned up {len(orders_to_remove)} old orders")
-        return len(orders_to_remove)
+            if order.status not in [OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]:
+                return False, order, f"order_not_active ({order.status.value})"
 
-    def get_order_statistics(self) -> Dict:
-        """Get order statistics."""
-        status_counts = {}
-        for order in self.orders.values():
-            status = order.status.value
-            status_counts[status] = status_counts.get(status, 0) + 1
+            order.status = OrderStatus.CANCELLED
+            self._record_audit("ORDER_CANCELLED", order)
+
+            logger.info(f"Order {client_order_id} cancelled: {reason}")
+
+            return True, order, "cancelled"
+
+    def _record_audit(self, event_type: str, order: Order) -> None:
+        """Record audit trail entry"""
+        entry = {
+            "timestamp": int(time.time() * 1000),
+            "event_type": event_type,
+            "client_order_id": order.client_order_id,
+            "exchange_order_id": order.exchange_order_id,
+            "symbol": order.symbol,
+            "status": order.status.value,
+            "cumulative_quantity": order.cumulative_quantity,
+            "average_fill_price": order.average_fill_price,
+        }
+
+        self.audit_log.append(entry)
+
+        # Enforce size limit
+        if len(self.audit_log) > self.max_audit_log_size:
+            self.audit_log = self.audit_log[-self.max_audit_log_size:]
+
+    def get_order(self, client_order_id: str) -> Optional[Order]:
+        """Get order by client ID"""
+        return self.client_order_map.get(client_order_id)
+
+    def get_orders_by_symbol(self, exchange: str, symbol: str) -> List[Order]:
+        """Get all orders for a symbol"""
+        return [
+            o for o in self.orders.values()
+            if o.venue == exchange and o.symbol == symbol
+        ]
+
+    def get_open_orders(self, exchange: Optional[str] = None) -> List[Order]:
+        """Get all open/active orders"""
+        orders = [
+            o for o in self.orders.values()
+            if o.status in [OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
+        ]
+        if exchange:
+            orders = [o for o in orders if o.venue == exchange]
+        return orders
+
+    def get_filled_orders(self, exchange: Optional[str] = None) -> List[Order]:
+        """Get all filled orders"""
+        orders = [o for o in self.orders.values() if o.status == OrderStatus.FILLED]
+        if exchange:
+            orders = [o for o in orders if o.venue == exchange]
+        return orders
+
+    def get_stats(self) -> Dict:
+        """Get order manager statistics"""
+        open_orders = self.get_open_orders()
+        filled_orders = self.get_filled_orders()
+
+        total_value_filled = sum(
+            o.cumulative_quantity * o.average_fill_price
+            for o in filled_orders
+        )
 
         return {
             "total_orders": len(self.orders),
-            "pending_orders": len(self.pending_orders),
-            "status_distribution": status_counts,
-            "users_count": len(self.user_orders),
+            "open_orders": len(open_orders),
+            "filled_orders": len(filled_orders),
+            "total_fill_value": total_value_filled,
+            "total_fees": sum(o.total_fee for o in filled_orders),
+            "idempotency_records": self.idempotency.get_stats()["total_records"],
+            "audit_log_size": len(self.audit_log),
         }
+
+    async def run(self) -> None:
+        """Start order manager"""
+        self._running = True
+        logger.info("OrderManager started")
+        while self._running:
+            await asyncio.sleep(60)
+
+    async def stop(self) -> None:
+        """Stop order manager"""
+        self._running = False
+        logger.info("OrderManager stopped")

@@ -8,8 +8,14 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-import aiohttp
 from loguru import logger
+
+try:
+    import aiohttp
+    _AIOHTTP = True
+except ImportError:
+    aiohttp = None
+    _AIOHTTP = False
 
 
 class FedEventType(Enum):
@@ -51,12 +57,21 @@ class FedCalendar:
 
     async def initialize(self) -> None:
         """Initialize Fed Calendar."""
-        self._http_session = aiohttp.ClientSession()
+        if _AIOHTTP:
+            self._http_session = aiohttp.ClientSession()
+        elif not self.paper_mode:
+            logger.warning("aiohttp not installed — falling back to paper mode for FedCalendar")
+            self.paper_mode = True
 
         await self._load_fomc_dates()
         await self._load_scheduled_speeches()
+        self._rebuild_index()
 
         logger.info(f"Loaded {len(self.events)} Fed events")
+
+    def _rebuild_index(self) -> None:
+        """Rebuild O(1) event lookup index by event_id."""
+        self.event_index = {event.event_id: event for event in self.events}
 
     async def _load_fomc_dates(self) -> None:
         """Load FOMC meeting dates."""
@@ -85,16 +100,22 @@ class FedCalendar:
                     data = await response.json()
 
                     for meeting in data.get('meetings', []):
-                        event = FedEvent(
-                            event_id=f"fomc_{meeting.get('date', '')}",
-                            event_type=FedEventType.FOMC_DECISION,
-                            title=meeting.get('title', 'FOMC Meeting'),
-                            description=meeting.get('statement', ''),
-                            date=datetime.fromisoformat(meeting.get('date', '')),
-                            importance=5,
-                            expected_impact="HIGH",
-                        )
-                        self.events.append(event)
+                        meeting_date = meeting.get('date')
+                        if not meeting_date:
+                            continue
+                        try:
+                            event = FedEvent(
+                                event_id=f"fomc_{meeting_date}",
+                                event_type=FedEventType.FOMC_DECISION,
+                                title=meeting.get('title', 'FOMC Meeting'),
+                                description=meeting.get('statement', ''),
+                                date=datetime.fromisoformat(meeting_date),
+                                importance=5,
+                                expected_impact="HIGH",
+                            )
+                            self.events.append(event)
+                        except ValueError:
+                            logger.debug("Skipping FOMC meeting with invalid date: {}", meeting_date)
 
         except Exception as e:
             logger.error(f"Error loading FOMC dates: {e}")
@@ -207,15 +228,19 @@ class FedCalendar:
 
     def is_fomc_week(self) -> bool:
         """Check if we're in FOMC week (week of meeting)."""
-        next_fomc = next(
-            (e for e in self.events if e.event_type == FedEventType.FOMC_DECISION),
-            None
+        now = datetime.now()
+        upcoming_fomc = sorted(
+            [
+                e for e in self.events
+                if e.event_type == FedEventType.FOMC_DECISION and e.date >= now
+            ],
+            key=lambda e: e.date,
         )
+        next_fomc = upcoming_fomc[0] if upcoming_fomc else None
 
         if not next_fomc:
             return False
 
-        now = datetime.now()
         days_diff = (next_fomc.date - now).days
 
         return -1 <= days_diff <= 3

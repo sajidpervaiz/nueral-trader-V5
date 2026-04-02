@@ -2,13 +2,23 @@
 Risk API routes for FastAPI dashboard.
 """
 
+import time
 from fastapi import APIRouter, HTTPException, Query, Body
-from typing import List, Optional, Dict
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 from enum import Enum
 from loguru import logger
 
+from engine.signal_generator import TradingSignal
+from execution.risk_manager import RiskManager
+
 router = APIRouter(prefix="/risk", tags=["risk"])
+_RISK_MANAGER: Optional[RiskManager] = None
+
+
+def configure_risk_routes(risk_manager: Optional[RiskManager]) -> None:
+    global _RISK_MANAGER
+    _RISK_MANAGER = risk_manager
 
 
 class RiskLimitType(str, Enum):
@@ -45,12 +55,27 @@ class RiskCheck(BaseModel):
     exposure_after: Optional[float]
 
 
+def _require_risk_manager() -> RiskManager:
+    if _RISK_MANAGER is None:
+        raise HTTPException(status_code=503, detail="risk_manager_unavailable")
+    return _RISK_MANAGER
+
+
 @router.get("/limits", response_model=RiskLimits)
 async def get_risk_limits():
     """Get current risk limits."""
     try:
-        # Placeholder - would fetch from risk manager
-        return RiskLimits()
+        manager = _require_risk_manager()
+        snap = manager.get_risk_snapshot()
+        max_position_value = snap["equity"] * manager._max_position_pct * manager._leverage
+        return RiskLimits(
+            max_position_value=max(1.0, float(max_position_value)),
+            max_order_size=max(1.0, float(max_position_value)),
+            max_orders_per_sec=100,
+            max_concentration=0.3,
+            leverage_limit=float(manager._leverage),
+            stop_loss_pct=float(manager.config.get_value("risk", "stop_loss_pct", default=0.015)),
+        )
 
     except Exception as e:
         logger.error(f"Error fetching risk limits: {e}")
@@ -64,10 +89,15 @@ async def set_risk_limits(
 ):
     """Update risk limits."""
     try:
-        # Placeholder - would update risk manager
+        manager = _require_risk_manager()
+        manager._leverage = float(max(0.1, limits.leverage_limit))
+        # Convert max position value back into a position percentage of equity.
+        if manager.equity > 0:
+            manager._max_position_pct = float(min(1.0, max(0.0001, limits.max_position_value / manager.equity)))
         return {
             "status": "updated",
             "limits": limits.dict(),
+            "user_id": user_id,
         }
 
     except Exception as e:
@@ -81,15 +111,20 @@ async def get_margin_info(
 ):
     """Get margin information."""
     try:
-        # Placeholder - would fetch from risk engine
+        manager = _require_risk_manager()
+        snap = manager.get_risk_snapshot()
+        margin_used = float(snap["portfolio_notional_usd"]) / max(1.0, manager._leverage)
+        margin_available = max(0.0, float(snap["equity"]) - margin_used)
+        leverage_used = float(snap["portfolio_notional_usd"]) / max(1.0, float(snap["equity"]))
+        health_score = max(0.0, min(1.0, 1.0 - snap["var_95"]))
         return MarginInfo(
-            account_balance=1_000_000.0,
-            margin_available=800_000.0,
-            margin_used=200_000.0,
-            total_exposure=500_000.0,
-            leverage_used=5.0,
+            account_balance=float(snap["equity"]),
+            margin_available=float(margin_available),
+            margin_used=float(margin_used),
+            total_exposure=float(snap["portfolio_notional_usd"]),
+            leverage_used=float(leverage_used),
             liquidation_price=None,
-            health_score=0.95,
+            health_score=float(health_score),
         )
 
     except Exception as e:
@@ -100,7 +135,7 @@ async def get_margin_info(
 @router.post("/check", response_model=RiskCheck)
 async def check_risk(
     symbol: str = Query(...),
-    side: str = Query(..., regex="^(buy|sell)$"),
+    side: str = Query(..., pattern="^(buy|sell)$"),
     quantity: float = Query(..., gt=0),
     price: float = Query(..., gt=0),
     user_id: Optional[str] = Query(None),
@@ -109,17 +144,42 @@ async def check_risk(
     Check if order passes risk controls.
     """
     try:
-        # Placeholder - would run actual risk checks
-        passed = True
-        reason = "All checks passed"
-        margin_required = quantity * price * 0.1
-        exposure_after = 500_000.0 + quantity * price
+        manager = _require_risk_manager()
+        side = side.lower()
+        sl_pct = float(manager.config.get_value("risk", "stop_loss_pct", default=0.015))
+        tp_pct = float(manager.config.get_value("risk", "take_profit_pct", default=0.03))
+        is_buy = side == "buy"
+        stop_loss = price * (1 - sl_pct) if is_buy else price * (1 + sl_pct)
+        take_profit = price * (1 + tp_pct) if is_buy else price * (1 - tp_pct)
+
+        signal = TradingSignal(
+            exchange="api",
+            symbol=symbol,
+            direction="long" if is_buy else "short",
+            score=0.8,
+            technical_score=0.8,
+            ml_score=0.8,
+            sentiment_score=0.0,
+            macro_score=0.0,
+            regime="api",
+            regime_confidence=1.0,
+            price=price,
+            atr=price * 0.01,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timestamp=int(time.time()),
+            metadata={"user_id": user_id, "quantity": quantity},
+        )
+
+        passed, reason, approved_notional = manager.approve_signal(signal)
+        margin_required = approved_notional / max(1.0, manager._leverage)
+        exposure_after = manager.portfolio_notional() + approved_notional
 
         return RiskCheck(
-            passed=passed,
+            passed=bool(passed),
             reason=reason,
-            margin_required=margin_required,
-            exposure_after=exposure_after,
+            margin_required=float(margin_required),
+            exposure_after=float(exposure_after),
         )
 
     except Exception as e:
@@ -133,22 +193,23 @@ async def get_exposure_breakdown(
 ):
     """Get exposure breakdown by symbol and venue."""
     try:
-        # Placeholder - would fetch from risk engine
+        manager = _require_risk_manager()
+        by_symbol: dict[str, float] = {}
+        by_venue: dict[str, float] = {}
+        by_side: dict[str, float] = {"long": 0.0, "short": 0.0}
+
+        for pos in manager.positions.values():
+            exposure = abs(float(pos.size) * float(pos.current_price))
+            by_symbol[pos.symbol] = by_symbol.get(pos.symbol, 0.0) + exposure
+            by_venue[pos.exchange] = by_venue.get(pos.exchange, 0.0) + exposure
+            by_side[pos.direction] = by_side.get(pos.direction, 0.0) + exposure
+
+        total_exposure = float(sum(by_symbol.values()))
         return {
-            "total_exposure": 500_000.0,
-            "by_symbol": {
-                "BTC/USDT": 300_000.0,
-                "ETH/USDT": 200_000.0,
-            },
-            "by_venue": {
-                "binance": 250_000.0,
-                "bybit": 150_000.0,
-                "okx": 100_000.0,
-            },
-            "by_side": {
-                "long": 400_000.0,
-                "short": 100_000.0,
-            },
+            "total_exposure": total_exposure,
+            "by_symbol": by_symbol,
+            "by_venue": by_venue,
+            "by_side": by_side,
         }
 
     except Exception as e:
@@ -160,26 +221,19 @@ async def get_exposure_breakdown(
 async def get_circuit_breaker_status():
     """Get circuit breaker status across venues."""
     try:
-        # Placeholder - would fetch from circuit breaker
+        manager = _require_risk_manager()
+        cb = manager._circuit_breaker
+        state = "OPEN" if cb.tripped else "CLOSED"
         return {
             "venues": {
-                "binance": {
-                    "state": "CLOSED",
+                "global_risk": {
+                    "state": state,
                     "failure_count": 0,
                     "last_failure_time": None,
-                },
-                "bybit": {
-                    "state": "CLOSED",
-                    "failure_count": 0,
-                    "last_failure_time": None,
-                },
-                "okx": {
-                    "state": "CLOSED",
-                    "failure_count": 0,
-                    "last_failure_time": None,
-                },
+                    "reason": cb.trip_reason,
+                }
             },
-            "overall_status": "HEALTHY",
+            "overall_status": "HEALTHY" if state == "CLOSED" else "TRIPPED",
         }
 
     except Exception as e:
@@ -191,7 +245,8 @@ async def get_circuit_breaker_status():
 async def reset_circuit_breaker(venue: str = Query(...)):
     """Reset circuit breaker for a venue."""
     try:
-        # Placeholder - would reset circuit breaker
+        manager = _require_risk_manager()
+        manager._circuit_breaker.reset()
         return {
             "venue": venue,
             "status": "reset",
@@ -212,11 +267,19 @@ async def run_stress_test(
     Scenarios: flash_crash, liquidity_crisis, correlation_breakdown, extreme_volatility
     """
     try:
-        # Placeholder - would run stress test
+        manager = _require_risk_manager()
+        scenario_map = {
+            "flash_crash": [-0.20],
+            "liquidity_crisis": [-0.10],
+            "correlation_breakdown": [-0.15],
+            "extreme_volatility": [-0.05, -0.10, -0.20],
+        }
+        shocks = scenario_map.get(scenario, [-0.10])
+        report = manager.run_stress_test(shocks=shocks, correlation_breakdown_factor=1.5)
         return {
             "scenario": scenario,
-            "status": "running",
-            "message": "Stress test initiated",
+            "status": "completed",
+            "report": report,
         }
 
     except Exception as e:

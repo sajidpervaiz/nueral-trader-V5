@@ -80,9 +80,15 @@ class CircuitBreaker:
         self.last_failure_time = time.time()
 
         if self.state == CircuitState.HALF_OPEN:
-            asyncio.create_task(self._transition_to_open())
+            # Transition immediately to keep behavior deterministic for callers/tests.
+            self.state = CircuitState.OPEN
+            self.success_count = 0
+            logger.warning("Circuit breaker OPENED from HALF_OPEN after failure")
         elif self.failure_count >= self.failure_threshold:
-            asyncio.create_task(self._transition_to_open())
+            # Transition immediately to keep behavior deterministic for callers/tests.
+            self.state = CircuitState.OPEN
+            self.success_count = 0
+            logger.warning(f"Circuit breaker OPENED: {self.failure_count} failures")
 
     async def _transition_to_open(self) -> None:
         """Transition to OPEN state."""

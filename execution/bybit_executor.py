@@ -90,8 +90,6 @@ class BybitExecutor:
         """Initialize executor with connectivity checks."""
         try:
             await self.exchange.load_markets()
-
-            await self.exchange.load_markets()
             logger.info("Bybit V5 executor initialized successfully")
 
             if self.paper_trading:
@@ -219,7 +217,7 @@ class BybitExecutor:
     async def get_positions(self) -> List[PositionInfo]:
         """Get all open positions."""
         if self.paper_trading:
-            return []
+            return list(self.position_cache.values())
 
         try:
             positions_data = await self.exchange.fetch_positions()
@@ -244,7 +242,7 @@ class BybitExecutor:
 
         except Exception as e:
             logger.error(f"Failed to fetch positions: {e}")
-            return []
+            return list(self.position_cache.values())
 
     async def set_position_mode(self, mode: PositionMode) -> bool:
         """Set position mode (HEDGE or ONE_WAY)."""
@@ -312,7 +310,7 @@ class BybitExecutor:
             try:
                 await self._orderbook_task
             except asyncio.CancelledError:
-                pass
+                logger.debug("Bybit orderbook stream task cancelled")
         logger.info("Stopped orderbook stream")
 
     async def close(self) -> None:

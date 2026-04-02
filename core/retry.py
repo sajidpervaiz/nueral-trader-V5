@@ -22,17 +22,22 @@ class RetryPolicy:
         self,
         max_attempts: int = 3,
         base_delay: float = 1.0,
+        initial_delay: Optional[float] = None,
         max_delay: float = 10.0,
         exponential_backoff: bool = True,
         jitter: bool = True,
         retryable_exceptions: Optional[List[Type[Exception]]] = None,
+        dead_letter_queue_size: int = 100,
     ):
         self.max_attempts = max_attempts
-        self.base_delay = base_delay
+        # Backward compatibility: accept `initial_delay` as alias for `base_delay`.
+        self.base_delay = initial_delay if initial_delay is not None else base_delay
         self.max_delay = max_delay
         self.exponential_backoff = exponential_backoff
         self.jitter = jitter
         self.retryable_exceptions = retryable_exceptions or [Exception]
+        self.dead_letter_queue_size = dead_letter_queue_size
+        self._dead_letter_queue: List[dict] = []
 
     def _calculate_delay(self, attempt: int) -> float:
         """Calculate delay for retry attempt."""
@@ -54,6 +59,59 @@ class RetryPolicy:
             isinstance(exception, exc_type)
             for exc_type in self.retryable_exceptions
         )
+
+    async def execute_with_retry(
+        self,
+        operation: Callable,
+        operation_name: str = "operation",
+        *args,
+        **kwargs,
+    ):
+        """Execute an async operation with retry semantics and DLQ fallback."""
+        last_exception = None
+
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                if asyncio.iscoroutinefunction(operation):
+                    return await operation(*args, **kwargs)
+                return operation(*args, **kwargs)
+            except Exception as e:
+                last_exception = e
+
+                if not self.is_retryable(e):
+                    logger.warning(f"Non-retryable exception in {operation_name}: {e}")
+                    self._add_to_dlq(operation_name, e)
+                    raise
+
+                if attempt < self.max_attempts:
+                    delay = self._calculate_delay(attempt)
+                    logger.warning(
+                        f"Attempt {attempt}/{self.max_attempts} failed in {operation_name}: {e}. "
+                        f"Retrying in {delay:.2f}s"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        f"All {self.max_attempts} attempts failed in {operation_name}. Last error: {e}"
+                    )
+                    self._add_to_dlq(operation_name, e)
+
+        raise last_exception
+
+    def _add_to_dlq(self, operation_name: str, exception: Exception) -> None:
+        entry = {
+            "timestamp": time.time(),
+            "operation_name": operation_name,
+            "error": str(exception),
+            "exception_type": type(exception).__name__,
+        }
+        self._dead_letter_queue.append(entry)
+        if len(self._dead_letter_queue) > self.dead_letter_queue_size:
+            self._dead_letter_queue = self._dead_letter_queue[-self.dead_letter_queue_size:]
+
+    def get_dlq(self) -> List[dict]:
+        """Return dead-letter queue entries."""
+        return list(self._dead_letter_queue)
 
 
 def with_retry(policy: Optional[RetryPolicy] = None):

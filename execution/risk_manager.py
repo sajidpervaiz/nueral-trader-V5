@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 from loguru import logger
 
 from core.config import Config
@@ -86,8 +87,12 @@ class RiskManager:
         self._max_position_pct = float(risk_cfg.get("max_position_size_pct", 0.02))
         self._max_open = int(risk_cfg.get("max_open_positions", 5))
         self._leverage = float(risk_cfg.get("default_leverage", 1.0))
+        self._max_portfolio_var_pct = float(risk_cfg.get("max_portfolio_var_pct", 0.08))
+        self._returns_window = int(risk_cfg.get("returns_window", 250))
+        self._var_min_history = int(risk_cfg.get("var_min_history", 30))
         self._positions: dict[str, Position] = {}
         self._equity = 100_000.0
+        self._return_history: list[float] = []
         self._circuit_breaker = CircuitBreaker(
             max_daily_loss_pct=float(risk_cfg.get("max_daily_loss_pct", 0.03)),
             max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 0.10)),
@@ -112,6 +117,18 @@ class RiskManager:
             return False, f"poor_risk_reward ({signal.risk_reward:.2f})", 0.0
 
         size = self._equity * self._max_position_pct * self._leverage
+
+        # Only enforce VaR limits when we have enough return history.
+        if len(self._return_history) >= self._var_min_history and self._equity > 0:
+            var95 = self.calculate_historical_var(0.95)
+            projected_position_impact = size / self._equity
+            projected_var = var95 + projected_position_impact
+            if projected_var > self._max_portfolio_var_pct:
+                return False, (
+                    f"var_limit_breach (projected={projected_var:.2%}, "
+                    f"limit={self._max_portfolio_var_pct:.2%})"
+                ), 0.0
+
         return True, "approved", size
 
     def open_position(self, signal: TradingSignal, size: float) -> Position:
@@ -142,12 +159,92 @@ class RiskManager:
         pos.update_price(exit_price)
         pnl_dollar = pos.pnl
         self._equity += pnl_dollar
+        self.record_return(pos.pnl_pct)
         self._circuit_breaker.record_pnl(pos.pnl_pct, self._equity)
         logger.info(
             "Position closed: {}/{} pnl={:.2f} ({:.2%}) equity={:.2f}",
             exchange, symbol, pnl_dollar, pos.pnl_pct, self._equity
         )
         return pos
+
+    def record_return(self, pnl_pct: float) -> None:
+        self._return_history.append(float(pnl_pct))
+        if len(self._return_history) > self._returns_window:
+            self._return_history = self._return_history[-self._returns_window:]
+
+    def calculate_historical_var(self, confidence: float = 0.95) -> float:
+        if not self._return_history:
+            return 0.0
+        arr = np.array(self._return_history, dtype=float)
+        q = np.percentile(arr, (1.0 - confidence) * 100.0)
+        return float(max(0.0, -q))
+
+    def calculate_cvar(self, confidence: float = 0.95) -> float:
+        if not self._return_history:
+            return 0.0
+        arr = np.array(self._return_history, dtype=float)
+        q = np.percentile(arr, (1.0 - confidence) * 100.0)
+        tail = arr[arr <= q]
+        if tail.size == 0:
+            return 0.0
+        return float(max(0.0, -tail.mean()))
+
+    def portfolio_notional(self) -> float:
+        return float(sum(abs(p.size * p.current_price) for p in self._positions.values()))
+
+    def run_stress_test(
+        self,
+        shocks: list[float] | None = None,
+        correlation_breakdown_factor: float = 1.5,
+    ) -> dict[str, Any]:
+        if shocks is None:
+            shocks = [-0.05, -0.10, -0.20]
+
+        notional = self.portfolio_notional()
+        scenarios: dict[str, Any] = {}
+        worst_loss = 0.0
+
+        for shock in shocks:
+            loss = abs(notional * shock)
+            worst_loss = max(worst_loss, loss)
+            scenarios[f"shock_{int(abs(shock) * 100)}pct"] = {
+                "shock_pct": float(shock),
+                "estimated_loss_usd": float(loss),
+                "loss_pct_equity": float(loss / self._equity) if self._equity > 0 else 0.0,
+            }
+
+        corr_loss = worst_loss * correlation_breakdown_factor
+        scenarios["correlation_breakdown"] = {
+            "factor": float(correlation_breakdown_factor),
+            "estimated_loss_usd": float(corr_loss),
+            "loss_pct_equity": float(corr_loss / self._equity) if self._equity > 0 else 0.0,
+        }
+
+        return {
+            "portfolio_notional_usd": notional,
+            "var_95": self.calculate_historical_var(0.95),
+            "var_99": self.calculate_historical_var(0.99),
+            "cvar_95": self.calculate_cvar(0.95),
+            "cvar_99": self.calculate_cvar(0.99),
+            "scenarios": scenarios,
+            "max_portfolio_var_pct": self._max_portfolio_var_pct,
+        }
+
+    def get_risk_snapshot(self) -> dict[str, Any]:
+        return {
+            "equity": float(self._equity),
+            "open_positions": len(self._positions),
+            "portfolio_notional_usd": self.portfolio_notional(),
+            "var_95": self.calculate_historical_var(0.95),
+            "var_99": self.calculate_historical_var(0.99),
+            "cvar_95": self.calculate_cvar(0.95),
+            "cvar_99": self.calculate_cvar(0.99),
+            "return_history_size": len(self._return_history),
+            "var_min_history": self._var_min_history,
+            "max_portfolio_var_pct": self._max_portfolio_var_pct,
+            "circuit_breaker_tripped": self._circuit_breaker.tripped,
+            "circuit_breaker_reason": self._circuit_breaker.trip_reason,
+        }
 
     def update_prices(self, exchange: str, symbol: str, price: float) -> None:
         key = f"{exchange}:{symbol}"

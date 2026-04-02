@@ -44,6 +44,27 @@ class CEXWebSocketManager:
         self._connections: dict[str, Any] = {}
         self._running = False
 
+    def _to_kraken_pair(self, symbol: str) -> str:
+        """Convert internal symbol formats to Kraken pair notation."""
+        normalized = symbol.upper()
+
+        if "/" in normalized:
+            base, quote = normalized.split("/", 1)
+            quote = quote.split(":", 1)[0]
+        else:
+            if normalized.endswith("USDT"):
+                base, quote = normalized[:-4], "USDT"
+            elif normalized.endswith("USD"):
+                base, quote = normalized[:-3], "USD"
+            else:
+                return normalized
+
+        base_map = {"BTC": "XBT"}
+        quote_map = {"USDT": "USD"}
+        base = base_map.get(base, base)
+        quote = quote_map.get(quote, quote)
+        return f"{base}/{quote}"
+
     def _build_subscribe_msg(self, exchange: str, symbols: list[str]) -> list[dict | str]:
         if exchange == "binance":
             streams = [f"{s.replace('/', '').replace(':USDT', '').lower()}@aggTrade" for s in symbols]
@@ -55,9 +76,10 @@ class CEXWebSocketManager:
             args = [{"channel": "trades", "instId": s.replace("/USDT:USDT", "-USDT-SWAP")} for s in symbols]
             return [{"op": "subscribe", "args": args}]
         if exchange == "kraken":
-            pairs = [s.replace("/USDT:USDT", "XBT/USD") for s in symbols]
+            pairs = [self._to_kraken_pair(s) for s in symbols]
             return [{"event": "subscribe", "pair": pairs, "subscription": {"name": "trade"}}]
-        return []
+        logger.debug("No subscribe payload builder for exchange '{}'", exchange)
+        return list()
 
     async def _handle_message(self, exchange: str, raw: str) -> None:
         try:
@@ -139,6 +161,6 @@ class CEXWebSocketManager:
         for exchange, ws in self._connections.items():
             try:
                 await ws.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Error closing websocket for {}: {}", exchange, exc)
         logger.info("CEX WebSocket manager stopped")

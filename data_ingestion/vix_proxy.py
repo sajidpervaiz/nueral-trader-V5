@@ -72,7 +72,7 @@ class VIXProxy:
 
         history = self._price_history.get(symbol)
         if history is None:
-            return []
+            return list()
 
         results = []
         now = int(time.time())

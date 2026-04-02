@@ -56,7 +56,8 @@ class DEXRPCFeed:
                 headers={"Content-Type": "application/json"},
             ) as resp:
                 if resp.status != 200:
-                    return []
+                    logger.debug("Uniswap V3 graph returned status {}", resp.status)
+                    return list()
                 data = await resp.json()
                 ticks = []
                 pools = data.get("data", {}).get("pools", [])
@@ -74,7 +75,7 @@ class DEXRPCFeed:
                 return ticks
         except Exception as exc:
             logger.debug("Uniswap V3 graph query failed: {}", exc)
-            return []
+            return list()
 
     async def run(self) -> None:
         self._running = True

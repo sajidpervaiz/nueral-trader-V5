@@ -36,9 +36,9 @@ class Signal:
 class PnLTracking:
     signal_id: str
     entry_price: float
-    exit_price: Optional[float] = None
     quantity: float
     entry_time: int
+    exit_price: Optional[float] = None
     exit_time: Optional[int] = None
     realized_pnl: Optional[float] = None
     unrealized_pnl: float = 0.0

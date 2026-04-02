@@ -7,8 +7,14 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-import aiohttp
 from loguru import logger
+
+try:
+    import aiohttp
+    _AIOHTTP = True
+except ImportError:
+    aiohttp = None
+    _AIOHTTP = False
 
 
 class IndicatorType(Enum):
@@ -52,7 +58,11 @@ class EconomicReleases:
 
     async def initialize(self) -> None:
         """Initialize Economic Releases."""
-        self._http_session = aiohttp.ClientSession()
+        if _AIOHTTP:
+            self._http_session = aiohttp.ClientSession()
+        elif not self.paper_mode:
+            logger.warning("aiohttp not installed — falling back to paper mode for EconomicReleases")
+            self.paper_mode = True
 
         await self._load_historical_releases()
         await self._load_scheduled_releases()
@@ -148,26 +158,34 @@ class EconomicReleases:
 
     async def _load_scheduled_releases(self) -> None:
         """Load scheduled economic releases."""
-        if self.paper_mode:
-            now = datetime.now()
+        now = datetime.now()
+        scheduled = [
+            (IndicatorType.CPI, "Consumer Price Index", 5),
+            (IndicatorType.PPI, "Producer Price Index", 4),
+            (IndicatorType.NFP, "Non-Farm Payrolls", 5),
+            (IndicatorType.PMI, "Manufacturing PMI", 4),
+        ]
 
-            scheduled = [
-                (IndicatorType.CPI, "Consumer Price Index", 5),
-                (IndicatorType.PPI, "Producer Price Index", 4),
-                (IndicatorType.NFP, "Non-Farm Payrolls", 5),
-                (IndicatorType.PMI, "Manufacturing PMI", 4),
-            ]
+        existing_upcoming_types = {
+            release.indicator_type
+            for release in self.releases
+            if release.release_date > now
+        }
 
-            for i, (indicator, title, importance) in enumerate(scheduled):
-                release = EconomicRelease(
-                    release_id=f"{indicator.value.lower()}_{i}",
-                    indicator_type=indicator,
-                    title=title,
-                    release_date=now + timedelta(days=7 + i * 5),
-                    importance=importance,
-                    source="BLS",
-                )
-                self.releases.append(release)
+        # Keep the system operational even without a dedicated schedule API by
+        # adding deterministic upcoming entries for missing indicators.
+        for i, (indicator, title, importance) in enumerate(scheduled):
+            if indicator in existing_upcoming_types:
+                continue
+            release = EconomicRelease(
+                release_id=f"{indicator.value.lower()}_{i}",
+                indicator_type=indicator,
+                title=title,
+                release_date=now + timedelta(days=7 + i * 5),
+                importance=importance,
+                source="BLS",
+            )
+            self.releases.append(release)
 
     async def calculate_consensus_deviation(
         self,

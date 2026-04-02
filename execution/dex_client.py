@@ -41,7 +41,6 @@ class DEXSwapResult:
 
 try:
     import grpc
-    from google.protobuf import empty_pb2
     _GRPC_AVAILABLE = True
 except ImportError:
     _GRPC_AVAILABLE = False
@@ -97,15 +96,46 @@ class DEXClient:
             return cached[0]
 
         if not self._available:
-            return self._simulate_quote(dex, token_in, token_out, amount_in)
+            quote = self._simulate_quote(dex, token_in, token_out, amount_in)
+            self._quote_cache[cache_key] = (quote, time.time())
+            return quote
+
+        # If generated gRPC stubs are unavailable in this Python environment,
+        # fallback to simulation rather than returning empty responses.
+        if self._stub is None:
+            quote = self._simulate_quote(dex, token_in, token_out, amount_in)
+            self._quote_cache[cache_key] = (quote, time.time())
+            return quote
 
         try:
-            pass
+            # Hook point for generated protobuf request/response handling.
+            if hasattr(self._stub, "get_quote"):
+                response = await self._stub.get_quote(
+                    dex=dex,
+                    token_in=token_in,
+                    token_out=token_out,
+                    amount_in=amount_in,
+                )
+                quote = DEXQuote(
+                    dex=dex,
+                    token_in=token_in,
+                    token_out=token_out,
+                    amount_in=float(amount_in),
+                    amount_out=float(response.amount_out),
+                    price_impact_pct=float(getattr(response, "price_impact_pct", 0.0)),
+                    gas_estimate=int(getattr(response, "gas_estimate", 0)),
+                    route=list(getattr(response, "route", [token_in, token_out])),
+                    timestamp=int(time.time()),
+                    valid_until=int(time.time()) + 30,
+                )
+                self._quote_cache[cache_key] = (quote, time.time())
+                return quote
         except Exception as exc:
             logger.debug("DEX gRPC quote error: {}", exc)
-            return self._simulate_quote(dex, token_in, token_out, amount_in)
 
-        return None
+        quote = self._simulate_quote(dex, token_in, token_out, amount_in)
+        self._quote_cache[cache_key] = (quote, time.time())
+        return quote
 
     def _simulate_quote(
         self,
@@ -147,7 +177,29 @@ class DEXClient:
             logger.error("DEX layer unavailable — cannot execute live swap")
             return None
 
-        logger.error("Live DEX swap not yet implemented — enable ts_dex_layer in config")
+        if self._stub is None:
+            logger.error("DEX gRPC stub unavailable — cannot execute live swap")
+            return None
+
+        try:
+            if hasattr(self._stub, "execute_swap"):
+                response = await self._stub.execute_swap(quote=quote)
+                return DEXSwapResult(
+                    tx_hash=str(getattr(response, "tx_hash", "")),
+                    dex=quote.dex,
+                    token_in=quote.token_in,
+                    token_out=quote.token_out,
+                    amount_in=quote.amount_in,
+                    amount_out=float(getattr(response, "amount_out", quote.amount_out)),
+                    gas_used=int(getattr(response, "gas_used", quote.gas_estimate)),
+                    status=str(getattr(response, "status", "unknown")),
+                    is_paper=False,
+                    timestamp=int(time.time()),
+                )
+        except Exception as exc:
+            logger.error("Live DEX swap failed: {}", exc)
+
+        logger.error("Live DEX swap failed — no compatible gRPC execution method available")
         return None
 
     async def close(self) -> None:

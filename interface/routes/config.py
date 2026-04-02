@@ -33,13 +33,24 @@ class VenueConfig(BaseModel):
     latency_ms: float
 
 
+# Runtime config state for API-level updates without mutating on-disk YAML.
+_TRADING_MODE: TradingMode = TradingMode.PAPER
+_ALGO_CONFIG = AlgoConfig(
+    enabled=True,
+    max_position_size=10.0,
+    max_risk_per_trade=0.02,
+    max_daily_loss=5000.0,
+    max_positions=5,
+)
+
+
 @router.get("/trading-mode")
 async def get_trading_mode():
     """Get current trading mode."""
     try:
         return {
-            "mode": "paper",
-            "reason": "Default safe mode enabled",
+            "mode": _TRADING_MODE.value,
+            "reason": "Runtime mode state",
         }
 
     except Exception as e:
@@ -54,11 +65,14 @@ async def set_trading_mode(
 ):
     """Set trading mode (requires confirmation for LIVE)."""
     try:
+        global _TRADING_MODE
         if mode == TradingMode.LIVE and not confirmation:
             raise HTTPException(
                 status_code=400,
                 detail="Confirmation required for live trading"
             )
+
+        _TRADING_MODE = mode
 
         return {
             "mode": mode.value,
@@ -77,13 +91,7 @@ async def set_trading_mode(
 async def get_algo_config():
     """Get algorithm configuration."""
     try:
-        return AlgoConfig(
-            enabled=True,
-            max_position_size=10.0,
-            max_risk_per_trade=0.02,
-            max_daily_loss=5000.0,
-            max_positions=5,
-        )
+        return _ALGO_CONFIG
 
     except Exception as e:
         logger.error(f"Error fetching algo config: {e}")
@@ -96,8 +104,9 @@ async def set_algo_config(
 ):
     """Update algorithm configuration."""
     try:
-        # Placeholder - would update config manager
-        return config
+        global _ALGO_CONFIG
+        _ALGO_CONFIG = config
+        return _ALGO_CONFIG
 
     except Exception as e:
         logger.error(f"Error setting algo config: {e}")

@@ -26,10 +26,16 @@ class CandleAggregator:
         self.timeframe_seconds = timeframe_seconds
         self._current: dict[str, Any] | None = None
         self._completed: list[Candle] = []
+        self._start_bucket: int | None = None
 
     def _current_bucket(self, ts_us: int) -> int:
         ts_s = ts_us // 1_000_000
-        return (ts_s // self.timeframe_seconds) * self.timeframe_seconds
+        if self._start_bucket is None:
+            self._start_bucket = ts_s
+            return ts_s
+        offset = ts_s - self._start_bucket
+        bucket_offset = (offset // self.timeframe_seconds) * self.timeframe_seconds
+        return self._start_bucket + bucket_offset
 
     def add_tick(self, tick: Tick) -> Candle | None:
         if _RUST_AVAILABLE:
@@ -115,7 +121,7 @@ class TickBatchParser:
     """Parses batches of raw tick dicts efficiently."""
 
     def __init__(self) -> None:
-        pass
+        self.parse_errors = 0
 
     def parse_batch(self, exchange: str, raw_ticks: list[dict]) -> list[Tick]:
         if _RUST_AVAILABLE:
@@ -141,5 +147,6 @@ class TickBatchParser:
                     trade_id=str(raw.get("trade_id", "")),
                 ))
             except (KeyError, ValueError):
+                self.parse_errors += 1
                 continue
         return results

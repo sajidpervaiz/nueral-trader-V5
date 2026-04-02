@@ -20,6 +20,9 @@ def config() -> Config:
         "default_leverage": 1.0,
         "max_daily_loss_pct": 0.03,
         "max_drawdown_pct": 0.10,
+        "max_portfolio_var_pct": 0.08,
+        "returns_window": 250,
+        "var_min_history": 30,
         "stop_loss_pct": 0.015,
         "take_profit_pct": 0.03,
     }
@@ -107,6 +110,38 @@ class TestRiskManager:
         approved, reason, _ = risk_manager.approve_signal(extra)
         assert approved is False
         assert "max_positions" in reason.lower()
+
+    def test_calculate_var_and_cvar(self, risk_manager: RiskManager) -> None:
+        returns = [-0.02, -0.01, 0.01, -0.03, 0.015, -0.005, -0.04, 0.02]
+        for r in returns:
+            risk_manager.record_return(r)
+
+        var95 = risk_manager.calculate_historical_var(0.95)
+        cvar95 = risk_manager.calculate_cvar(0.95)
+
+        assert var95 > 0
+        assert cvar95 > 0
+        assert cvar95 >= var95
+
+    def test_stress_test_output(self, risk_manager: RiskManager) -> None:
+        signal = _make_signal(price=50000.0)
+        pos = risk_manager.open_position(signal, size=1000.0)
+        assert pos is not None
+
+        report = risk_manager.run_stress_test(shocks=[-0.10], correlation_breakdown_factor=2.0)
+        assert report["portfolio_notional_usd"] == pytest.approx(1000.0)
+        assert "shock_10pct" in report["scenarios"]
+        assert report["scenarios"]["shock_10pct"]["estimated_loss_usd"] == pytest.approx(100.0)
+        assert report["scenarios"]["correlation_breakdown"]["estimated_loss_usd"] == pytest.approx(200.0)
+
+    def test_var_gate_rejects_signal_when_limit_exceeded(self, risk_manager: RiskManager) -> None:
+        for _ in range(30):
+            risk_manager.record_return(-0.10)
+
+        signal = _make_signal()
+        approved, reason, _ = risk_manager.approve_signal(signal)
+        assert approved is False
+        assert "var_limit_breach" in reason
 
 
 class TestCircuitBreaker:

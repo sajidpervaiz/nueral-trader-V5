@@ -52,6 +52,26 @@ class TestNormalizerBinance:
         assert tick.price == 49900.0
         assert tick.side == "sell"
 
+    def test_kraken_tick(self, normalizer: Normalizer) -> None:
+        raw = [
+            42,
+            [["50250.1", "0.25", "1700000000.123", "b", "l", "trade-kraken-1"]],
+            "trade",
+            "XBT/USD",
+        ]
+        tick = normalizer.normalize_tick("kraken", raw)
+        assert tick is not None
+        assert tick.exchange == "kraken"
+        assert tick.symbol == "XBT/USD"
+        assert tick.price == 50250.1
+        assert tick.volume == 0.25
+        assert tick.side == "buy"
+        assert tick.trade_id == "trade-kraken-1"
+
+    def test_kraken_malformed_payload_returns_none(self, normalizer: Normalizer) -> None:
+        tick = normalizer.normalize_tick("kraken", [123, "bad-payload"])
+        assert tick is None
+
     def test_unknown_exchange_returns_none(self, normalizer: Normalizer) -> None:
         tick = normalizer.normalize_tick("unknown_exchange", {"price": "50000"})
         assert tick is None
