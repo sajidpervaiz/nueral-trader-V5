@@ -18,6 +18,11 @@ EXCHANGE_ENV_REQUIREMENTS = {
     "kraken": ("KRAKEN_API_KEY", "KRAKEN_API_SECRET"),
 }
 
+DEX_ENV_REQUIREMENTS = (
+    "ETH_RPC_HTTP",
+    "ETH_RPC_WS",
+)
+
 
 def _load(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as fh:
@@ -66,6 +71,19 @@ def main() -> int:
         return _fail(f"enabled exchanges still using testnet: {', '.join(bad_testnet)}")
 
     enabled_names, required_env = _required_env_for_enabled_exchanges(exchanges)
+
+    dex_cfg = data.get("dex", {}) if isinstance(data.get("dex", {}), dict) else {}
+    dex_enabled = bool(dex_cfg.get("enabled", False))
+    dex_route_enabled = False
+    if dex_enabled:
+        for venue in ("uniswap", "sushiswap", "pancakeswap", "dydx"):
+            cfg = dex_cfg.get(venue, {})
+            if isinstance(cfg, dict) and bool(cfg.get("enabled", False)):
+                dex_route_enabled = True
+                break
+    if dex_enabled and dex_route_enabled:
+        required_env = sorted(set(required_env).union(DEX_ENV_REQUIREMENTS))
+
     missing_env = [key for key in required_env if not os.getenv(key)]
     if missing_env:
         return _fail(f"missing required env vars: {', '.join(missing_env)}")
