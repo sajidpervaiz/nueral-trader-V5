@@ -13,7 +13,7 @@ COLOR_YELLOW='\033[1;33m'
 COLOR_BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-PROJECT_ROOT="/workspaces/CTO-TEST-AI-trading-Bot"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_FILE="$PROJECT_ROOT/logs/deployment.log"
 BOT_PID_FILE="$PROJECT_ROOT/.bot.pid"
 

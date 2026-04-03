@@ -96,3 +96,6 @@ secrets/
 *.db
 *.sqlite
 *.sqlite3
+
+# Generated runtime config
+config/settings.live.yaml

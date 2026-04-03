@@ -378,6 +378,9 @@ python3 scripts/preflight_live_trading.py
 
 # 4) Start engine with live config
 python3 main.py
+
+# Or run guarded one-command startup
+bash scripts/start_live_autotrading.sh
 ```
 
 Runtime loads config from `NT_CONFIG_PATH` when set; otherwise it uses `config/settings.yaml`.
