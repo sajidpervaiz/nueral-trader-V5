@@ -1,5 +1,15 @@
 # Neural Trader v4 - Production-Grade Multi-Venue Crypto Trading Engine
 
+## Canonical Deployment Path
+
+Use this single production path for current operations:
+
+1. `DEPLOYMENT_GAP_CLOSURE.md`
+2. `docker-compose.prod-ready.yml`
+3. `.env.production.example` -> `.env.production`
+
+Legacy TIER0 deployment docs remain in the repository for historical context, but the current Docker-first stack should be operated via `docker-compose.prod-ready.yml`.
+
 **Enterprise-grade algorithmic trading system with Rust hot-path services, TypeScript DEX layer, and Python orchestration**
 
 ---
@@ -226,7 +236,7 @@
 
 ### Phase 9: Docker Infrastructure
 
-#### Production Compose (`docker-compose.prod.yml`)
+#### Production Compose (`docker-compose.prod-ready.yml`)
 - **Redis Cluster** for high-throughput messaging
 - **NATS JetStream** for streaming
 - **PostgreSQL** with persistent storage
@@ -316,14 +326,9 @@
 # Python 3.12+
 python --version
 
-# Rust 1.75+
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Node.js 20+ (for DEX layer)
-node --version
-
-# maturin (Python-Rust bridge)
-pip install maturin
+# Docker + Docker Compose plugin
+docker --version
+docker compose version
 ```
 
 ### Install Python Dependencies
@@ -332,23 +337,10 @@ pip install maturin
 pip install -r requirements.txt
 ```
 
-### Build Rust Extensions
+### Configure Production Environment
 
 ```bash
-cd rust
-cargo build --workspace --release
-cd ../rust/py-bindings
-maturin develop --release
-cd ../..
-```
-
-### Install TypeScript DEX Layer
-
-```bash
-cd ts/dex-layer
-npm install
-npm run build
-cd ../..
+cp .env.production.example .env.production
 ```
 
 ### Configure
@@ -361,8 +353,11 @@ cp config/settings.yaml config/settings.local.yaml
 ### Start with Docker Compose
 
 ```bash
-# Production stack with monitoring
-docker compose -f docker-compose.prod.yml up -d
+# Canonical production-ready stack
+docker compose -f docker-compose.prod-ready.yml --env-file .env.production up -d clickhouse clickhouse-migrator gateway bridge-api ui-static
+
+# Optional E2E validation profile
+docker compose -f docker-compose.prod-ready.yml --env-file .env.production --profile e2e up --build --abort-on-container-exit e2e-tests
 ```
 
 ### Run Directly (Development)
@@ -376,7 +371,7 @@ python main.py
 ## Project Structure
 
 ```
-neural-trader-v4/
+NUERAL-TRADER-5/
 ├── rust/                     # Rust workspace
 │   ├── risk-engine/          # Lock-free risk management
 │   ├── order-matcher/        # Lock-free order book + matching
@@ -420,7 +415,7 @@ neural-trader-v4/
 ├── scripts/                  # Utility scripts
 │   └── generate_proto.sh   # Code generation
 ├── Dockerfile               # Multi-stage build
-└── docker-compose.prod.yml   # Production stack
+└── docker-compose.prod-ready.yml   # Canonical production-ready stack
 ```
 
 ---

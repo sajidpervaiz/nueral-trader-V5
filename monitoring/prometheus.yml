@@ -4,7 +4,7 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
   external_labels:
-    cluster: 'neural-trader-prod'
+    cluster: 'NUERAL-TRADER-5-prod'
     environment: 'production'
 
 # Alertmanager configuration
@@ -37,6 +37,13 @@ scrape_configs:
   - job_name: 'dex-layer'
     static_configs:
       - targets: ['dex-layer:3001']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # Bridge API metrics
+  - job_name: 'bridge-api'
+    static_configs:
+      - targets: ['bridge-api:8080']
     metrics_path: '/metrics'
     scrape_interval: 10s
 

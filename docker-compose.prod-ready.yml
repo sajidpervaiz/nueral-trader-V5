@@ -1,0 +1,115 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-neural_trader}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_admin}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  clickhouse-migrator:
+    image: clickhouse/clickhouse-server:24.3
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    volumes:
+      - ./db/clickhouse/migrations:/migrations:ro
+      - ./scripts/clickhouse-migrate.sh:/scripts/clickhouse-migrate.sh:ro
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 9000
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_admin}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-neural_trader}
+      CLICKHOUSE_APP_USER: ${CLICKHOUSE_APP_USER:-nt_app}
+      CLICKHOUSE_APP_PASSWORD: ${CLICKHOUSE_APP_PASSWORD:-nt_app_password}
+    command: ["bash", "/scripts/clickhouse-migrate.sh"]
+    restart: "no"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: rust/gateway/Dockerfile
+      args:
+        TARGETPLATFORM: linux/amd64
+    restart: unless-stopped
+    environment:
+      GATEWAY_GRPC_HOST: 0.0.0.0
+      GATEWAY_GRPC_PORT: 50051
+    ports:
+      - "50051:50051"
+    depends_on:
+      clickhouse-migrator:
+        condition: service_completed_successfully
+
+  bridge-api:
+    build:
+      context: .
+      dockerfile: services/bridge-api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_started
+      clickhouse-migrator:
+        condition: service_completed_successfully
+    environment:
+      BRIDGE_API_PORT: 8080
+      GRPC_TARGET: gateway:50051
+      BRIDGE_PROTO_PATH: /app/proto/bridge.proto
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-neural_trader}
+      CLICKHOUSE_USER: ${CLICKHOUSE_APP_USER:-nt_app}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_APP_PASSWORD:-nt_app_password}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-*}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ui-static:
+    build:
+      context: ./ui/app
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+    restart: unless-stopped
+    depends_on:
+      bridge-api:
+        condition: service_healthy
+    ports:
+      - "8088:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  e2e-tests:
+    build:
+      context: ./tests/e2e
+      dockerfile: Dockerfile
+    depends_on:
+      bridge-api:
+        condition: service_healthy
+      ui-static:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    profiles: ["e2e"]
+
+volumes:
+  clickhouse_data:

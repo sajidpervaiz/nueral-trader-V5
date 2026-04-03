@@ -1,0 +1,28 @@
+name: prod-ready-stack
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "tier2-strict-audit-final-20260402"]
+
+jobs:
+  docker-stack-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare env file
+        run: cp .env.production.example .env.production
+
+      - name: Build services
+        run: docker compose -f docker-compose.prod-ready.yml --env-file .env.production build
+
+      - name: Run e2e profile
+        run: docker compose -f docker-compose.prod-ready.yml --env-file .env.production --profile e2e up --abort-on-container-exit --exit-code-from e2e-tests e2e-tests
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.prod-ready.yml --env-file .env.production logs --no-color

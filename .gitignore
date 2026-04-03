@@ -50,6 +50,12 @@ Cargo.lock
 ts/dex-layer/node_modules/
 ts/dex-layer/dist/
 ts/dex-layer/.env
+services/**/node_modules/
+services/**/dist/
+services/**/.env
+ui/app/node_modules/
+ui/app/dist/
+ui/app/.env
 
 # Protobuf generated
 proto/gen/
@@ -69,6 +75,8 @@ models/*.onnx
 # Secrets / env
 .env
 .env.*
+!.env.example
+!**/.env.example
 *.pem
 *.key
 secrets/
