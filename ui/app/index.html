@@ -322,12 +322,15 @@ html,body{height:100%;overflow:hidden;background:var(--bg1);color:var(--text);fo
     <div class="panel-hdr"><span class="panel-title">🦄 DEX Liquidity</span></div>
     <div class="panel-body" id="dexPools"></div>
 
+    <div class="panel-hdr"><span class="panel-title">🧭 Data Sources</span></div>
+    <div class="panel-body" id="dataSources"></div>
+
     <div class="panel-hdr"><span class="panel-title">📰 News</span></div>
     <div class="panel-body" id="newsFeed"></div>
   </div>
 </div>
 
-<div class="modal-overlay" id="settingsModal"><div class="modal"><div class="modal-header"><span class="modal-title">⚙️ Settings</span><button class="modal-close" onclick="closeSettings()">×</button></div><div class="modal-body"><div class="modal-row"><input class="modal-input" id="cfgApiKey" placeholder="Binance API Key"><input class="modal-input" id="cfgSecret" placeholder="Binance Secret"></div><div style="display:flex;gap:10px;margin-top:12px"><button class="btn btn-buy" onclick="saveSettings()">Save</button><button class="btn btn-ghost" onclick="testConnections()">Test</button></div></div></div></div>
+<div class="modal-overlay" id="settingsModal"><div class="modal"><div class="modal-header"><span class="modal-title">⚙️ Settings</span><button class="modal-close" onclick="closeSettings()">×</button></div><div class="modal-body"><div style="font:600 10px;color:var(--text2);margin-bottom:8px">🔑 CEX API CONFIGURATION</div><div class="modal-row"><input class="modal-input" id="cfgApiKey" placeholder="Binance API Key"><input class="modal-input" id="cfgSecret" placeholder="Binance Secret"></div><div class="modal-row" style="margin-top:8px"><input class="modal-input" id="cfgBybitApiKey" placeholder="Bybit API Key"><input class="modal-input" id="cfgBybitSecret" placeholder="Bybit Secret"></div><div class="modal-row" style="margin-top:8px"><input class="modal-input" id="cfgOkxApiKey" placeholder="OKX API Key"><input class="modal-input" id="cfgOkxSecret" placeholder="OKX Secret"></div><div class="modal-row" style="margin-top:8px"><input class="modal-input" id="cfgOkxPassphrase" placeholder="OKX Passphrase"><input class="modal-input" id="cfgKrakenApiKey" placeholder="Kraken API Key"></div><div class="modal-row" style="margin-top:8px"><input class="modal-input" id="cfgKrakenSecret" placeholder="Kraken Secret"><div></div></div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px"><label><input type="checkbox" id="cfgBinanceEnabled"> Binance</label><label><input type="checkbox" id="cfgBybitEnabled"> Bybit</label><label><input type="checkbox" id="cfgOkxEnabled"> OKX</label><label><input type="checkbox" id="cfgKrakenEnabled"> Kraken</label></div><div style="font:600 10px;color:var(--text2);margin:14px 0 8px">🌐 DEX CONFIGURATION</div><div class="modal-row"><input class="modal-input" id="cfgDexRpcUrl" placeholder="RPC URL"><input class="modal-input" id="cfgDexPrivateKey" placeholder="Wallet Private Key"></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px"><label><input type="checkbox" id="cfgUniswapEnabled"> Uniswap V3</label><label><input type="checkbox" id="cfgSushiswapEnabled"> SushiSwap</label><label><input type="checkbox" id="cfgDydxEnabled"> dYdX</label></div><div style="font:600 10px;color:var(--text2);margin:14px 0 8px">🔔 NOTIFICATIONS</div><div class="modal-row"><input class="modal-input" id="cfgTelegramToken" placeholder="Telegram Bot Token"><input class="modal-input" id="cfgTelegramChatId" placeholder="Chat ID"></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px"><label><input type="checkbox" id="cfgTradeAlertsEnabled"> Trade Alerts</label><label><input type="checkbox" id="cfgRiskAlertsEnabled"> Risk Alerts</label><label><input type="checkbox" id="cfgDailySummaryEnabled"> Daily Summary</label></div><div style="font:600 10px;color:var(--text2);margin:14px 0 8px">🤖 AUTO TRADING</div><div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px"><label><input type="checkbox" id="cfgAutoTradingEnabled"> Enable Auto Trading</label><label><input type="checkbox" id="cfgAutoStopLossEnabled"> Auto Stop Loss</label><label><input type="checkbox" id="cfgAutoTakeProfitEnabled"> Auto Take Profit</label><label><input type="checkbox" id="cfgTrailingStopsEnabled"> Trailing Stops</label><label><input type="checkbox" id="cfgAtrPositionSizingEnabled"> Position Sizing (ATR)</label></div><div style="display:flex;gap:10px;margin-top:14px"><button class="btn btn-buy" onclick="saveSettings()">Save</button><button class="btn btn-ghost" onclick="testConnections()">Test</button></div><div id="connectionRegistry" style="margin-top:12px;padding:10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;font:10px 'JetBrains Mono';color:var(--text2)">Connection state will appear after save/test.</div></div></div></div>
 <div class="toast-container" id="toastContainer"></div>
 
 <script>
@@ -348,6 +351,31 @@ function esc(v) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function setChecked(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.checked = !!value;
+}
+
+function getChecked(id) {
+  const el = document.getElementById(id);
+  return !!(el && el.checked);
+}
+
+function renderConnectionRegistry(records) {
+  const host = document.getElementById('connectionRegistry');
+  if (!host) return;
+  const rows = Array.isArray(records) ? records : [];
+  if (!rows.length) {
+    host.textContent = 'Connection state unavailable';
+    return;
+  }
+  host.innerHTML = rows.map((r) => {
+    const ok = r.connected === true || r.status === 'connected';
+    const color = ok ? 'var(--green)' : 'var(--red)';
+    return `<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border)"><span>${esc(r.exchange)} (${esc(r.venue_type)})</span><span style="color:${color}">${ok ? 'CONNECTED' : esc(String(r.status || 'DISCONNECTED').toUpperCase())}</span></div>`;
+  }).join('');
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -380,6 +408,7 @@ function bindToolbar() {
       tf = {'1':'1m','5':'5m','15':'15m','60':'1h','240':'4h','1440':'1d'}[btn.dataset.tf] || '1m';
       loadCandles();
       startRealtimeStream();
+      showToast('info', `Timeframe switched to ${tf}`);
     };
   });
 }
@@ -396,6 +425,23 @@ function activateTab(tab) {
   if (tab === 'backtest') loadBacktestSummary();
   if (tab === 'news') loadNews();
   if (tab === 'logs') loadLogs();
+
+  const labels = {
+    chart: 'Chart',
+    signals: 'Signals',
+    portfolio: 'Portfolio',
+    backtest: 'Backtest',
+    news: 'News',
+    logs: 'Logs',
+  };
+  showToast('info', `${labels[tab] || 'Tab'} loaded`);
+}
+
+function resizeChart() {
+  if (!chart) return;
+  const el = document.getElementById('chart');
+  if (!el) return;
+  chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
 }
 
 function initChart() {
@@ -437,6 +483,7 @@ function initChart() {
   });
 
   loadCandles();
+  window.addEventListener('resize', resizeChart);
 }
 
 function startRealtimeStream() {
@@ -471,7 +518,7 @@ async function loadRealtimeSnapshotFallback() {
 
 async function loadAll() {
   await Promise.all([
-    loadStatus(), loadWatchlist(), loadFearGreed(), loadOrderBook(), loadIndicators(), loadDexPools(), loadNews(), loadBacktestSummary(), loadLogs(), loadAutoStatus()
+    loadStatus(), loadWatchlist(), loadFearGreed(), loadOrderBook(), loadIndicators(), loadDexPools(), loadDataSources(), loadNews(), loadBacktestSummary(), loadLogs(), loadAutoStatus()
   ]);
 }
 
@@ -703,9 +750,11 @@ async function loadDexPools() {
 }
 
 function applyNewsData(d) {
-  document.getElementById('newsFeed').innerHTML = (d.items || []).map(n => `
+  const provider = d.provider ? `<div style="padding:6px 12px;color:var(--text3);font:500 9px 'JetBrains Mono'">provider: ${esc(d.provider)}</div>` : '';
+  const rows = (d.items || []).map(n => `
     <div class="news-item"><span class="news-time">${new Date(n.ts).toLocaleTimeString('en-GB')}</span><span class="news-sentiment ${n.sentiment === 'bullish' ? 'positive' : n.sentiment === 'bearish' ? 'negative' : 'neutral'}">${esc(n.sentiment)}</span><div class="news-title">${esc(n.title)}</div></div>
   `).join('');
+  document.getElementById('newsFeed').innerHTML = provider + (rows || '<div style="padding:10px 12px;color:var(--text3)">No live news available</div>');
 }
 
 async function loadNews() {
@@ -713,6 +762,32 @@ async function loadNews() {
     const r = await fetch('/api/news');
     applyNewsData(await r.json());
   } catch (_e) {}
+}
+
+function applyDataSourcesData(d) {
+  const entries = [
+    ['sentiment', d.sentiment],
+    ['news', d.news],
+    ['backtest', d.backtest],
+    ['logs', d.logs],
+    ['auto', d.auto],
+    ['signals', d.signals],
+  ];
+  document.getElementById('dataSources').innerHTML = entries.map(([name, meta]) => {
+    const src = meta && meta.source ? String(meta.source) : 'unknown';
+    const ok = src !== 'unknown' && src !== 'unavailable';
+    return `<div style="padding:8px 12px;border-bottom:1px solid var(--border)"><span>${esc(name)}</span><span style="float:right;color:${ok ? 'var(--green)' : 'var(--yellow)'}">${esc(src)}</span></div>`;
+  }).join('');
+}
+
+async function loadDataSources() {
+  try {
+    const r = await fetch('/api/system/data-sources');
+    const d = await r.json();
+    applyDataSourcesData(d);
+  } catch (_e) {
+    document.getElementById('dataSources').innerHTML = '<div style="padding:10px 12px;color:var(--text3)">Data source map unavailable</div>';
+  }
 }
 
 async function loadBacktestSummary() {
@@ -787,10 +862,25 @@ async function toggleAutoTrade() {
 
 function setView(view) {
   document.getElementById('app').className = 'app ' + view + '-view';
+  document.querySelectorAll('.view-btn').forEach((b) => b.classList.remove('active'));
+  const idx = view === 'grid' ? 0 : 1;
+  const btn = document.querySelectorAll('.view-btn')[idx];
+  if (btn) btn.classList.add('active');
+  setTimeout(resizeChart, 30);
+  showToast('info', `View changed to ${view}`);
 }
 
 function addIndicator(ind) {
-  indicators[ind.toLowerCase()] = !indicators[ind.toLowerCase()];
+  const key = ind.toLowerCase();
+  indicators[key] = !indicators[key];
+  const letters = { MA: 'M', BB: 'B', RSI: 'R', MACD: 'D', VOL: 'V' };
+  const target = letters[ind] || '';
+  document.querySelectorAll('.chart-tool-btn').forEach((btn) => {
+    if (btn.textContent.trim() === target) {
+      btn.classList.toggle('active', indicators[key]);
+    }
+  });
+  showToast('info', `${ind} ${indicators[key] ? 'enabled' : 'disabled'}`);
 }
 
 async function setBreakEven() {
@@ -821,6 +911,34 @@ async function openSettings() {
     const d = await r.json();
     document.getElementById('cfgApiKey').value = d.binance_api_key || '';
     document.getElementById('cfgSecret').value = d.binance_secret || '';
+    document.getElementById('cfgBybitApiKey').value = d.bybit_api_key || '';
+    document.getElementById('cfgBybitSecret').value = d.bybit_secret || '';
+    document.getElementById('cfgOkxApiKey').value = d.okx_api_key || '';
+    document.getElementById('cfgOkxSecret').value = d.okx_secret || '';
+    document.getElementById('cfgOkxPassphrase').value = d.okx_passphrase || '';
+    document.getElementById('cfgKrakenApiKey').value = d.kraken_api_key || '';
+    document.getElementById('cfgKrakenSecret').value = d.kraken_secret || '';
+    document.getElementById('cfgDexRpcUrl').value = d.dex_rpc_url || '';
+    document.getElementById('cfgDexPrivateKey').value = d.dex_private_key || '';
+    document.getElementById('cfgTelegramToken').value = d.telegram_bot_token || '';
+    document.getElementById('cfgTelegramChatId').value = d.telegram_chat_id || '';
+
+    setChecked('cfgBinanceEnabled', d.binance_enabled);
+    setChecked('cfgBybitEnabled', d.bybit_enabled);
+    setChecked('cfgOkxEnabled', d.okx_enabled);
+    setChecked('cfgKrakenEnabled', d.kraken_enabled);
+    setChecked('cfgUniswapEnabled', d.uniswap_v3_enabled);
+    setChecked('cfgSushiswapEnabled', d.sushiswap_enabled);
+    setChecked('cfgDydxEnabled', d.dydx_enabled);
+    setChecked('cfgTradeAlertsEnabled', d.trade_alerts_enabled);
+    setChecked('cfgRiskAlertsEnabled', d.risk_alerts_enabled);
+    setChecked('cfgDailySummaryEnabled', d.daily_summary_enabled);
+    setChecked('cfgAutoTradingEnabled', d.auto_trading_enabled);
+    setChecked('cfgAutoStopLossEnabled', d.auto_stop_loss_enabled);
+    setChecked('cfgAutoTakeProfitEnabled', d.auto_take_profit_enabled);
+    setChecked('cfgTrailingStopsEnabled', d.trailing_stops_enabled);
+    setChecked('cfgAtrPositionSizingEnabled', d.atr_position_sizing_enabled);
+    renderConnectionRegistry(d.connection_registry);
   } catch (_e) {}
 }
 function closeSettings() { document.getElementById('settingsModal').style.display = 'none'; }
@@ -829,6 +947,32 @@ async function saveSettings() {
     const payload = {
       binance_api_key: document.getElementById('cfgApiKey').value,
       binance_secret: document.getElementById('cfgSecret').value,
+      bybit_api_key: document.getElementById('cfgBybitApiKey').value,
+      bybit_secret: document.getElementById('cfgBybitSecret').value,
+      okx_api_key: document.getElementById('cfgOkxApiKey').value,
+      okx_secret: document.getElementById('cfgOkxSecret').value,
+      okx_passphrase: document.getElementById('cfgOkxPassphrase').value,
+      kraken_api_key: document.getElementById('cfgKrakenApiKey').value,
+      kraken_secret: document.getElementById('cfgKrakenSecret').value,
+      dex_rpc_url: document.getElementById('cfgDexRpcUrl').value,
+      dex_private_key: document.getElementById('cfgDexPrivateKey').value,
+      telegram_bot_token: document.getElementById('cfgTelegramToken').value,
+      telegram_chat_id: document.getElementById('cfgTelegramChatId').value,
+      binance_enabled: getChecked('cfgBinanceEnabled'),
+      bybit_enabled: getChecked('cfgBybitEnabled'),
+      okx_enabled: getChecked('cfgOkxEnabled'),
+      kraken_enabled: getChecked('cfgKrakenEnabled'),
+      uniswap_v3_enabled: getChecked('cfgUniswapEnabled'),
+      sushiswap_enabled: getChecked('cfgSushiswapEnabled'),
+      dydx_enabled: getChecked('cfgDydxEnabled'),
+      trade_alerts_enabled: getChecked('cfgTradeAlertsEnabled'),
+      risk_alerts_enabled: getChecked('cfgRiskAlertsEnabled'),
+      daily_summary_enabled: getChecked('cfgDailySummaryEnabled'),
+      auto_trading_enabled: getChecked('cfgAutoTradingEnabled'),
+      auto_stop_loss_enabled: getChecked('cfgAutoStopLossEnabled'),
+      auto_take_profit_enabled: getChecked('cfgAutoTakeProfitEnabled'),
+      trailing_stops_enabled: getChecked('cfgTrailingStopsEnabled'),
+      atr_position_sizing_enabled: getChecked('cfgAtrPositionSizingEnabled'),
     };
     const r = await fetch('/api/config', {
       method: 'POST',
@@ -837,8 +981,8 @@ async function saveSettings() {
     });
     const d = await r.json();
     if (d.success) {
+      renderConnectionRegistry(d.connection_registry);
       showToast('success', 'Settings saved');
-      closeSettings();
     } else {
       showToast('error', d.error || 'Save failed');
     }
@@ -853,8 +997,14 @@ async function testConnections() {
     const r = await fetch('/api/config/test', { method: 'POST' });
     const d = await r.json();
     if (d.success) {
+      renderConnectionRegistry(d.connection_registry);
       const c = d.checks || {};
-      showToast('success', `gRPC:${c.grpc ? 'OK' : 'FAIL'} CH:${c.clickhouse ? 'OK' : 'FAIL'} Keys:${c.credentials_present ? 'OK' : 'MISSING'}`);
+      const cex = c.cex_credentials || {};
+      const dex = c.dex_credentials || {};
+      const enabled = c.enabled || {};
+      const activeCex = ['binance', 'bybit', 'okx', 'kraken'].filter((k) => enabled[k]).map((k) => `${k}:${cex[k] ? 'OK' : 'MISS'}`).join(' ');
+      const activeDex = (enabled.uniswap_v3 || enabled.sushiswap || enabled.dydx) ? `dex:${dex.rpc_url && dex.private_key ? 'OK' : 'MISS'}` : 'dex:N/A';
+      showToast('success', `gRPC:${c.grpc ? 'OK' : 'FAIL'} CH:${c.clickhouse ? 'OK' : 'FAIL'} CRED:${c.credentials_present ? 'READY' : 'MISSING'} ${activeCex || 'cex:N/A'} ${activeDex}`);
     } else {
       showToast('error', d.error || 'Connection test failed');
     }

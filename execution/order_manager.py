@@ -287,7 +287,12 @@ class OrderManager:
         """
         async with self._lock:
             # Check circuit breaker
-            if self.circuit_breaker.get_state().value == "OPEN":
+            cb_open = False
+            if hasattr(self.circuit_breaker, 'get_state'):
+                cb_open = self.circuit_breaker.get_state().value == "OPEN"
+            elif hasattr(self.circuit_breaker, 'tripped'):
+                cb_open = self.circuit_breaker.tripped
+            if cb_open:
                 return False, None, "circuit_breaker_open"
 
             # Use caller-provided client order ID when supplied; otherwise generate one.

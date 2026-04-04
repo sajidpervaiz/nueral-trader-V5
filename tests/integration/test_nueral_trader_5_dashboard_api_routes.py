@@ -186,6 +186,8 @@ def test_positions_routes_are_manager_backed(api_context: dict) -> None:
         ml_score=0.8,
         sentiment_score=0.0,
         macro_score=0.0,
+        news_score=0.0,
+        orderbook_score=0.0,
         regime="integration",
         regime_confidence=1.0,
         price=3000.0,

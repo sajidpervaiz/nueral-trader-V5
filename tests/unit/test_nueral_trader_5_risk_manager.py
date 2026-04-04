@@ -25,6 +25,22 @@ def config() -> Config:
         "var_min_history": 30,
         "stop_loss_pct": 0.015,
         "take_profit_pct": 0.03,
+        "initial_equity": 100000,
+        "risk_per_trade_pct": 0.01,
+        "sizing_method": "risk_based",
+        "max_spread_bps": 10.0,
+        "max_atr_pct": 0.05,
+        "max_exposure_per_symbol_pct": 0.10,
+        "cooldown_seconds": 0,
+        "session_start_utc": "00:00",
+        "session_end_utc": "23:59",
+        "atr_sl_multiplier": 1.5,
+        "rr_ratio": 2.0,
+        "trailing_activation_atr": 2.0,
+        "trailing_distance_atr": 1.0,
+        "breakeven_trigger_atr": 1.0,
+        "max_hold_minutes": 0,
+        "circuit_breaker_pause_seconds": 0,
     }
     return c
 
@@ -50,6 +66,8 @@ def _make_signal(score: float = 0.75, price: float = 50000.0) -> TradingSignal:
         ml_score=score,
         sentiment_score=0.0,
         macro_score=0.0,
+        news_score=0.0,
+        orderbook_score=0.0,
         regime="trending_up",
         regime_confidence=0.8,
         price=price,
@@ -80,6 +98,7 @@ class TestRiskManager:
             exchange="binance", symbol="BTC/USDT:USDT", direction="long",
             score=0.9, technical_score=0.9, ml_score=0.9,
             sentiment_score=0.0, macro_score=0.0,
+            news_score=0.0, orderbook_score=0.0,
             regime="trending_up", regime_confidence=0.8,
             price=50000.0, atr=500.0,
             stop_loss=sl, take_profit=tp, timestamp=1_700_000_000,
@@ -159,3 +178,55 @@ class TestCircuitBreaker:
         assert cb.tripped
         cb.reset()
         assert not cb.tripped
+
+    def test_timed_auto_resume(self) -> None:
+        import time
+        cb = CircuitBreaker(max_daily_loss_pct=0.03, max_drawdown_pct=0.10, pause_seconds=0.1)
+        cb.record_pnl(-0.05, 95000)
+        assert cb.tripped
+        time.sleep(0.15)
+        assert not cb.tripped  # Should auto-reset after pause
+
+
+class TestKillSwitch:
+    def test_kill_switch_closes_all_and_blocks(self, risk_manager: RiskManager) -> None:
+        sig1 = _make_signal()
+        sig1.symbol = "BTC/USDT"
+        risk_manager.open_position(sig1, 1000.0)
+
+        sig2 = _make_signal()
+        sig2.symbol = "ETH/USDT"
+        risk_manager.open_position(sig2, 500.0)
+        assert len(risk_manager.positions) == 2
+
+        closed = risk_manager.activate_kill_switch()
+        assert len(closed) == 2
+        assert len(risk_manager.positions) == 0
+        assert risk_manager.killed
+
+        # New signals should be rejected
+        approved, reason, _ = risk_manager.approve_signal(_make_signal())
+        assert not approved
+        assert "kill_switch" in reason
+
+    def test_deactivate_kill_switch(self, risk_manager: RiskManager) -> None:
+        risk_manager.activate_kill_switch()
+        assert risk_manager.killed
+        risk_manager.deactivate_kill_switch()
+        assert not risk_manager.killed
+
+
+class TestPositionManagement:
+    def test_compute_atr_stops(self, risk_manager: RiskManager) -> None:
+        signal = _make_signal(price=50000.0)
+        sl, tp = risk_manager.compute_atr_stops(signal)
+        # ATR = 50000 * 0.01 = 500, SL distance = 500 * 1.5 = 750
+        assert sl < signal.price
+        assert tp > signal.price
+        assert tp - signal.price > signal.price - sl  # TP distance > SL distance (RR > 1)
+
+    def test_risk_snapshot_includes_new_fields(self, risk_manager: RiskManager) -> None:
+        snap = risk_manager.get_risk_snapshot()
+        assert "kill_switch_active" in snap
+        assert "current_drawdown_pct" in snap
+        assert snap["kill_switch_active"] is False

@@ -24,7 +24,9 @@ from core.dispatcher import Dispatcher
 from data_ingestion.cex_websocket import CEXWebSocketManager
 from data_ingestion.dex_rpc import DEXRPCFeed
 from data_ingestion.funding_feed import FundingRateFeed
+from data_ingestion.news_feed import NewsFeed
 from data_ingestion.oi_feed import OpenInterestFeed
+from data_ingestion.orderbook_feed import OrderbookFeed
 from data_ingestion.vix_proxy import VIXProxy
 
 from analysis.data_manager import DataManager
@@ -84,9 +86,13 @@ async def main() -> None:
     oi_feed = OpenInterestFeed(config, event_bus)
     vix_proxy = VIXProxy(config, event_bus)
     sentiment = SentimentManager(config, event_bus)
+    news_feed = NewsFeed(config, event_bus)
+    orderbook_feed = OrderbookFeed(config, event_bus)
 
     data_manager = DataManager(config, event_bus)
     signal_gen = SignalGenerator(config, event_bus, data_manager)
+    # Auto-trading defaults to off — requires explicit UI toggle
+    signal_gen.set_auto_trading(False)
     risk_mgr = RiskManager(config, event_bus)
     order_mgr = OrderManager(config, event_bus, risk_mgr._circuit_breaker)
 
@@ -102,7 +108,17 @@ async def main() -> None:
 
     telegram = TelegramNotifier(config, event_bus)
 
-    app = build_app(config, event_bus, risk_mgr, data_manager, order_mgr, db, cache)
+    app = build_app(
+        config, event_bus, risk_mgr, data_manager, order_mgr, db, cache, signal_gen,
+        news_feed=news_feed,
+        orderbook_feed=orderbook_feed,
+        sentiment_manager=sentiment,
+        dex_feed=dex_feed,
+    )
+
+    # Re-add the dashboard log sink (logger.remove() in _setup_logging wipes it)
+    from interface.dashboard_api import _log_sink
+    logger.add(_log_sink, level="INFO", format="{message}")
 
     dispatcher = Dispatcher(
         config=config,
@@ -133,6 +149,8 @@ async def main() -> None:
         asyncio.create_task(oi_feed.run(), name="oi"),
         asyncio.create_task(vix_proxy.run(), name="vix"),
         asyncio.create_task(sentiment.run(), name="sentiment"),
+        asyncio.create_task(news_feed.run(), name="news_feed"),
+        asyncio.create_task(orderbook_feed.run(), name="orderbook_feed"),
         asyncio.create_task(telegram.run(), name="telegram"),
         asyncio.create_task(order_mgr.run(), name="order_manager"),
     ]
@@ -159,6 +177,8 @@ async def main() -> None:
     await funding_feed.stop()
     await oi_feed.stop()
     await sentiment.stop()
+    await news_feed.stop()
+    await orderbook_feed.stop()
     await telegram.stop()
     await order_mgr.stop()
 

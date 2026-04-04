@@ -73,6 +73,12 @@ class Config:
     def paper_mode(self) -> bool:
         return bool(self._data.get("system", {}).get("paper_mode", True))
 
+    @paper_mode.setter
+    def paper_mode(self, value: bool) -> None:
+        if "system" not in self._data:
+            self._data["system"] = {}
+        self._data["system"]["paper_mode"] = bool(value)
+
     @property
     def log_level(self) -> str:
         return str(self._data.get("system", {}).get("log_level", "INFO"))

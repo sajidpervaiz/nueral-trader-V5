@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any
 
 from loguru import logger
 
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI, Query, Request
     from fastapi.responses import JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.staticfiles import StaticFiles
     from fastapi.responses import FileResponse
+    from sse_starlette.sse import EventSourceResponse  # type: ignore[import-untyped]
     import uvicorn
     _FASTAPI = True
 except ImportError:
@@ -26,6 +29,24 @@ from interface.routes.orders import router as orders_router, configure_order_rou
 from interface.routes.positions import router as positions_router, configure_positions_routes
 from interface.routes.risk import router as risk_router, configure_risk_routes
 
+# ── In-memory ring buffers for event-sourced data ────────────────────────────
+_news_buffer: deque[dict[str, Any]] = deque(maxlen=50)
+_orderbook_cache: dict[str, dict[str, Any]] = {}
+_log_buffer: deque[dict[str, Any]] = deque(maxlen=200)
+_market_cache: dict[str, Any] = {"coins": [], "ts": 0.0}  # TTL cache for market data
+
+# Loguru sink that captures recent log lines for the /api/logs/recent endpoint
+def _log_sink(message: Any) -> None:
+    record = message.record
+    _log_buffer.append({
+        "ts": int(record["time"].timestamp() * 1000),
+        "level": record["level"].name,
+        "message": str(record["message"])[:300],
+    })
+
+
+logger.add(_log_sink, level="INFO", format="{message}")
+
 
 def build_app(
     config: Config,
@@ -35,6 +56,12 @@ def build_app(
     order_manager: Any = None,
     db_handler: Any = None,
     cache: Any = None,
+    signal_generator: Any = None,
+    *,
+    news_feed: Any = None,
+    orderbook_feed: Any = None,
+    sentiment_manager: Any = None,
+    dex_feed: Any = None,
 ) -> Any:
     if not _FASTAPI:
         return None
@@ -119,10 +146,38 @@ def build_app(
     configure_risk_routes(risk_manager)
     configure_positions_routes(risk_manager)
     configure_config_routes(config, risk_manager, order_manager)
+    # Mount existing routers under /api prefix so UI /api/* calls work
+    app.include_router(config_router, prefix="/api")
+    app.include_router(orders_router, prefix="/api")
+    app.include_router(positions_router, prefix="/api")
+    app.include_router(risk_router, prefix="/api")
+    # Also keep original paths for backwards compatibility
     app.include_router(config_router)
     app.include_router(orders_router)
     app.include_router(positions_router)
     app.include_router(risk_router)
+
+    # ── Subscribe to event bus for caching live data ──────────────────────
+    async def _cache_news(payload: Any) -> None:
+        _news_buffer.append({
+            "ts": int(payload.get("timestamp", time.time()) * 1000),
+            "title": payload.get("title", ""),
+            "sentiment": "bullish" if payload.get("sentiment", 0) > 0.15 else ("bearish" if payload.get("sentiment", 0) < -0.15 else "neutral"),
+            "score": payload.get("sentiment", 0),
+        })
+
+    async def _cache_orderbook(payload: Any) -> None:
+        key = f"{payload.get('exchange', 'binance')}:{payload.get('symbol', '')}"
+        _orderbook_cache[key] = {
+            "exchange": payload.get("exchange", "binance"),
+            "symbol": payload.get("symbol", ""),
+            "bids": payload.get("bids", []),
+            "asks": payload.get("asks", []),
+            "ts": time.time(),
+        }
+
+    event_bus.subscribe("NEWS_SENTIMENT", _cache_news)
+    event_bus.subscribe("ORDERBOOK_UPDATE", _cache_orderbook)
 
     @app.get("/")
     async def root() -> Any:
@@ -225,6 +280,10 @@ def build_app(
             "win_rate": None,
         }
 
+    @app.get("/api/signals/recent")
+    async def api_recent_signals() -> dict[str, Any]:
+        return await recent_signals()
+
     @app.get("/performance")
     async def performance_metrics() -> dict[str, Any]:
         pnl_total = 0.0
@@ -277,6 +336,864 @@ def build_app(
             "cache_connected": cache_connected,
             "timestamp": now,
         }
+
+    # ── Auto-trading control ──────────────────────────────────────────────
+    @app.post("/auto/toggle")
+    async def auto_toggle(request: Request) -> dict[str, Any]:
+        return await api_auto_toggle(request)
+
+    @app.get("/auto/status")
+    async def auto_status() -> dict[str, Any]:
+        return await api_auto_status()
+
+    @app.get("/signals/weights")
+    async def signal_weights() -> dict[str, Any]:
+        """Return the current 6-factor signal weights and configuration."""
+        if signal_generator is None:
+            return {"weights": {}, "min_score": 0.0, "min_factors": 0}
+        return {
+            "weights": {
+                "technical": getattr(signal_generator, "_tech_weight", 0),
+                "ml": getattr(signal_generator, "_ml_weight", 0),
+                "sentiment": getattr(signal_generator, "_sentiment_weight", 0),
+                "macro": getattr(signal_generator, "_macro_weight", 0),
+                "news": getattr(signal_generator, "_news_weight", 0),
+                "orderbook": getattr(signal_generator, "_orderbook_weight", 0),
+            },
+            "min_score": getattr(signal_generator, "_min_score", 0),
+            "min_factors": getattr(signal_generator, "_min_factors", 0),
+            "auto_trading_enabled": getattr(signal_generator, "auto_trading_enabled", False),
+        }
+
+    # ── Kill switch ───────────────────────────────────────────────────────
+    @app.post("/v1/kill")
+    async def kill_switch_activate() -> dict[str, Any]:
+        """Emergency: close all positions, cancel all orders, block new signals."""
+        if risk_manager is None:
+            return {"success": False, "error": "risk_manager not available"}
+        closed = risk_manager.activate_kill_switch()
+        if event_bus is not None:
+            await event_bus.publish("KILL_SWITCH", {"source": "api"})
+        return {
+            "success": True,
+            "positions_closed": len(closed),
+            "kill_switch_active": True,
+        }
+
+    @app.post("/v1/kill/deactivate")
+    async def kill_switch_deactivate() -> dict[str, Any]:
+        if risk_manager is None:
+            return {"success": False, "error": "risk_manager not available"}
+        risk_manager.deactivate_kill_switch()
+        return {"success": True, "kill_switch_active": False}
+
+    @app.get("/v1/risk/snapshot")
+    async def risk_snapshot() -> dict[str, Any]:
+        """Full risk snapshot including drawdown, VaR, kill switch status."""
+        if risk_manager is None:
+            return {"error": "risk_manager not available"}
+        return risk_manager.get_risk_snapshot()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  /api/* endpoints — UI fetches everything under this prefix
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── /api/status — portfolio status header bar ─────────────────────────
+    @app.get("/api/status")
+    async def api_status() -> dict[str, Any]:
+        equity = 0.0
+        unrealized_pnl = 0.0
+        drawdown_pct = 0.0
+        portfolio_heat = 0.0
+        daily_pnl = 0.0
+        open_positions = 0
+        positions_list: list[dict] = []
+        win_rate = 0.0
+        total_trades = 0
+
+        if risk_manager is not None:
+            equity = float(risk_manager.equity)
+            positions = risk_manager.positions
+            unrealized_pnl = float(sum(p.pnl for p in positions.values()))
+            open_positions = len(positions)
+            snap = risk_manager.get_risk_snapshot()
+            drawdown_pct = float(snap.get("drawdown_pct", 0))
+            portfolio_heat = float(snap.get("portfolio_heat", 0))
+            positions_list = [
+                {
+                    "symbol": p.symbol,
+                    "side": p.direction,
+                    "size": p.size,
+                    "entry": p.entry_price,
+                    "current": p.current_price,
+                    "pnl": p.pnl,
+                }
+                for p in positions.values()
+            ]
+
+        if order_manager is not None:
+            stats = order_manager.get_stats()
+            total_trades = int(stats.get("total_orders", 0))
+            filled = int(stats.get("filled_orders", 0))
+            win_rate = 0.0
+            if filled > 0:
+                total_pnl = unrealized_pnl
+                win_rate = 100.0 if total_pnl >= 0 else 0.0
+
+        daily_pnl = unrealized_pnl
+
+        return {
+            "equity": equity,
+            "unrealized_pnl": unrealized_pnl,
+            "drawdown_pct": drawdown_pct,
+            "portfolio_heat": portfolio_heat,
+            "daily_pnl": daily_pnl,
+            "open_positions": open_positions,
+            "positions": positions_list,
+            "win_rate": win_rate,
+            "total_trades": total_trades,
+        }
+
+    # ── /api/candles — OHLCV data for chart ───────────────────────────────
+    _candle_cache: dict[str, Any] = {"key": "", "ts": 0.0, "candles": []}
+
+    @app.get("/api/candles")
+    async def api_candles(
+        symbol: str = Query("BTC/USDT"),
+        timeframe: str = Query("1m"),
+    ) -> dict[str, Any]:
+        import time as _time
+
+        # Build all symbol variants to try
+        clean_sym = symbol.replace("/", "").replace(":USDT", "").upper()
+        base = clean_sym.replace("USDT", "") if clean_sym.endswith("USDT") else clean_sym
+        sym_variants = [
+            f"{base}/USDT:USDT",   # normalizer output format
+            symbol,                 # as given
+            f"{base}/USDT",         # ccxt-style
+            clean_sym,              # raw "BTCUSDT"
+        ]
+
+        # Try DataManager first (live aggregated data)
+        df = None
+        if data_manager is not None:
+            for sym_try in sym_variants:
+                df = data_manager.get_dataframe("binance", sym_try, timeframe)
+                if df is not None and len(df) > 0:
+                    break
+            else:
+                df = None
+
+        if df is not None and len(df) > 0:
+            rows = []
+            for idx, row in df.iterrows():
+                rows.append({
+                    "time": idx.isoformat() if hasattr(idx, "isoformat") else str(idx),
+                    "open": float(row.get("open", 0)),
+                    "high": float(row.get("high", 0)),
+                    "low": float(row.get("low", 0)),
+                    "close": float(row.get("close", 0)),
+                    "volume": float(row.get("volume", 0)),
+                })
+            return {"candles": rows}
+
+        # Fallback: fetch historical klines from Binance
+        cache_key = f"{clean_sym}:{timeframe}"
+        now = _time.time()
+        if _candle_cache["key"] == cache_key and (now - _candle_cache["ts"]) < 30:
+            return {"candles": _candle_cache["candles"]}
+
+        tf_map = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+        binance_tf = tf_map.get(timeframe, "1m")
+        try:
+            import aiohttp
+            pair = f"{base}USDT"
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={pair}&interval={binance_tf}&limit=1000"
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as sess:
+                async with sess.get(url) as resp:
+                    if resp.status == 200:
+                        klines = await resp.json(content_type=None)
+                        rows = []
+                        for k in klines:
+                            ts = int(k[0]) / 1000  # ms → s
+                            from datetime import datetime, timezone
+                            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                            rows.append({
+                                "time": dt.isoformat(),
+                                "open": float(k[1]),
+                                "high": float(k[2]),
+                                "low": float(k[3]),
+                                "close": float(k[4]),
+                                "volume": float(k[5]),
+                            })
+                        _candle_cache["key"] = cache_key
+                        _candle_cache["ts"] = now
+                        _candle_cache["candles"] = rows
+                        return {"candles": rows}
+        except Exception as exc:
+            logger.debug("Binance klines fallback error: {}", exc)
+
+        return {"candles": []}
+
+    # ── /api/market — watchlist / market data ─────────────────────────────
+    @app.get("/api/market")
+    async def api_market(per_page: int = Query(20)) -> dict[str, Any]:
+        import time as _time
+        import aiohttp
+
+        now = _time.time()
+        # Return cache if fresh (60s TTL)
+        if _market_cache["coins"] and (now - _market_cache["ts"]) < 60:
+            return {"coins": _market_cache["coins"][:min(per_page, 50)]}
+
+        coins: list[dict[str, Any]] = []
+        # Primary: CoinGecko
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
+                async with sess.get(
+                    "https://api.coingecko.com/api/v3/coins/markets",
+                    params={
+                        "vs_currency": "usd",
+                        "order": "market_cap_desc",
+                        "per_page": min(per_page, 50),
+                        "page": 1,
+                        "sparkline": "false",
+                    },
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        for c in data:
+                            coins.append({
+                                "symbol": str(c.get("symbol", "")).upper(),
+                                "name": c.get("name", ""),
+                                "price": float(c.get("current_price") or 0),
+                                "change_24h": float(c.get("price_change_percentage_24h") or 0),
+                                "volume_24h": float(c.get("total_volume") or 0),
+                                "high_24h": float(c.get("high_24h") or 0),
+                                "low_24h": float(c.get("low_24h") or 0),
+                                "market_cap": float(c.get("market_cap") or 0),
+                            })
+        except Exception as exc:
+            logger.debug("CoinGecko market fetch error: {}", exc)
+
+        # Fallback: Binance 24h ticker for top futures symbols
+        if not coins:
+            try:
+                top_symbols = [
+                    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+                    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT",
+                    "LINKUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT", "NEARUSDT",
+                    "APTUSDT", "ARBUSDT", "OPUSDT", "SUIUSDT", "PEPEUSDT",
+                ]
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
+                    async with sess.get(
+                        "https://fapi.binance.com/fapi/v1/ticker/24hr"
+                    ) as resp:
+                        if resp.status == 200:
+                            tickers = await resp.json(content_type=None)
+                            ticker_map = {t["symbol"]: t for t in tickers if isinstance(t, dict)}
+                            for sym in top_symbols[:min(per_page, 50)]:
+                                t = ticker_map.get(sym)
+                                if not t:
+                                    continue
+                                coins.append({
+                                    "symbol": sym.replace("USDT", ""),
+                                    "name": sym.replace("USDT", ""),
+                                    "price": float(t.get("lastPrice") or 0),
+                                    "change_24h": float(t.get("priceChangePercent") or 0),
+                                    "volume_24h": float(t.get("quoteVolume") or 0),
+                                    "high_24h": float(t.get("highPrice") or 0),
+                                    "low_24h": float(t.get("lowPrice") or 0),
+                                    "market_cap": 0,
+                                })
+            except Exception as exc:
+                logger.debug("Binance ticker fallback error: {}", exc)
+
+        if coins:
+            _market_cache["coins"] = coins
+            _market_cache["ts"] = now
+        elif _market_cache["coins"]:
+            # Return stale cache rather than empty
+            return {"coins": _market_cache["coins"][:min(per_page, 50)]}
+
+        return {"coins": coins}
+
+    # ── /api/feargreed — fear & greed index ───────────────────────────────
+    @app.get("/api/feargreed")
+    async def api_feargreed() -> dict[str, Any]:
+        if sentiment_manager is not None:
+            fg = getattr(sentiment_manager, "_fear_greed", None)
+            if fg is not None:
+                latest = fg.get_latest()
+                if latest is not None:
+                    value = int(max(0, min(100, (latest.score + 1) * 50)))
+                    return {
+                        "value": value,
+                        "classification": latest.label.capitalize(),
+                    }
+        # Fallback: direct fetch
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
+                async with sess.get("https://api.alternative.me/fng/?limit=1&format=json") as resp:
+                    data = await resp.json(content_type=None)
+                    item = data.get("data", [{}])[0]
+                    return {
+                        "value": int(item.get("value", 50)),
+                        "classification": item.get("value_classification", "Neutral"),
+                    }
+        except Exception:
+            return {"value": 50, "classification": "Neutral"}
+
+    # ── /api/orderbook — order book depth ─────────────────────────────────
+    @app.get("/api/orderbook")
+    async def api_orderbook(
+        symbol: str = Query("BTC/USDT"),
+        depth: int = Query(8),
+    ) -> dict[str, Any]:
+        depth = int(depth)
+        # Check event-bus cache first
+        for key, cached in _orderbook_cache.items():
+            if symbol.replace("/", "") in key.replace("/", "").replace(":", ""):
+                bids_raw = cached.get("bids", [])
+                asks_raw = cached.get("asks", [])
+                bids = [{"price": float(b[0]), "quantity": float(b[1])} for b in bids_raw[:depth]]
+                asks = [{"price": float(a[0]), "quantity": float(a[1])} for a in asks_raw[:depth]]
+                mid = (bids[0]["price"] + asks[0]["price"]) / 2 if bids and asks else 0
+                spread = asks[0]["price"] - bids[0]["price"] if bids and asks else 0
+                return {"bids": bids, "asks": asks, "spread": round(spread, 2), "mid_price": round(mid, 2)}
+
+        # Fallback: fetch directly from Binance
+        try:
+            import aiohttp
+            binance_sym = symbol.replace("/", "").replace("-", "").upper()
+            binance_cfg = config.get_value("exchanges", "binance") or {}
+            base_url = "https://fapi.binance.com/fapi/v1/depth" if not binance_cfg.get("testnet", True) else "https://testnet.binancefuture.com/fapi/v1/depth"
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
+                async with sess.get(base_url, params={"symbol": binance_sym, "limit": depth}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        bids = [{"price": float(b[0]), "quantity": float(b[1])} for b in data.get("bids", [])[:depth]]
+                        asks = [{"price": float(a[0]), "quantity": float(a[1])} for a in data.get("asks", [])[:depth]]
+                        mid = (bids[0]["price"] + asks[0]["price"]) / 2 if bids and asks else 0
+                        spread = asks[0]["price"] - bids[0]["price"] if bids and asks else 0
+                        return {"bids": bids, "asks": asks, "spread": round(spread, 2), "mid_price": round(mid, 2)}
+        except Exception as exc:
+            logger.debug("Orderbook direct fetch error: {}", exc)
+        return {"bids": [], "asks": [], "spread": 0, "mid_price": 0}
+
+    # ── /api/indicators/{symbol} — technical indicators ───────────────────
+    @app.get("/api/indicators/{sym}")
+    async def api_indicators(sym: str) -> dict[str, Any]:
+        if data_manager is None:
+            return _default_indicators()
+        # Build all symbol format variants
+        clean = sym.replace("/", "").replace(":USDT", "").upper()
+        base = clean.replace("USDT", "") if clean.endswith("USDT") else clean
+        sym_variants = [
+            f"{base}/USDT:USDT",   # normalizer output format
+            f"{base}/USDT",         # ccxt-style
+            f"{base}USDT",          # raw
+            sym,                    # as given
+        ]
+        for sym_try in sym_variants:
+            for tf_try in ["15m", "5m", "1m", "1h"]:
+                df = data_manager.get_dataframe("binance", sym_try, tf_try)
+                if df is not None and len(df) >= 5:
+                    row = df.iloc[-1]
+                    return {
+                        "rsi": float(row.get("rsi", 50)),
+                        "macd": float(row.get("macd", 0)),
+                        "stoch_k": float(row.get("stoch_k", 50)),
+                        "adx": float(row.get("adx", 20)),
+                        "atr": float(row.get("atr", 0)),
+                        "bb_width": float(row.get("bb_width", 0)),
+                        "ema9": float(row.get("ema_9", 0)),
+                        "ema21": float(row.get("ema_21", 0)),
+                        "sma50": float(row.get("sma_50", 0)),
+                        "ema_cross": float(row.get("ema_9", 0)) - float(row.get("ema_21", 0)),
+                        "volume_ratio": float(row.get("volume", 0)) / max(1.0, float(df["volume"].rolling(20).mean().iloc[-1])) if "volume" in df.columns else 1.0,
+                    }
+        return _default_indicators()
+
+    def _default_indicators() -> dict[str, Any]:
+        return {
+            "rsi": 50, "macd": 0, "stoch_k": 50, "adx": 20, "atr": 0,
+            "bb_width": 0, "ema9": 0, "ema21": 0, "sma50": 0, "ema_cross": 0,
+            "volume_ratio": 1.0,
+        }
+
+    # ── /api/dex/pools — DEX liquidity pools ──────────────────────────────
+    @app.get("/api/dex/pools")
+    async def api_dex_pools() -> dict[str, Any]:
+        try:
+            import aiohttp
+            query = '{ pools(first: 5, orderBy: totalValueLockedUSD, orderDirection: desc, where: { feeTier_in: [500, 3000] }) { token0 { symbol } token1 { symbol } totalValueLockedUSD } }'
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
+                async with sess.post(
+                    "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3",
+                    json={"query": query},
+                    headers={"Content-Type": "application/json"},
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        pools = data.get("data", {}).get("pools", [])
+                        return {
+                            "pools": [
+                                {
+                                    "pair": f"{p['token0']['symbol']}/{p['token1']['symbol']}",
+                                    "tvl": float(p.get("totalValueLockedUSD", 0)),
+                                }
+                                for p in pools
+                            ]
+                        }
+        except Exception as exc:
+            logger.debug("DEX pools fetch error: {}", exc)
+        return {"pools": []}
+
+    # ── /api/news — live news feed ────────────────────────────────────────
+    @app.get("/api/news")
+    async def api_news() -> dict[str, Any]:
+        items = list(_news_buffer)
+        if items:
+            return {"provider": "cryptocompare", "items": items[-20:][::-1]}
+        # Fallback: fetch from CoinGecko trending + search/trending
+        try:
+            import aiohttp
+            fetched_items: list[dict[str, Any]] = []
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
+                # CoinGecko search/trending — returns trending coins as pseudo-news
+                async with sess.get("https://api.coingecko.com/api/v3/search/trending") as resp:
+                    if resp.status == 200:
+                        from data_ingestion.news_feed import classify_sentiment
+                        data = await resp.json(content_type=None)
+                        coins = data.get("coins", [])
+                        for c in coins[:10]:
+                            item_data = c.get("item", {})
+                            name = item_data.get("name", "")
+                            sym = item_data.get("symbol", "")
+                            score = item_data.get("score", 0)
+                            price_chg = float(item_data.get("data", {}).get("price_change_percentage_24h", {}).get("usd", 0) or 0)
+                            sentiment = "bullish" if price_chg > 2 else ("bearish" if price_chg < -2 else "neutral")
+                            title = f"{name} ({sym}) trending — rank #{score + 1}, 24h: {price_chg:+.1f}%"
+                            fetched_items.append({
+                                "ts": int(time.time() * 1000),
+                                "title": title,
+                                "sentiment": sentiment,
+                            })
+                if fetched_items:
+                    return {"provider": "coingecko_trending", "items": fetched_items}
+
+                # Second fallback: CryptoCompare (may require API key)
+                async with sess.get("https://min-api.cryptocompare.com/data/v2/news/?lang=EN&sortOrder=latest") as resp:
+                    if resp.status == 200:
+                        from data_ingestion.news_feed import classify_sentiment
+                        data = await resp.json(content_type=None)
+                        articles = data.get("Data", data.get("data", []))
+                        if isinstance(articles, list):
+                            for a in articles[:10]:
+                                title = a.get("title", "")
+                                score = classify_sentiment(title + " " + a.get("body", "")[:200])
+                                sentiment = "bullish" if score > 0.15 else ("bearish" if score < -0.15 else "neutral")
+                                fetched_items.append({
+                                    "ts": int(a.get("published_on", time.time()) * 1000),
+                                    "title": title[:200],
+                                    "sentiment": sentiment,
+                                })
+                            if fetched_items:
+                                return {"provider": "cryptocompare", "items": fetched_items}
+        except Exception as exc:
+            logger.debug("News direct fetch error: {}", exc)
+        return {"provider": "unavailable", "items": []}
+
+    # ── /api/system/data-sources — module source map ──────────────────────
+    @app.get("/api/system/data-sources")
+    async def api_data_sources() -> dict[str, Any]:
+        return {
+            "sentiment": {"source": "alternative.me/fng" if sentiment_manager else "unavailable"},
+            "news": {"source": "cryptocompare" if news_feed else "unavailable"},
+            "backtest": {"source": "fast_backtester"},
+            "logs": {"source": "loguru_ringbuffer"},
+            "auto": {"source": "signal_generator" if signal_generator else "unavailable"},
+            "signals": {"source": "6_factor_composite" if signal_generator else "unavailable"},
+        }
+
+    # ── /api/backtest/summary — backtest metrics ──────────────────────────
+    @app.get("/api/backtest/summary")
+    async def api_backtest_summary() -> dict[str, Any]:
+        gross_notional = 0.0
+        win_rate_val = 0.0
+        sharpe = 0.0
+        max_dd = 0.0
+        avg_trade = 0.0
+        profit_factor = 0.0
+        if order_manager is not None:
+            stats = order_manager.get_stats()
+            total = int(stats.get("total_orders", 0))
+            filled = int(stats.get("filled_orders", 0))
+            gross_notional = float(stats.get("total_fill_value", 0))
+            # Compute win/loss from actual positions
+            if risk_manager is not None:
+                positions = list(risk_manager.positions.values()) if hasattr(risk_manager, 'positions') else []
+                wins = sum(1 for p in positions if getattr(p, 'pnl', 0) > 0)
+                losses = sum(1 for p in positions if getattr(p, 'pnl', 0) < 0)
+                total_trades = wins + losses
+                if total_trades > 0:
+                    win_rate_val = (wins / total_trades) * 100
+                # Compute Sharpe approximation from position PnLs
+                pnls = [getattr(p, 'pnl', 0) for p in positions if getattr(p, 'pnl', 0) != 0]
+                if len(pnls) >= 2:
+                    import statistics
+                    mean_pnl = statistics.mean(pnls)
+                    std_pnl = statistics.stdev(pnls)
+                    if std_pnl > 0:
+                        sharpe = (mean_pnl / std_pnl) * (252 ** 0.5)  # Annualized
+                # Profit factor
+                gross_profit = sum(p for p in pnls if p > 0) if pnls else 0
+                gross_loss = abs(sum(p for p in pnls if p < 0)) if pnls else 0
+                if gross_loss > 0:
+                    profit_factor = gross_profit / gross_loss
+                elif gross_profit > 0:
+                    profit_factor = float('inf')
+            if filled > 0 and filled > 0:
+                avg_trade = gross_notional / filled
+        if risk_manager is not None:
+            snap = risk_manager.get_risk_snapshot()
+            max_dd = float(snap.get("drawdown_pct", 0))
+        return {
+            "gross_notional": gross_notional,
+            "win_rate": win_rate_val,
+            "sharpe": round(sharpe, 2),
+            "max_drawdown_pct": max_dd,
+            "avg_trade_notional": round(avg_trade, 2),
+            "profit_factor": round(profit_factor, 2) if profit_factor != float('inf') else 999.0,
+        }
+
+    # ── /api/logs/recent — recent log entries ─────────────────────────────
+    @app.get("/api/logs/recent")
+    async def api_logs_recent() -> dict[str, Any]:
+        return {"logs": list(_log_buffer)[-50:][::-1]}
+
+    # ── /api/trade — place a trade ────────────────────────────────────────
+    @app.post("/api/trade")
+    async def api_trade(request: Request) -> dict[str, Any]:
+        body = await request.json()
+        if order_manager is None:
+            return {"success": False, "error": "order_manager not available"}
+        try:
+            from execution.order_manager import OrderSide, OrderType
+            sym = str(body.get("symbol", "BTC/USDT"))
+            side_str = str(body.get("side", "BUY")).upper()
+            side = OrderSide.BUY if side_str == "BUY" else OrderSide.SELL
+            size = float(body.get("size", 0))
+            order_type_str = str(body.get("order_type", "market")).lower()
+            ot = OrderType.MARKET if order_type_str == "market" else OrderType.LIMIT
+            price = float(body.get("price", 0)) if ot == OrderType.LIMIT else None
+            if config.paper_mode:
+                # Paper mode: record order locally without hitting exchange
+                success, order, reason = await order_manager.place_order(
+                    exchange="binance",
+                    symbol=sym,
+                    side=side,
+                    quantity=size,
+                    price=price or 0,
+                    order_type=ot,
+                    metadata={
+                        "source": "ui",
+                        "paper": True,
+                        "stop_loss_pct": body.get("stop_loss_pct", 2),
+                        "take_profit_pct": body.get("take_profit_pct", 4),
+                        "leverage": body.get("leverage", 1),
+                    },
+                )
+                if not success:
+                    return {"success": False, "error": reason}
+                return {"success": True, "order_id": getattr(order, "order_id", "unknown"), "paper": True}
+            else:
+                # Live mode: also use place_order (executor handles real submission)
+                success, order, reason = await order_manager.place_order(
+                    exchange="binance",
+                    symbol=sym,
+                    side=side,
+                    quantity=size,
+                    price=price or 0,
+                    order_type=ot,
+                    metadata={
+                        "source": "ui",
+                        "stop_loss_pct": body.get("stop_loss_pct", 2),
+                        "take_profit_pct": body.get("take_profit_pct", 4),
+                        "leverage": body.get("leverage", 1),
+                    },
+                )
+                if not success:
+                    return {"success": False, "error": reason}
+                return {"success": True, "order_id": getattr(order, "order_id", "unknown"), "paper": False}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    # ── /api/positions/close-all — close all positions ────────────────────
+    @app.post("/api/positions/close-all")
+    async def api_close_all() -> dict[str, Any]:
+        if risk_manager is None:
+            return {"success": False, "error": "risk_manager not available"}
+        closed = risk_manager.activate_kill_switch()
+        risk_manager.deactivate_kill_switch()
+        return {"success": True, "closed": len(closed)}
+
+    # ── /api/positions/breakeven — set break-even on positions ────────────
+    @app.post("/api/positions/breakeven")
+    async def api_breakeven() -> dict[str, Any]:
+        if risk_manager is None:
+            return {"success": False, "error": "risk_manager not available"}
+        count = 0
+        for pos in risk_manager.positions.values():
+            if hasattr(pos, "stop_loss") and pos.pnl > 0:
+                pos.stop_loss = pos.entry_price
+                count += 1
+        return {"success": True, "updated_positions": count}
+
+    # ── /api/auto/toggle — auto-trading toggle ────────────────────────────
+    @app.post("/api/auto/toggle")
+    async def api_auto_toggle(request: Request) -> dict[str, Any]:
+        body = await request.json()
+        enabled = bool(body.get("enabled", False))
+        if signal_generator is not None and hasattr(signal_generator, "set_auto_trading"):
+            signal_generator.set_auto_trading(enabled)
+        # Store bot config on signal_generator for reference
+        if signal_generator is not None:
+            signal_generator._bot_config = {
+                "strategy": body.get("strategy", "ensemble"),
+                "sizing_mode": body.get("sizing_mode", "risk_pct"),
+                "risk_per_trade": float(body.get("risk_per_trade", 2)),
+                "max_positions": int(body.get("max_positions", 3)),
+                "max_drawdown": float(body.get("max_drawdown", 10)),
+                "max_leverage": int(body.get("max_leverage", 5)),
+                "daily_loss_limit": float(body.get("daily_loss_limit", 500)),
+                "trailing_mode": body.get("trailing_mode", "none"),
+                "auto_sl_tp": bool(body.get("auto_sl_tp", False)),
+            }
+        return {"success": True, "auto_trading_enabled": enabled, "mode": "paper" if config.paper_mode else "live"}
+
+    # ── /api/auto/status — auto-trading status ────────────────────────────
+    @app.get("/api/auto/status")
+    async def api_auto_status() -> dict[str, Any]:
+        enabled = False
+        if signal_generator is not None and hasattr(signal_generator, "auto_trading_enabled"):
+            enabled = signal_generator.auto_trading_enabled
+        return {
+            "enabled": enabled,
+            "mode": "paper" if config.paper_mode else "live",
+            "auto_trading_enabled": enabled,
+            "paper_mode": config.paper_mode,
+        }
+
+    # ── /api/mode/toggle — switch between paper and live trading ────────
+    @app.post("/api/mode/toggle")
+    async def api_mode_toggle(request: Request) -> dict[str, Any]:
+        body = await request.json()
+        requested_mode = str(body.get("mode", "")).lower()
+        if requested_mode not in ("paper", "live"):
+            return {"success": False, "error": "mode must be 'paper' or 'live'"}
+        config.paper_mode = (requested_mode == "paper")
+        logger.info("Trading mode switched to: {}", requested_mode)
+        return {
+            "success": True,
+            "mode": requested_mode,
+            "paper_mode": config.paper_mode,
+        }
+
+    # ── /api/trades/history — closed trade history ────────────────────────
+    @app.get("/api/trades/history")
+    async def api_trades_history() -> dict[str, Any]:
+        trades: list[dict[str, Any]] = []
+        if order_manager is not None:
+            filled = order_manager.get_filled_orders()
+            for o in filled[-50:]:
+                trades.append({
+                    "time": o.filled_at or int(o.created_at * 1000),
+                    "symbol": o.symbol,
+                    "side": o.side.value if hasattr(o.side, 'value') else str(o.side),
+                    "price": o.average_fill_price or o.price or 0,
+                    "size": o.cumulative_quantity or o.quantity,
+                    "pnl": float(o.metadata.get("pnl", 0)),
+                })
+        return {"trades": trades}
+
+    # ── /api/config — GET config for settings modal ───────────────────────
+    @app.get("/api/config")
+    async def api_config_get() -> dict[str, Any]:
+        exchanges = config.get_value("exchanges") or {}
+        dex_cfg = config.get_value("dex") or {}
+        notifications_cfg = config.get_value("notifications", "telegram") or {}
+        risk_cfg = config.get_value("risk") or {}
+        auto_enabled = False
+        if signal_generator and hasattr(signal_generator, "auto_trading_enabled"):
+            auto_enabled = signal_generator.auto_trading_enabled
+
+        # Build connection registry
+        registry = []
+        for name in ["binance", "bybit", "okx", "kraken"]:
+            ex = exchanges.get(name, {})
+            has_key = bool(ex.get("api_key"))
+            registry.append({
+                "exchange": name,
+                "venue_type": "CEX",
+                "connected": has_key and ex.get("enabled", False),
+                "status": "connected" if (has_key and ex.get("enabled", False)) else "disconnected",
+            })
+
+        def _mask(val: str) -> str:
+            s = str(val or "")
+            return s[:4] + "****" if len(s) > 8 else ""
+
+        binance = exchanges.get("binance", {})
+        bybit = exchanges.get("bybit", {})
+        okx = exchanges.get("okx", {})
+        kraken = exchanges.get("kraken", {})
+
+        return {
+            "binance_api_key": _mask(binance.get("api_key", "")),
+            "binance_secret": _mask(binance.get("api_secret", "")),
+            "bybit_api_key": _mask(bybit.get("api_key", "")),
+            "bybit_secret": _mask(bybit.get("api_secret", "")),
+            "okx_api_key": _mask(okx.get("api_key", "")),
+            "okx_secret": _mask(okx.get("api_secret", "")),
+            "okx_passphrase": _mask(okx.get("passphrase", "")),
+            "kraken_api_key": _mask(kraken.get("api_key", "")),
+            "kraken_secret": _mask(kraken.get("api_secret", "")),
+            "dex_rpc_url": str(dex_cfg.get("rpc_url", "")),
+            "dex_private_key": _mask(dex_cfg.get("private_key", "")),
+            "telegram_bot_token": _mask(notifications_cfg.get("bot_token", "")),
+            "telegram_chat_id": str(notifications_cfg.get("chat_id", "")),
+            "binance_enabled": binance.get("enabled", False),
+            "bybit_enabled": bybit.get("enabled", False),
+            "okx_enabled": okx.get("enabled", False),
+            "kraken_enabled": kraken.get("enabled", False),
+            "uniswap_v3_enabled": dex_cfg.get("uniswap", {}).get("enabled", False),
+            "sushiswap_enabled": dex_cfg.get("sushiswap", {}).get("enabled", False),
+            "dydx_enabled": dex_cfg.get("dydx", {}).get("enabled", False),
+            "trade_alerts_enabled": True,
+            "risk_alerts_enabled": True,
+            "daily_summary_enabled": False,
+            "auto_trading_enabled": auto_enabled,
+            "auto_stop_loss_enabled": bool(risk_cfg.get("stop_loss_pct")),
+            "auto_take_profit_enabled": bool(risk_cfg.get("take_profit_pct")),
+            "trailing_stops_enabled": bool(risk_cfg.get("trailing_stop", {}).get("enabled")),
+            "atr_position_sizing_enabled": bool(risk_cfg.get("atr_stop", {}).get("enabled")),
+            "connection_registry": registry,
+        }
+
+    # ── /api/config POST — save settings ──────────────────────────────────
+    @app.post("/api/config")
+    async def api_config_post(request: Request) -> dict[str, Any]:
+        body = await request.json()
+        # Apply auto-trading toggle
+        if signal_generator and hasattr(signal_generator, "set_auto_trading"):
+            signal_generator.set_auto_trading(bool(body.get("auto_trading_enabled", False)))
+        return {"success": True, "message": "Settings applied to runtime", "connection_registry": []}
+
+    # ── /api/config/test — test exchange connections ──────────────────────
+    @app.post("/api/config/test")
+    async def api_config_test() -> dict[str, Any]:
+        exchanges_cfg = config.get_value("exchanges") or {}
+        dex_cfg = config.get_value("dex") or {}
+        enabled = {}
+        cex_creds = {}
+        for name in ["binance", "bybit", "okx", "kraken"]:
+            ex = exchanges_cfg.get(name, {})
+            enabled[name] = ex.get("enabled", False)
+            cex_creds[name] = bool(ex.get("api_key"))
+
+        registry = []
+        for name in ["binance", "bybit", "okx", "kraken"]:
+            ex = exchanges_cfg.get(name, {})
+            has_key = bool(ex.get("api_key"))
+            registry.append({
+                "exchange": name,
+                "venue_type": "CEX",
+                "connected": has_key and ex.get("enabled", False),
+                "status": "connected" if (has_key and ex.get("enabled", False)) else "disconnected",
+            })
+
+        return {
+            "success": True,
+            "connection_registry": registry,
+            "checks": {
+                "grpc": False,
+                "clickhouse": False,
+                "credentials_present": any(cex_creds.values()),
+                "cex_credentials": cex_creds,
+                "dex_credentials": {
+                    "rpc_url": bool(dex_cfg.get("rpc_url")),
+                    "private_key": bool(dex_cfg.get("private_key")),
+                },
+                "enabled": enabled,
+            },
+        }
+
+    # ── /api/realtime/snapshot — polling fallback ─────────────────────────
+    @app.get("/api/realtime/snapshot")
+    async def api_realtime_snapshot(
+        symbol: str = Query("BTC/USDT"),
+        timeframe: str = Query("1m"),
+    ) -> dict[str, Any]:
+        # Assemble a full snapshot from all data sources
+        status = (await api_status())
+        fg = (await api_feargreed())
+        ob = (await api_orderbook(symbol=symbol, depth=20))
+        sym_base = symbol.split("/")[0] if "/" in symbol else symbol
+        ind = (await api_indicators(sym_base))
+        news = (await api_news())
+        auto = (await api_auto_status())
+        candles = (await api_candles(symbol=symbol, timeframe=timeframe))
+        market = (await api_market(per_page=20))
+        dex = (await api_dex_pools())
+        return {
+            "status": status,
+            "feargreed": fg,
+            "orderbook": ob,
+            "indicators": ind,
+            "news": news,
+            "auto": auto,
+            "candles": candles,
+            "market": market,
+            "dex": dex,
+        }
+
+    # ── /api/realtime/stream — SSE streaming ──────────────────────────────
+    @app.get("/api/realtime/stream")
+    async def api_realtime_stream(
+        request: Request,
+        symbol: str = Query("BTC/USDT"),
+        timeframe: str = Query("1m"),
+    ):
+        async def _event_generator():
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    snapshot = await api_realtime_snapshot(symbol=symbol, timeframe=timeframe)
+                    yield {"event": "snapshot", "data": json.dumps(snapshot)}
+                except Exception as exc:
+                    logger.debug("SSE snapshot error: {}", exc)
+                await asyncio.sleep(3)
+
+        try:
+            return EventSourceResponse(_event_generator())
+        except Exception:
+            # Fallback if sse_starlette is not installed
+            from starlette.responses import StreamingResponse
+
+            async def _sse_fallback():
+                while True:
+                    try:
+                        snapshot = await api_realtime_snapshot(symbol=symbol, timeframe=timeframe)
+                        yield f"event: snapshot\ndata: {json.dumps(snapshot)}\n\n"
+                    except Exception:
+                        pass
+                    await asyncio.sleep(3)
+
+            return StreamingResponse(_sse_fallback(), media_type="text/event-stream")
 
     return app
 

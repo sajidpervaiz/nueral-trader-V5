@@ -161,6 +161,8 @@ async def check_risk(
             ml_score=0.8,
             sentiment_score=0.0,
             macro_score=0.0,
+            news_score=0.0,
+            orderbook_score=0.0,
             regime="api",
             regime_confidence=1.0,
             price=price,

@@ -13,7 +13,7 @@ exchanges:
     api_key: "${BINANCE_API_KEY}"
     api_secret: "${BINANCE_API_SECRET}"
     type: futures
-    testnet: true
+    testnet: false
     symbols:
       - BTC/USDT:USDT
       - ETH/USDT:USDT
@@ -143,6 +143,35 @@ risk:
   take_profit_pct: 0.03
   kelly_fraction: 0.25
   min_liquidity_usd: 100000
+  initial_equity: 100000
+
+  # Position sizing: "risk_based" = size=(equity*risk_per_trade)/(entry-stop), "fixed_fraction" = equity*max_position_pct
+  sizing_method: risk_based
+  risk_per_trade_pct: 0.01
+
+  # Pre-trade filters
+  max_spread_bps: 10.0
+  max_atr_pct: 0.05
+  max_exposure_per_symbol_pct: 0.10
+  cooldown_seconds: 300
+  session_start_utc: "00:00"
+  session_end_utc: "23:59"
+
+  # Position management (ATR-based)
+  atr_sl_multiplier: 1.5
+  rr_ratio: 2.0
+  trailing_activation_atr: 2.0
+  trailing_distance_atr: 1.0
+  breakeven_trigger_atr: 1.0
+  max_hold_minutes: 0  # 0 = disabled
+
+  # Circuit breaker
+  circuit_breaker_pause_seconds: 3600
+
+  # VaR
+  max_portfolio_var_pct: 0.08
+  returns_window: 250
+  var_min_history: 30
 
 # ── Signal engine ─────────────────────────────────────────────────────────────
 signals:
@@ -150,10 +179,13 @@ signals:
   primary_timeframe: 15m
   confirmation_timeframes: [1h, 4h]
   min_score_threshold: 0.65
-  ml_weight: 0.4
-  technical_weight: 0.4
-  sentiment_weight: 0.1
-  macro_weight: 0.1
+  ml_weight: 0.25
+  technical_weight: 0.30
+  sentiment_weight: 0.10
+  macro_weight: 0.10
+  news_weight: 0.15
+  orderbook_weight: 0.10
+  min_contributing_factors: 3
 
 # ── Backtester ────────────────────────────────────────────────────────────────
 backtest:
