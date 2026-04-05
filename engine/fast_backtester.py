@@ -233,3 +233,61 @@ class WalkForwardOptimizer:
                 logger.warning("WFO split {} error: {}", i + 1, exc)
 
         return results
+
+
+class MonteCarloSimulator:
+    """Monte Carlo simulation over trade sequences to estimate probability of ruin."""
+
+    def __init__(self, n_runs: int = 1000, ruin_threshold_pct: float = 0.50) -> None:
+        self._n_runs = n_runs
+        self._ruin_threshold = ruin_threshold_pct
+
+    def run(self, trades: list[BacktestTrade], initial_capital: float = 100_000) -> dict[str, Any]:
+        if not trades:
+            return {"error": "no_trades", "runs": 0}
+
+        pnl_pcts = np.array([t.pnl_pct for t in trades])
+        n_trades = len(pnl_pcts)
+        ruin_count = 0
+        final_equities: list[float] = []
+        max_drawdowns: list[float] = []
+        rng = np.random.default_rng(42)
+
+        for _ in range(self._n_runs):
+            # Shuffle trade order
+            shuffled = rng.permutation(pnl_pcts)
+            equity = initial_capital
+            peak = equity
+            max_dd = 0.0
+
+            for pnl_pct in shuffled:
+                equity *= (1.0 + pnl_pct)
+                if equity > peak:
+                    peak = equity
+                dd = (peak - equity) / peak if peak > 0 else 0.0
+                max_dd = max(max_dd, dd)
+
+                if dd >= self._ruin_threshold:
+                    ruin_count += 1
+                    break
+
+            final_equities.append(equity)
+            max_drawdowns.append(max_dd)
+
+        final_arr = np.array(final_equities)
+        dd_arr = np.array(max_drawdowns)
+
+        return {
+            "runs": self._n_runs,
+            "trades_per_run": n_trades,
+            "probability_of_ruin": ruin_count / self._n_runs,
+            "ruin_threshold_pct": self._ruin_threshold,
+            "ruin_count": ruin_count,
+            "median_final_equity": float(np.median(final_arr)),
+            "mean_final_equity": float(np.mean(final_arr)),
+            "p5_final_equity": float(np.percentile(final_arr, 5)),
+            "p95_final_equity": float(np.percentile(final_arr, 95)),
+            "median_max_drawdown": float(np.median(dd_arr)),
+            "p95_max_drawdown": float(np.percentile(dd_arr, 95)),
+            "mean_max_drawdown": float(np.mean(dd_arr)),
+        }

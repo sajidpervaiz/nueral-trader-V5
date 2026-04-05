@@ -153,6 +153,10 @@ risk:
   max_spread_bps: 10.0
   max_atr_pct: 0.05
   max_exposure_per_symbol_pct: 0.10
+  max_funding_rate_bps: 50.0
+  min_orderbook_depth_usd: 50000
+  max_order_size_usd: 500000
+  max_leverage_per_symbol: {}  # e.g. {"BTC/USDT": 10, "ETH/USDT": 5}
   cooldown_seconds: 300
   session_start_utc: "00:00"
   session_end_utc: "23:59"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -145,12 +146,21 @@ class RiskManager:
         self._returns_window = int(risk_cfg.get("returns_window", 250))
         self._var_min_history = int(risk_cfg.get("var_min_history", 30))
 
+        # ── New risk filters ──────────────────────────────────────────────
+        self._max_funding_rate_bps = float(risk_cfg.get("max_funding_rate_bps", 50.0))
+        self._min_orderbook_depth_usd = float(risk_cfg.get("min_orderbook_depth_usd", 50_000.0))
+        self._max_order_size_usd = float(risk_cfg.get("max_order_size_usd", 500_000.0))
+        self._max_leverage_per_symbol: dict[str, float] = risk_cfg.get("max_leverage_per_symbol", {})
+
         # ── State ─────────────────────────────────────────────────────────
         self._positions: dict[str, Position] = {}
         self._equity = float(risk_cfg.get("initial_equity", 100_000.0))
         self._return_history: list[float] = []
         self._last_trade_time: dict[str, float] = {}
         self._killed = False
+        self._current_funding_rates: dict[str, float] = {}  # symbol → rate (decimal)
+        self._current_orderbook_depth: dict[str, float] = {}  # symbol → top-of-book USD
+        self._kill_switch_file = Path("data/.kill_switch")
         self._circuit_breaker = CircuitBreaker(
             max_daily_loss_pct=float(risk_cfg.get("max_daily_loss_pct", 0.03)),
             max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 0.10)),
@@ -229,9 +239,61 @@ class RiskManager:
             return False, f"symbol_exposure_exceeded ({proposed_size:.0f} > {max_exposure:.0f})"
         return True, ""
 
+    def _check_funding_rate(self, signal: TradingSignal) -> tuple[bool, str]:
+        """Funding rate filter: skip trading when funding is extreme."""
+        rate = self._current_funding_rates.get(signal.symbol, 0.0)
+        rate_bps = abs(rate) * 10_000
+        if rate_bps > self._max_funding_rate_bps:
+            return False, f"funding_rate_extreme ({rate_bps:.1f} > {self._max_funding_rate_bps:.1f} bps)"
+        return True, ""
+
+    def _check_orderbook_depth(self, signal: TradingSignal) -> tuple[bool, str]:
+        """Order book depth filter: reject if top-of-book liquidity insufficient."""
+        depth_usd = self._current_orderbook_depth.get(signal.symbol, float("inf"))
+        if depth_usd < self._min_orderbook_depth_usd:
+            return False, f"orderbook_depth_insufficient ({depth_usd:.0f} < {self._min_orderbook_depth_usd:.0f} USD)"
+        return True, ""
+
+    def _check_max_order_size(self, proposed_size: float) -> tuple[bool, str]:
+        """Hard max order size cap per trade."""
+        if proposed_size > self._max_order_size_usd:
+            return False, f"max_order_size_exceeded ({proposed_size:.0f} > {self._max_order_size_usd:.0f} USD)"
+        return True, ""
+
+    def _check_liquidation_risk(self, signal: TradingSignal) -> tuple[bool, str]:
+        """Refuse trades that place liquidation price too close to entry."""
+        if self._leverage <= 1.0:
+            return True, ""  # No leverage = no liquidation risk
+        # Liquidation price ≈ entry × (1 - 1/leverage) for longs
+        # Reject if stop_loss is beyond estimated liquidation price
+        liq_margin = 1.0 / self._leverage
+        if signal.is_long:
+            est_liq = signal.price * (1 - liq_margin * 0.9)  # 90% of margin = danger zone
+            if signal.stop_loss <= est_liq:
+                return False, f"liquidation_risk (SL={signal.stop_loss:.2f} <= est_liq={est_liq:.2f})"
+        else:
+            est_liq = signal.price * (1 + liq_margin * 0.9)
+            if signal.stop_loss >= est_liq:
+                return False, f"liquidation_risk (SL={signal.stop_loss:.2f} >= est_liq={est_liq:.2f})"
+        return True, ""
+
+    def update_funding_rate(self, symbol: str, rate: float) -> None:
+        """Update current funding rate for a symbol (in decimal, e.g., 0.0001)."""
+        self._current_funding_rates[symbol] = rate
+
+    def update_orderbook_depth(self, symbol: str, depth_usd: float) -> None:
+        """Update current top-of-book depth in USD for a symbol."""
+        self._current_orderbook_depth[symbol] = depth_usd
+
     def approve_signal(self, signal: TradingSignal) -> tuple[bool, str, float]:
         if self._killed:
             return False, "kill_switch_active", 0.0
+
+        # File-based kill switch — manual override
+        if self._kill_switch_file.exists():
+            logger.critical("Kill switch FILE detected: {}", self._kill_switch_file)
+            self._killed = True
+            return False, "kill_switch_file_detected", 0.0
 
         if self._circuit_breaker.tripped:
             return False, f"circuit_breaker: {self._circuit_breaker.trip_reason}", 0.0
@@ -266,12 +328,28 @@ class RiskManager:
         if not ok:
             return False, reason, 0.0
 
+        ok, reason = self._check_funding_rate(signal)
+        if not ok:
+            return False, reason, 0.0
+
+        ok, reason = self._check_orderbook_depth(signal)
+        if not ok:
+            return False, reason, 0.0
+
+        ok, reason = self._check_liquidation_risk(signal)
+        if not ok:
+            return False, reason, 0.0
+
         # ── Position sizing ───────────────────────────────────────────────
         size = self.calculate_position_size(signal)
         if size <= 0:
             return False, "position_size_zero", 0.0
 
         ok, reason = self._check_symbol_exposure(signal, size)
+        if not ok:
+            return False, reason, 0.0
+
+        ok, reason = self._check_max_order_size(size)
         if not ok:
             return False, reason, 0.0
 

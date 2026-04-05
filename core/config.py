@@ -8,6 +8,8 @@ from typing import Any
 import yaml
 from loguru import logger
 
+from core.config_schema import validate_config, AppConfig
+
 
 _ENV_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
@@ -44,7 +46,15 @@ class Config:
         with open(path, "r") as fh:
             raw = yaml.safe_load(fh)
         self._data: dict[str, Any] = _interpolate(raw)
-        logger.debug("Configuration loaded from {}", path)
+
+        # Pydantic validation — fail fast on bad config
+        try:
+            self._validated: AppConfig = validate_config(self._data)
+        except Exception as exc:
+            logger.error("Config validation FAILED: {}", exc)
+            raise SystemExit(f"FATAL: Invalid configuration — {exc}") from exc
+
+        logger.debug("Configuration loaded and validated from {}", path)
 
     @classmethod
     def get(cls, path: str | Path | None = None) -> "Config":

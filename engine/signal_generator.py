@@ -277,6 +277,7 @@ class SignalGenerator:
         self._min_score = float(signals_cfg.get("min_score_threshold", 0.65))
         self._min_factors = int(signals_cfg.get("min_contributing_factors", 3))
         self._primary_tf = signals_cfg.get("primary_timeframe", "15m")
+        self._confirmation_tfs: list[str] = list(signals_cfg.get("confirmation_timeframes", ["1h", "4h"]))
 
     def set_auto_trading(self, enabled: bool) -> None:
         prev = self._auto_trading_enabled
@@ -287,6 +288,38 @@ class SignalGenerator:
     @property
     def auto_trading_enabled(self) -> bool:
         return self._auto_trading_enabled
+
+    def _check_higher_timeframe_trend(
+        self, exchange: str, symbol: str, direction: str,
+    ) -> tuple[bool, str]:
+        """Multi-timeframe confirmation: higher TF trend must agree with direction.
+
+        Returns (ok, reason).  If no HTF data is available, passes by default.
+        """
+        if not self._confirmation_tfs:
+            return True, ""
+
+        for tf in self._confirmation_tfs:
+            htf_df = self.data_manager.get_dataframe(exchange, symbol, tf)
+            if htf_df is None or len(htf_df) < 20:
+                continue  # no data — skip this TF rather than block
+
+            last = htf_df.iloc[-1]
+            ema_fast = last.get("ema_12", last.get("close", 0))
+            ema_slow = last.get("ema_26", last.get("close", 0))
+
+            if ema_fast == 0 or ema_slow == 0:
+                continue
+
+            htf_bullish = ema_fast > ema_slow
+            htf_bearish = ema_fast < ema_slow
+
+            if direction == "long" and htf_bearish:
+                return False, f"{tf}_trend_bearish (EMA12={ema_fast:.2f} < EMA26={ema_slow:.2f})"
+            if direction == "short" and htf_bullish:
+                return False, f"{tf}_trend_bullish (EMA12={ema_fast:.2f} > EMA26={ema_slow:.2f})"
+
+        return True, ""
 
     async def _handle_candle(self, payload: Any) -> None:
         candle = payload
@@ -321,6 +354,19 @@ class SignalGenerator:
 
         abs_score = abs(composite)
         if abs_score < self._min_score:
+            return
+
+        # ── Multi-timeframe confirmation ──────────────────────────────────
+        # Higher TF trend must agree with signal direction
+        proposed_direction = "long" if composite > 0 else "short"
+        htf_ok, htf_reason = self._check_higher_timeframe_trend(
+            candle.exchange, candle.symbol, proposed_direction,
+        )
+        if not htf_ok:
+            logger.debug(
+                "Signal rejected for {} on HTF filter: {}",
+                key, htf_reason,
+            )
             return
 
         # ── Require minimum factor agreement ──────────────────────────────

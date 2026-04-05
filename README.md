@@ -509,6 +509,258 @@ bash scripts/generate_proto.sh
 
 ---
 
+## System Architecture — Signal Flow
+
+```mermaid
+flowchart TB
+    subgraph DataLayer["1. Market Data Layer"]
+        WS[CEX WebSocket Feed] --> N[Normalizer]
+        REST[REST Polling] --> N
+        N --> TV[Tick Validator]
+        TV --> CA[Candle Aggregator]
+        CA --> DM[Data Manager]
+    end
+
+    subgraph IndicatorLayer["2. Indicator Engine"]
+        DM --> TI[Technical Indicators<br/>SMA EMA RSI ATR<br/>MACD BB VWAP]
+        DM --> RD[Regime Detector<br/>ADX Hurst Volatility]
+    end
+
+    subgraph SignalLayer["3. Strategy Engine"]
+        TI --> TS[Technical Scorer]
+        RD --> TS
+        ML[ML Scorer] --> SC
+        NS[News Scorer] --> SC
+        OB[Orderbook Scorer] --> SC
+        SENT[Sentiment] --> SC
+        MACRO[Macro Score] --> SC
+        TS --> SC[6-Factor Composite<br/>Confidence Scoring]
+        SC --> HTF{Multi-TF<br/>Confirmation}
+        HTF -->|HTF agrees| SIG[Signal Intent<br/>action direction<br/>confidence SL TP]
+        HTF -->|HTF disagrees| REJECT1[Rejected]
+    end
+
+    subgraph RiskLayer["4. Risk Engine — Final Authority"]
+        SIG --> KS{Kill Switch?}
+        KS -->|active| BLOCK1[Blocked]
+        KS -->|clear| CB{Circuit<br/>Breaker?}
+        CB -->|tripped| BLOCK2[Blocked]
+        CB -->|ok| RF[Risk Filters<br/>spread · volatility · funding<br/>depth · cooldown · session<br/>exposure · VaR · liquidation]
+        RF -->|pass| PS[Position Sizing<br/>risk_based or kelly]
+        RF -->|fail| BLOCK3[Blocked + Reason]
+        PS --> SZ{Size > 0?}
+        SZ -->|yes| APPROVE[Approved + Size]
+        SZ -->|no| BLOCK4[Zero Size]
+    end
+
+    subgraph ExecLayer["5. Execution Engine"]
+        APPROVE --> OM[Order Manager<br/>Idempotency · State Machine]
+        OM --> SR[Smart Order Router<br/>Venue Selection]
+        SR --> EX[Exchange Executor<br/>LIMIT entry · MARKET emergency]
+        EX --> FT[Fill Tracker<br/>Partial Fill Handling]
+    end
+
+    subgraph PosLayer["6. Position Management"]
+        FT --> PM[Position Manager<br/>ATR-based SL/TP]
+        PM --> TS2[Trailing Stop]
+        PM --> BE[Breakeven Move]
+        PM --> TE[Time Exit]
+        PM --> PNL[PnL Update<br/>Equity Curve]
+        PNL --> CB
+    end
+
+    style DataLayer fill:#1a1a2e,color:#e94560
+    style IndicatorLayer fill:#16213e,color:#e94560
+    style SignalLayer fill:#0f3460,color:#e94560
+    style RiskLayer fill:#533483,color:#e94560
+    style ExecLayer fill:#2b2d42,color:#e94560
+    style PosLayer fill:#1b1b2f,color:#e94560
+```
+
+## Order State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: Order Created
+    PENDING --> SUBMITTED: Sent to Exchange
+    SUBMITTED --> OPEN: Exchange ACK
+    OPEN --> PARTIALLY_FILLED: Partial Fill
+    PARTIALLY_FILLED --> PARTIALLY_FILLED: More Fills
+    PARTIALLY_FILLED --> FILLED: Complete
+    OPEN --> FILLED: Full Fill
+    OPEN --> CANCELLED: Cancel Request
+    SUBMITTED --> REJECTED: Exchange Reject
+    SUBMITTED --> CANCELLED: Timeout / Cancel
+    FILLED --> [*]
+    CANCELLED --> [*]
+    REJECTED --> [*]
+```
+
+## Risk Engine Decision Tree
+
+```mermaid
+flowchart LR
+    S[Signal] --> K{Kill Switch}
+    K -->|file/API| X1[BLOCK]
+    K -->|clear| C{Circuit Breaker}
+    C -->|tripped| X2[BLOCK daily_loss/drawdown]
+    C -->|ok| P{Already in Position?}
+    P -->|yes| X3[BLOCK duplicate]
+    P -->|no| M{Max Positions?}
+    M -->|reached| X4[BLOCK max_open]
+    M -->|ok| SC{Score ≥ 0.5?}
+    SC -->|no| X5[BLOCK score_low]
+    SC -->|ok| RR{R:R ≥ 1.5?}
+    RR -->|no| X6[BLOCK poor_rr]
+    RR -->|ok| F[Pre-Trade Filters]
+    F --> SP{Spread OK?}
+    SP -->|wide| X7[BLOCK spread]
+    SP -->|ok| V{Volatility OK?}
+    V -->|high| X8[BLOCK atr_pct]
+    V -->|ok| FR{Funding Rate OK?}
+    FR -->|extreme| X9[BLOCK funding]
+    FR -->|ok| D{Book Depth OK?}
+    D -->|thin| X10[BLOCK depth]
+    D -->|ok| LQ{Liquidation Safe?}
+    LQ -->|danger| X11[BLOCK liquidation]
+    LQ -->|ok| SZ[Calculate Size]
+    SZ --> VA{VaR OK?}
+    VA -->|breach| X12[BLOCK var]
+    VA -->|ok| AP[✅ APPROVED]
+```
+
+---
+
+## Configuration Reference
+
+All configuration lives in `config/settings.yaml`. Key sections:
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `system.paper_mode` | bool | `true` | **Must be true for safety.** Set false only for live trading |
+| `system.log_level` | str | `INFO` | DEBUG, INFO, WARNING, ERROR, CRITICAL |
+| `risk.max_position_size_pct` | float | `0.02` | Max position size as % of equity |
+| `risk.max_daily_loss_pct` | float | `0.03` | Daily loss limit — triggers circuit breaker |
+| `risk.max_drawdown_pct` | float | `0.10` | Equity drawdown limit — pauses trading |
+| `risk.max_open_positions` | int | `5` | Maximum simultaneous open positions |
+| `risk.risk_per_trade_pct` | float | `0.01` | Risk per trade for position sizing |
+| `risk.atr_sl_multiplier` | float | `1.5` | ATR multiplier for stop loss |
+| `risk.rr_ratio` | float | `2.0` | Minimum risk-reward ratio for TP |
+| `risk.max_spread_bps` | float | `10.0` | Maximum bid-ask spread in basis points |
+| `risk.max_atr_pct` | float | `0.05` | Maximum ATR / price ratio |
+| `risk.max_funding_rate_bps` | float | `50.0` | Maximum funding rate in bps |
+| `risk.min_orderbook_depth_usd` | float | `50000` | Minimum top-of-book depth USD |
+| `risk.max_order_size_usd` | float | `500000` | Hard cap per order in USD |
+| `risk.cooldown_seconds` | float | `300` | Post-trade cooldown per symbol |
+| `risk.max_hold_minutes` | int | `0` | Time exit (0 = disabled) |
+| `signals.primary_timeframe` | str | `15m` | Primary signal generation timeframe |
+| `signals.confirmation_timeframes` | list | `[1h, 4h]` | Higher TF trend override |
+| `signals.min_score_threshold` | float | `0.65` | Minimum composite score to signal |
+| `signals.min_contributing_factors` | int | `3` | Minimum agreeing factors (of 6) |
+| `backtest.monte_carlo_runs` | int | `1000` | MC simulation iterations |
+
+### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `BINANCE_API_KEY` | For live | Binance Futures API key |
+| `BINANCE_API_SECRET` | For live | Binance Futures API secret |
+| `DASHBOARD_API_KEY` | Optional | REST API authentication key |
+| `POSTGRES_HOST` | Optional | PostgreSQL host (default: localhost) |
+| `REDIS_HOST` | Optional | Redis host (default: localhost) |
+
+---
+
+## Strategy Explanation
+
+The default strategy is a **dual EMA crossover with RSI confirmation** and **6-factor composite scoring**:
+
+1. **Technical Score (30%)**: RSI oversold/overbought, MACD crossover, EMA crossover, Bollinger Band position
+2. **ML Score (25%)**: Z-score-based directional bias (or trained model if available)
+3. **News Score (15%)**: Decay-weighted sentiment from crypto news feeds
+4. **Sentiment Score (10%)**: Fear & Greed Index integration
+5. **Macro Score (10%)**: Funding rate and market structure signals
+6. **Orderbook Score (10%)**: Bid/ask imbalance from real-time depth
+
+A signal is generated when:
+- Composite score exceeds `min_score_threshold` (default 0.65)
+- At least `min_contributing_factors` (default 3) agree on direction
+- Higher timeframe trend confirms the direction
+- Auto-trading is enabled
+
+The Risk Engine then validates against 15+ safety filters before any order placement.
+
+---
+
+## Commands
+
+```bash
+# Run backtest (BTC/USDT 1h, 6 months)
+python scripts/run_backtest.py --symbol BTC/USDT --timeframe 1h --months 6
+
+# Paper trading (safe, default mode)
+python main.py
+
+# Live trading (requires explicit config changes)
+# 1. Set system.paper_mode: false
+# 2. Set exchanges.binance.testnet: false
+# 3. Provide BINANCE_API_KEY and BINANCE_API_SECRET
+python main.py
+
+# Run tests
+python -m pytest tests/ -v --tb=short
+
+# Run self-validation tests only
+python -m pytest tests/unit/test_nueral_trader_5_self_validation.py -v
+
+# Check test coverage
+python -m pytest tests/ --cov=. --cov-report=term-missing
+
+# Kill switch (create file to stop trading)
+touch data/.kill_switch
+# Remove to resume:
+rm data/.kill_switch
+```
+
+---
+
+## OpenAPI Documentation
+
+When the dashboard is running, access the auto-generated OpenAPI docs at:
+- **Swagger UI**: http://localhost:8000/docs
+- **ReDoc**: http://localhost:8000/redoc
+- **OpenAPI JSON**: http://localhost:8000/openapi.json
+
+Key endpoints:
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | System health, uptime, error count |
+| `/status` | GET | Equity, PnL, drawdown, mode |
+| `/kill` | POST | Emergency kill switch |
+| `/api/mode/toggle` | POST | Toggle paper/live mode |
+| `/api/risk/snapshot` | GET | Current risk state + VaR |
+| `/api/risk/stress-test` | POST | Run stress test scenarios |
+| `/api/signals/history` | GET | Recent signal history |
+| `/api/positions` | GET | Open positions |
+| `/api/market/data` | GET | Live market data |
+| `/api/realtime/stream` | GET | SSE real-time stream |
+
+---
+
+## Risk Disclaimer
+
+⚠️ **WARNING: This software is provided for EDUCATIONAL and RESEARCH purposes only.**
+
+- Cryptocurrency and futures trading involves substantial risk of loss
+- Past backtest performance does NOT guarantee future results
+- The authors accept NO liability for financial losses
+- Always start in **paper mode** before risking real capital
+- Never trade with funds you cannot afford to lose
+- The system defaults to `paper_mode: true` and `testnet: true` for your protection
+- **YOU are solely responsible** for any trades executed by this software
+
+---
+
 ## License
 
 MIT License - See LICENSE file for details
