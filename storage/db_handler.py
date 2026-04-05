@@ -124,6 +124,8 @@ class DBHandler:
         self._timescale = bool(pg.get("timescaledb", True))
 
     async def connect(self) -> None:
+        if self._pool is not None:
+            return  # Already connected — avoid creating a second pool
         if not _ASYNCPG:
             logger.warning("asyncpg not installed — DB disabled")
             return

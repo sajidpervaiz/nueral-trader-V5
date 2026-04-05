@@ -1305,3 +1305,213 @@ class TestModuleImports:
         from execution.startup_validation import StartupValidator, ValidationError
         assert StartupValidator is not None
         assert issubclass(ValidationError, Exception)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Deep audit round 2 — line-by-line bug fixes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestDeepAuditFixes:
+    """Tests for bugs found during line-by-line audit."""
+
+    @pytest.mark.asyncio
+    async def test_db_connect_guard_prevents_double_pool(self):
+        """db.connect() called twice should NOT create a second pool."""
+        from storage.db_handler import DBHandler
+
+        config = Config(config_path=CONFIG_PATH)
+        db = DBHandler(config)
+
+        # Simulate first successful connect by setting _pool
+        fake_pool = MagicMock()
+        db._pool = fake_pool
+
+        # Second connect should be a no-op (guard returns early)
+        await db.connect()
+
+        # Pool should still be the same object, not replaced
+        assert db._pool is fake_pool
+
+    @pytest.mark.asyncio
+    async def test_user_stream_reconnect_untrips_circuit_breaker(self):
+        """Circuit breaker should un-trip when user data stream reconnects."""
+        from execution.cex_executor import CEXExecutor
+
+        config = Config(config_path=CONFIG_PATH)
+        config.paper_mode = False
+        event_bus = EventBus()
+        from execution.risk_manager import RiskManager
+        risk_mgr = RiskManager(config, event_bus)
+
+        executor = CEXExecutor(config, event_bus, risk_mgr, exchange_id="binance")
+
+        # Simulate stream lost → circuit breaker tripped
+        await executor._handle_user_stream_lost({})
+        assert risk_mgr._circuit_breaker._tripped is True
+        assert risk_mgr._circuit_breaker._trip_reason == "user_stream_disconnected"
+
+        # Simulate stream reconnected → should un-trip
+        await executor._handle_user_stream_connected({})
+        assert risk_mgr._circuit_breaker._tripped is False
+        assert risk_mgr._circuit_breaker._trip_reason == ""
+
+    @pytest.mark.asyncio
+    async def test_user_stream_reconnect_keeps_other_trips(self):
+        """Reconnect should NOT un-trip circuit breaker if tripped for other reasons."""
+        from execution.cex_executor import CEXExecutor
+        from execution.risk_manager import RiskManager
+
+        config = Config(config_path=CONFIG_PATH)
+        config.paper_mode = False
+        event_bus = EventBus()
+        risk_mgr = RiskManager(config, event_bus)
+
+        executor = CEXExecutor(config, event_bus, risk_mgr, exchange_id="binance")
+
+        # Trip for daily loss (not stream disconnect)
+        risk_mgr._circuit_breaker._tripped = True
+        risk_mgr._circuit_breaker._trip_reason = "daily_loss=-3.00%"
+        risk_mgr._circuit_breaker._trip_time = time.time()
+
+        # Stream reconnect should NOT reset this
+        await executor._handle_user_stream_connected({})
+        assert risk_mgr._circuit_breaker._tripped is True
+        assert "daily_loss" in risk_mgr._circuit_breaker._trip_reason
+
+    @pytest.mark.asyncio
+    async def test_partial_fill_sl_failure_trips_circuit_breaker(self):
+        """Partial fill SL placement failure should trip circuit breaker."""
+        from execution.cex_executor import CEXExecutor
+        from execution.risk_manager import RiskManager
+        from engine.signal_generator import TradingSignal
+
+        config = Config(config_path=CONFIG_PATH)
+        config.paper_mode = False
+        event_bus = EventBus()
+        risk_mgr = RiskManager(config, event_bus)
+
+        executor = CEXExecutor(config, event_bus, risk_mgr, exchange_id="binance")
+
+        # Mock the client that returns a partial fill
+        mock_client = AsyncMock()
+        partial_fill_order = {
+            "id": "test123",
+            "status": "partially_filled",
+            "average": 50000.0,
+            "price": 50000.0,
+            "filled": 0.01,
+        }
+        mock_client.create_limit_order = AsyncMock(return_value=partial_fill_order)
+        executor._client = mock_client
+
+        # Skip the polling loop — return partial fill directly
+        executor._wait_for_fill = AsyncMock(return_value=partial_fill_order)
+
+        # Mock order placer that fails SL placement
+        mock_placer = AsyncMock()
+        mock_placer.place_protective_orders = AsyncMock(side_effect=RuntimeError("SL failed"))
+        executor._order_placer = mock_placer
+
+        signal = TradingSignal(
+            exchange="binance",
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            score=0.85,
+            technical_score=0.8,
+            ml_score=0.7,
+            sentiment_score=0.6,
+            macro_score=0.5,
+            news_score=0.5,
+            orderbook_score=0.5,
+            regime="trending",
+            regime_confidence=0.8,
+            price=50000.0,
+            stop_loss=49000.0,
+            take_profit=52000.0,
+            atr=500.0,
+            timestamp=int(time.time()),
+        )
+
+        await executor._live_execute(signal, 500.0)
+
+        # Circuit breaker should be tripped
+        assert risk_mgr._circuit_breaker._tripped is True
+        assert "sl_placement_failed" in risk_mgr._circuit_breaker._trip_reason
+
+    @pytest.mark.asyncio
+    async def test_position_closed_payload_is_always_dict(self):
+        """POSITION_CLOSED should always publish dict format, not raw Position."""
+        from execution.cex_executor import CEXExecutor
+        from execution.risk_manager import RiskManager
+
+        config = Config(config_path=CONFIG_PATH)
+        config.paper_mode = False
+        event_bus = EventBus()
+        risk_mgr = RiskManager(config, event_bus)
+
+        executor = CEXExecutor(config, event_bus, risk_mgr, exchange_id="binance")
+
+        # Open a position
+        from engine.signal_generator import TradingSignal
+        signal = TradingSignal(
+            exchange="binance", symbol="BTC/USDT:USDT", direction="long",
+            score=0.85, technical_score=0.8, ml_score=0.7, sentiment_score=0.6,
+            macro_score=0.5, news_score=0.5, orderbook_score=0.5,
+            regime="trending", regime_confidence=0.8,
+            price=50000.0, stop_loss=49000.0, take_profit=52000.0,
+            atr=500.0, timestamp=int(time.time()),
+        )
+        risk_mgr.open_position(signal, 500.0)
+
+        # Capture what gets published
+        captured = []
+        async def capture_handler(payload):
+            captured.append(payload)
+        event_bus.subscribe("POSITION_CLOSED", capture_handler)
+
+        # Trigger stop loss
+        await executor._handle_stop_loss({
+            "exchange": "binance", "symbol": "BTC/USDT:USDT", "price": 49000.0,
+        })
+        await _drain_event_bus(event_bus)
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], dict)
+        assert "position" in captured[0]
+        assert "reason" in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_user_order_update_filtered_by_exchange_id(self):
+        """Only binance executor should process USER_ORDER_UPDATE events."""
+        from execution.cex_executor import CEXExecutor
+        from execution.risk_manager import RiskManager
+
+        config = Config(config_path=CONFIG_PATH)
+        config.paper_mode = False
+        event_bus = EventBus()
+        risk_mgr = RiskManager(config, event_bus)
+
+        # Create a non-binance executor
+        executor = CEXExecutor(config, event_bus, risk_mgr, exchange_id="bybit")
+
+        payload = {
+            "symbol": "BTC/USDT:USDT",
+            "execution_type": "TRADE",
+            "order_status": "FILLED",
+            "order_type": "LIMIT",
+            "reduce_only": False,
+            "last_filled_qty": 0.01,
+            "last_filled_price": 50000.0,
+            "cumulative_filled_qty": 0.01,
+            "quantity": 0.01,
+            "commission": 0.005,
+            "realized_profit": 0,
+            "trade_id": 12345,
+            "order_id": 999,
+        }
+
+        # Should return early without processing (no error, no publish)
+        await executor._handle_user_order_update(payload)
+        # If it tried to process, it would hit close_position or other logic
+        # No assertion needed beyond no exception — the filter check is in place

@@ -191,6 +191,11 @@ class CEXExecutor:
                         )
                     except Exception as exc:
                         logger.critical("SL placement failed for partial fill {}: {}", signal.symbol, exc)
+                        self.risk_manager._circuit_breaker._tripped = True
+                        self.risk_manager._circuit_breaker._trip_reason = (
+                            f"sl_placement_failed:{signal.symbol}"
+                        )
+                        self.risk_manager._circuit_breaker._trip_time = time.time()
             else:
                 logger.warning("{} order not filled: status={}", self.exchange_id, result.status)
                 await self.event_bus.publish("ORDER_FAILED", result)
@@ -256,7 +261,9 @@ class CEXExecutor:
             if self._order_placer:
                 await self._order_placer.handle_sl_filled(symbol)
                 self._order_placer.remove_tracking(symbol)
-            await self.event_bus.publish("POSITION_CLOSED", pos)
+            await self.event_bus.publish("POSITION_CLOSED", {
+                "position": pos, "reason": "stop_loss", "price": price,
+            })
 
     async def _handle_take_profit(self, payload: Any) -> None:
         exchange = payload.get("exchange", "")
@@ -270,7 +277,9 @@ class CEXExecutor:
             if self._order_placer:
                 await self._order_placer.handle_tp_filled(symbol)
                 self._order_placer.remove_tracking(symbol)
-            await self.event_bus.publish("POSITION_CLOSED", pos)
+            await self.event_bus.publish("POSITION_CLOSED", {
+                "position": pos, "reason": "take_profit", "price": price,
+            })
 
     async def _handle_kill_switch(self, payload: Any) -> None:
         """Emergency: cancel all open orders, close all positions at market."""
@@ -298,6 +307,9 @@ class CEXExecutor:
 
     async def _handle_user_order_update(self, payload: Any) -> None:
         """Handle fill/cancel/reject from Binance User Data Stream."""
+        # Only the executor for the stream's exchange should process these
+        if self.exchange_id != "binance":
+            return
         symbol = payload.get("symbol", "")
         exec_type = payload.get("execution_type", "")
         order_status = payload.get("order_status", "")
@@ -374,8 +386,13 @@ class CEXExecutor:
         self.risk_manager._circuit_breaker._trip_time = time.time()
 
     async def _handle_user_stream_connected(self, payload: Any) -> None:
-        """User data stream reconnected."""
+        """User data stream reconnected — un-trip circuit breaker if it was tripped by disconnect."""
         logger.info("User data stream reconnected — resuming normal operation")
+        cb = self.risk_manager._circuit_breaker
+        if cb._tripped and cb._trip_reason == "user_stream_disconnected":
+            cb._tripped = False
+            cb._trip_reason = ""
+            logger.info("Circuit breaker reset after user stream reconnection")
 
     async def run(self) -> None:
         self._running = True
