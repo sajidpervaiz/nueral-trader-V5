@@ -143,6 +143,7 @@ risk:
   take_profit_pct: 0.03
   kelly_fraction: 0.25
   min_liquidity_usd: 100000
+  min_balance_usd: 100        # Minimum wallet balance required for live trading
   initial_equity: 100000
 
   # Position sizing: "risk_based" = size=(equity*risk_per_trade)/(entry-stop), "fixed_fraction" = equity*max_position_pct

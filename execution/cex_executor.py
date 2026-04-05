@@ -12,6 +12,7 @@ from core.config import Config
 from core.event_bus import EventBus
 from engine.signal_generator import TradingSignal
 from execution.risk_manager import RiskManager, Position
+from execution.exchange_order_placer import ExchangeOrderPlacer
 
 
 @dataclass
@@ -41,9 +42,12 @@ class CEXExecutor:
         self.risk_manager = risk_manager
         self.exchange_id = exchange_id
         self._client: Any = None
+        self._order_placer: ExchangeOrderPlacer | None = None
         self._running = False
 
     async def _init_client(self) -> None:
+        if self._client is not None:
+            return  # Already initialized — avoid wiping order_placer state
         cfg = self.config.get_value("exchanges", self.exchange_id) or {}
         if not cfg.get("enabled", False):
             return
@@ -67,6 +71,9 @@ class CEXExecutor:
             if cfg.get("testnet"):
                 self._client.set_sandbox_mode(True)
             await self._client.load_markets()
+            # Create exchange-side order placer for SL/TP
+            working_type = str(cfg.get("working_type", "CONTRACT_PRICE"))
+            self._order_placer = ExchangeOrderPlacer(self._client, working_type=working_type)
             logger.info("{} CEX client initialized", self.exchange_id)
         except Exception as exc:
             logger.warning("{} client init failed: {}", self.exchange_id, exc)
@@ -97,7 +104,8 @@ class CEXExecutor:
         return result
 
     async def _live_execute(self, signal: TradingSignal, size: float) -> OrderResult | None:
-        """Execute using LIMIT order for entries; MARKET only for emergency exits."""
+        """Execute using LIMIT order for entries; MARKET only for emergency exits.
+        Places exchange-side SL/TP after fill for crash protection."""
         if self._client is None:
             logger.error("No live client for {} — cannot execute", self.exchange_id)
             return None
@@ -111,29 +119,78 @@ class CEXExecutor:
                     symbol=signal.symbol, side=side, amount=amount, params={},
                 )
             else:
-                # Use limit order at signal price for controlled entry
                 order = await self._client.create_limit_order(
                     symbol=signal.symbol, side=side, amount=amount,
                     price=signal.price, params={},
                 )
-                # Wait for fill with cancel/replace retry
                 order = await self._wait_for_fill(signal, order, amount)
+
+            fill_price = float(order.get("average", order.get("price", signal.price)))
+            filled_qty = float(order.get("filled", amount))
 
             result = OrderResult(
                 order_id=order.get("id", ""),
                 exchange=signal.exchange,
                 symbol=signal.symbol,
                 direction=signal.direction,
-                price=float(order.get("average", order.get("price", signal.price))),
-                quantity=float(order.get("filled", amount)),
+                price=fill_price,
+                quantity=filled_qty,
                 status=order.get("status", "unknown"),
                 is_paper=False,
                 timestamp=int(time.time()),
                 raw=order,
             )
             if result.status in ("filled", "closed"):
-                self.risk_manager.open_position(signal, size)
+                pos = self.risk_manager.open_position(signal, filled_qty * fill_price)
                 await self.event_bus.publish("ORDER_FILLED", result)
+
+                # ── Place exchange-side SL/TP (crash protection) ──────────
+                if self._order_placer and not is_emergency:
+                    try:
+                        await self._order_placer.place_protective_orders(
+                            symbol=signal.symbol,
+                            direction=signal.direction,
+                            quantity=filled_qty,
+                            entry_price=fill_price,
+                            sl_price=pos.stop_loss,
+                            tp_price=pos.take_profit,
+                        )
+                        logger.info(
+                            "Exchange-side SL/TP placed for {} SL={:.2f} TP={:.2f}",
+                            signal.symbol, pos.stop_loss, pos.take_profit,
+                        )
+                    except Exception as exc:
+                        logger.critical(
+                            "FAILED to place exchange-side SL for {} — tripping circuit breaker: {}",
+                            signal.symbol, exc,
+                        )
+                        # Position is unprotected — trip circuit breaker to prevent more entries
+                        self.risk_manager._circuit_breaker._tripped = True
+                        self.risk_manager._circuit_breaker._trip_reason = (
+                            f"sl_placement_failed:{signal.symbol}"
+                        )
+                        self.risk_manager._circuit_breaker._trip_time = time.time()
+                        await self.event_bus.publish("ALERT_CRITICAL", {
+                            "type": "sl_placement_failed",
+                            "symbol": signal.symbol,
+                            "error": str(exc),
+                        })
+            elif result.status == "partially_filled" and filled_qty > 0:
+                pos = self.risk_manager.open_position(signal, filled_qty * fill_price)
+                await self.event_bus.publish("ORDER_PARTIALLY_FILLED", result)
+                # Place protective orders for partial fill qty
+                if self._order_placer:
+                    try:
+                        await self._order_placer.place_protective_orders(
+                            symbol=signal.symbol,
+                            direction=signal.direction,
+                            quantity=filled_qty,
+                            entry_price=fill_price,
+                            sl_price=pos.stop_loss,
+                            tp_price=pos.take_profit,
+                        )
+                    except Exception as exc:
+                        logger.critical("SL placement failed for partial fill {}: {}", signal.symbol, exc)
             else:
                 logger.warning("{} order not filled: status={}", self.exchange_id, result.status)
                 await self.event_bus.publish("ORDER_FAILED", result)
@@ -195,15 +252,34 @@ class CEXExecutor:
             return
         pos = self.risk_manager.close_position(exchange, symbol, price)
         if pos:
+            # OCO: SL triggered → cancel TP on exchange
+            if self._order_placer:
+                await self._order_placer.handle_sl_filled(symbol)
+                self._order_placer.remove_tracking(symbol)
             await self.event_bus.publish("POSITION_CLOSED", pos)
 
     async def _handle_take_profit(self, payload: Any) -> None:
-        await self._handle_stop_loss(payload)
+        exchange = payload.get("exchange", "")
+        symbol = payload.get("symbol", "")
+        price = float(payload.get("price", 0))
+        if exchange != self.exchange_id:
+            return
+        pos = self.risk_manager.close_position(exchange, symbol, price)
+        if pos:
+            # OCO: TP triggered → cancel SL on exchange
+            if self._order_placer:
+                await self._order_placer.handle_tp_filled(symbol)
+                self._order_placer.remove_tracking(symbol)
+            await self.event_bus.publish("POSITION_CLOSED", pos)
 
     async def _handle_kill_switch(self, payload: Any) -> None:
         """Emergency: cancel all open orders, close all positions at market."""
         logger.critical("KILL SWITCH received on {} executor", self.exchange_id)
         closed = self.risk_manager.activate_kill_switch()
+        # Cancel all protective orders tracking
+        if self._order_placer:
+            for symbol in list(self._order_placer.protective_orders.keys()):
+                await self._order_placer.cancel_all_for_symbol(symbol)
         # Cancel all open orders on exchange
         if self._client:
             try:
@@ -220,6 +296,87 @@ class CEXExecutor:
         for pos in closed:
             await self.event_bus.publish("POSITION_CLOSED", pos)
 
+    async def _handle_user_order_update(self, payload: Any) -> None:
+        """Handle fill/cancel/reject from Binance User Data Stream."""
+        symbol = payload.get("symbol", "")
+        exec_type = payload.get("execution_type", "")
+        order_status = payload.get("order_status", "")
+        order_type = payload.get("order_type", "")
+        reduce_only = payload.get("reduce_only", False)
+
+        if exec_type == "TRADE":
+            # A fill occurred
+            filled_qty = float(payload.get("last_filled_qty", 0))
+            filled_price = float(payload.get("last_filled_price", 0))
+            cum_qty = float(payload.get("cumulative_filled_qty", 0))
+            total_qty = float(payload.get("quantity", 0))
+            commission = float(payload.get("commission", 0))
+            realized_pnl = float(payload.get("realized_profit", 0))
+
+            logger.info(
+                "Fill via user stream: {} qty={:.6f}@{:.2f} cum={:.6f}/{:.6f} pnl={:.4f}",
+                symbol, filled_qty, filled_price, cum_qty, total_qty, realized_pnl,
+            )
+
+            # Detect if this is a SL or TP fill (reduce_only protective order)
+            if reduce_only and order_type in ("STOP_MARKET", "STOP"):
+                await self._on_exchange_sl_filled(symbol, filled_price)
+            elif reduce_only and order_type in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+                await self._on_exchange_tp_filled(symbol, filled_price)
+            else:
+                # Entry order fill — adjust protective orders if partial
+                if order_status == "PARTIALLY_FILLED" and self._order_placer:
+                    await self._order_placer.adjust_quantity(symbol, cum_qty)
+
+            await self.event_bus.publish("FILL_CONFIRMED", payload)
+
+        elif exec_type == "CANCELED":
+            logger.info("Order cancelled via user stream: {} orderId={}", symbol, payload.get("order_id"))
+            await self.event_bus.publish("ORDER_CANCELLED_EXCHANGE", payload)
+
+        elif exec_type == "REJECTED":
+            logger.error("Order REJECTED by exchange: {} reason={}", symbol, payload)
+            await self.event_bus.publish("ORDER_REJECTED", payload)
+
+        elif exec_type == "EXPIRED":
+            logger.info("Order expired: {} orderId={}", symbol, payload.get("order_id"))
+
+    async def _on_exchange_sl_filled(self, symbol: str, price: float) -> None:
+        """Exchange-side SL triggered — sync internal state."""
+        logger.warning("Exchange SL triggered for {} @ {:.2f}", symbol, price)
+        pos = self.risk_manager.close_position(self.exchange_id, symbol, price)
+        if pos:
+            if self._order_placer:
+                await self._order_placer.handle_sl_filled(symbol)
+                self._order_placer.remove_tracking(symbol)
+            await self.event_bus.publish("POSITION_CLOSED", {
+                "position": pos, "reason": "exchange_stop_loss", "price": price,
+            })
+
+    async def _on_exchange_tp_filled(self, symbol: str, price: float) -> None:
+        """Exchange-side TP triggered — sync internal state."""
+        logger.info("Exchange TP triggered for {} @ {:.2f}", symbol, price)
+        pos = self.risk_manager.close_position(self.exchange_id, symbol, price)
+        if pos:
+            if self._order_placer:
+                await self._order_placer.handle_tp_filled(symbol)
+                self._order_placer.remove_tracking(symbol)
+            await self.event_bus.publish("POSITION_CLOSED", {
+                "position": pos, "reason": "exchange_take_profit", "price": price,
+            })
+
+    async def _handle_user_stream_lost(self, payload: Any) -> None:
+        """User data stream disconnected — enter safety mode."""
+        logger.critical("User data stream LOST — entering safety mode, blocking new trades")
+        # Trip the circuit breaker to prevent new entries while stream is down
+        self.risk_manager._circuit_breaker._tripped = True
+        self.risk_manager._circuit_breaker._trip_reason = "user_stream_disconnected"
+        self.risk_manager._circuit_breaker._trip_time = time.time()
+
+    async def _handle_user_stream_connected(self, payload: Any) -> None:
+        """User data stream reconnected."""
+        logger.info("User data stream reconnected — resuming normal operation")
+
     async def run(self) -> None:
         self._running = True
         await self._init_client()
@@ -227,16 +384,25 @@ class CEXExecutor:
         self.event_bus.subscribe("STOP_LOSS", self._handle_stop_loss)
         self.event_bus.subscribe("TAKE_PROFIT", self._handle_take_profit)
         self.event_bus.subscribe("KILL_SWITCH", self._handle_kill_switch)
+        self.event_bus.subscribe("USER_ORDER_UPDATE", self._handle_user_order_update)
+        self.event_bus.subscribe("USER_STREAM_LOST", self._handle_user_stream_lost)
+        self.event_bus.subscribe("USER_STREAM_CONNECTED", self._handle_user_stream_connected)
         logger.info("{} CEX executor started (paper_mode={})", self.exchange_id, self.config.paper_mode)
         while self._running:
             await asyncio.sleep(5)
 
     async def stop(self) -> None:
         self._running = False
-        self.event_bus.unsubscribe("SIGNAL", self._handle_signal)
-        self.event_bus.unsubscribe("STOP_LOSS", self._handle_stop_loss)
-        self.event_bus.unsubscribe("TAKE_PROFIT", self._handle_take_profit)
-        self.event_bus.unsubscribe("KILL_SWITCH", self._handle_kill_switch)
+        for event, handler in [
+            ("SIGNAL", self._handle_signal),
+            ("STOP_LOSS", self._handle_stop_loss),
+            ("TAKE_PROFIT", self._handle_take_profit),
+            ("KILL_SWITCH", self._handle_kill_switch),
+            ("USER_ORDER_UPDATE", self._handle_user_order_update),
+            ("USER_STREAM_LOST", self._handle_user_stream_lost),
+            ("USER_STREAM_CONNECTED", self._handle_user_stream_connected),
+        ]:
+            self.event_bus.unsubscribe(event, handler)
         if self._client:
             try:
                 await self._client.close()

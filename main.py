@@ -28,6 +28,7 @@ from data_ingestion.news_feed import NewsFeed
 from data_ingestion.oi_feed import OpenInterestFeed
 from data_ingestion.orderbook_feed import OrderbookFeed
 from data_ingestion.vix_proxy import VIXProxy
+from data_ingestion.user_stream import UserDataStream
 
 from analysis.data_manager import DataManager
 from analysis.sentiment import SentimentManager
@@ -38,9 +39,12 @@ from execution.risk_manager import RiskManager
 from execution.order_manager import OrderManager
 from execution.exchange_factory import create_all_executors
 from execution.smart_order_router import SmartOrderRouter
+from execution.startup_validation import StartupValidator, ValidationError
+from execution.reconciliation import StartupReconciler
 
 from storage.db_handler import DBHandler
 from storage.cache import Cache
+from storage.trade_persistence import TradePersistence
 
 from monitoring.metrics import Metrics
 
@@ -75,10 +79,32 @@ async def main() -> None:
     logger.info("  NUERAL-TRADER-5  |  paper_mode={}", config.paper_mode)
     logger.info("=" * 60)
 
+    # ── Live mode safety gate ─────────────────────────────────────────────
+    # Require explicit opt-in for live trading
+    if not config.paper_mode:
+        live_confirm = os.getenv("LIVE_TRADING_CONFIRMED", "").lower()
+        if live_confirm != "true":
+            logger.critical(
+                "LIVE TRADING requires LIVE_TRADING_CONFIRMED=true env var. "
+                "Set it explicitly to acknowledge real-money risk."
+            )
+            sys.exit(1)
+
     event_bus = EventBus()
     db = DBHandler(config)
     cache = Cache(config)
     metrics = Metrics(config, event_bus)
+
+    # ── Database ──────────────────────────────────────────────────────────
+    await db.connect()
+
+    # ── Trade persistence (production audit trail) ────────────────────────
+    trade_persistence: TradePersistence | None = None
+    if db.available:
+        trade_persistence = TradePersistence(db._pool, event_bus, is_paper=config.paper_mode)
+        await trade_persistence.migrate()
+        trade_persistence.subscribe_events()
+        logger.info("Trade persistence layer initialized")
 
     ws_manager = CEXWebSocketManager(config, event_bus)
     dex_feed = DEXRPCFeed(config, event_bus)
@@ -107,6 +133,47 @@ async def main() -> None:
     order_mgr.attach_router(smart_router)
 
     telegram = TelegramNotifier(config, event_bus)
+
+    # ── User Data Stream (live mode only) ─────────────────────────────────
+    user_stream = UserDataStream(config, event_bus)
+
+    # ── Pre-trade validation (live mode only) ─────────────────────────────
+    if not config.paper_mode:
+        binance_executor = by_exchange.get("binance")
+        client = getattr(binance_executor, "_client", None) if binance_executor else None
+
+        # Initialize client early for validation
+        if binance_executor and client is None:
+            await binance_executor._init_client()
+            client = getattr(binance_executor, "_client", None)
+
+        # Step 1: Startup validation (API keys, balance, clock, permissions)
+        try:
+            validator = StartupValidator(config, client=client)
+            validation_result = await validator.validate_all()
+            logger.info("Startup validation: {}", validation_result.get("checks", {}))
+        except ValidationError as exc:
+            logger.critical("STARTUP VALIDATION FAILED: {}", exc)
+            logger.critical("Bot cannot start in live mode. Fix the issue and restart.")
+            sys.exit(1)
+
+        # Step 2: Reconciliation (sync state with exchange)
+        if client:
+            order_placer = getattr(binance_executor, "_order_placer", None)
+            reconciler = StartupReconciler(
+                config=config,
+                event_bus=event_bus,
+                risk_manager=risk_mgr,
+                client=client,
+                order_placer=order_placer,
+            )
+            recon_result = await reconciler.reconcile()
+            if recon_result.safe_mode:
+                logger.critical(
+                    "SAFE MODE: {} mismatch(es) detected — no new entries until resolved",
+                    len(recon_result.mismatches),
+                )
+            logger.info("Reconciliation result: {}", recon_result)
 
     app = build_app(
         config, event_bus, risk_mgr, data_manager, order_mgr, db, cache, signal_gen,
@@ -153,6 +220,7 @@ async def main() -> None:
         asyncio.create_task(orderbook_feed.run(), name="orderbook_feed"),
         asyncio.create_task(telegram.run(), name="telegram"),
         asyncio.create_task(order_mgr.run(), name="order_manager"),
+        asyncio.create_task(user_stream.run(), name="user_data_stream"),
     ]
 
     for executor in executors:
@@ -164,9 +232,30 @@ async def main() -> None:
     await stop_event.wait()
     logger.info("Initiating graceful shutdown…")
 
-    # Close executors first
+    # ── Graceful shutdown: cancel open orders on exchange ──────────────────
+    for executor in executors:
+        if not config.paper_mode and hasattr(executor, "_client") and executor._client:
+            try:
+                open_orders = await executor._client.fetch_open_orders()
+                for o in open_orders:
+                    try:
+                        await executor._client.cancel_order(o["id"], o.get("symbol"))
+                    except Exception:
+                        pass
+                if open_orders:
+                    logger.info(
+                        "Shutdown: cancelled {} open orders on {}",
+                        len(open_orders), executor.exchange_id,
+                    )
+            except Exception as exc:
+                logger.warning("Shutdown order cancel failed on {}: {}", executor.exchange_id, exc)
+
+    # Close executors (closes ccxt client)
     for executor in executors:
         await executor.close()
+
+    # Stop user data stream
+    await user_stream.stop()
 
     for task in tasks:
         task.cancel()
@@ -181,6 +270,7 @@ async def main() -> None:
     await orderbook_feed.stop()
     await telegram.stop()
     await order_mgr.stop()
+    await db.close()
 
     logger.info("Shutdown complete")
 
