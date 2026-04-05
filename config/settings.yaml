@@ -13,7 +13,7 @@ exchanges:
     api_key: "${BINANCE_API_KEY}"
     api_secret: "${BINANCE_API_SECRET}"
     type: futures
-    testnet: false
+    testnet: true
     symbols:
       - BTC/USDT:USDT
       - ETH/USDT:USDT
