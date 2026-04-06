@@ -58,9 +58,11 @@ class ExchangeOrderPlacer:
         self,
         client: Any,
         working_type: str = "CONTRACT_PRICE",
+        rate_limiter: Any = None,
     ) -> None:
         self._client = client
         self._working_type = working_type
+        self._rate_limiter = rate_limiter
         # symbol → ProtectiveOrders
         self._protective: dict[str, ProtectiveOrders] = {}
         self._lock = asyncio.Lock()
@@ -155,6 +157,8 @@ class ExchangeOrderPlacer:
             # Cancel and replace SL with new qty
             if prot.sl_order_id and prot.sl_placed and not prot.sl_filled:
                 try:
+                    if self._rate_limiter:
+                        await self._rate_limiter.acquire()
                     await self._client.cancel_order(prot.sl_order_id, symbol)
                     sl_order = await self._place_stop_market(
                         symbol=symbol,
@@ -170,6 +174,8 @@ class ExchangeOrderPlacer:
             # Cancel and replace TP with new qty
             if prot.tp_order_id and prot.tp_placed and not prot.tp_filled:
                 try:
+                    if self._rate_limiter:
+                        await self._rate_limiter.acquire()
                     await self._client.cancel_order(prot.tp_order_id, symbol)
                     tp_order = await self._place_take_profit_market(
                         symbol=symbol,
@@ -191,6 +197,8 @@ class ExchangeOrderPlacer:
             prot.sl_filled = True
             if prot.tp_order_id and prot.tp_placed and not prot.tp_filled:
                 try:
+                    if self._rate_limiter:
+                        await self._rate_limiter.acquire()
                     await self._client.cancel_order(prot.tp_order_id, symbol)
                     logger.info("OCO: cancelled TP {} after SL fill for {}", prot.tp_order_id, symbol)
                 except Exception as exc:
@@ -205,6 +213,8 @@ class ExchangeOrderPlacer:
             prot.tp_filled = True
             if prot.sl_order_id and prot.sl_placed and not prot.sl_filled:
                 try:
+                    if self._rate_limiter:
+                        await self._rate_limiter.acquire()
                     await self._client.cancel_order(prot.sl_order_id, symbol)
                     logger.info("OCO: cancelled SL {} after TP fill for {}", prot.sl_order_id, symbol)
                 except Exception as exc:
@@ -222,6 +232,8 @@ class ExchangeOrderPlacer:
             ]:
                 if order_id:
                     try:
+                        if self._rate_limiter:
+                            await self._rate_limiter.acquire()
                         await self._client.cancel_order(order_id, symbol)
                         logger.info("Cancelled {} {} for {}", label, order_id, symbol)
                     except Exception as exc:
@@ -246,6 +258,8 @@ class ExchangeOrderPlacer:
             "workingType": self._working_type,
             "type": "STOP_MARKET",
         }
+        if self._rate_limiter:
+            await self._rate_limiter.acquire()
         order = await self._client.create_order(
             symbol=symbol,
             type="STOP_MARKET",
@@ -265,6 +279,8 @@ class ExchangeOrderPlacer:
             "workingType": self._working_type,
             "type": "TAKE_PROFIT_MARKET",
         }
+        if self._rate_limiter:
+            await self._rate_limiter.acquire()
         order = await self._client.create_order(
             symbol=symbol,
             type="TAKE_PROFIT_MARKET",

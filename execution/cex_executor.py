@@ -11,6 +11,7 @@ from loguru import logger
 from core.config import Config
 from core.event_bus import EventBus
 from engine.signal_generator import TradingSignal
+from execution.rate_limiter import RateLimiter
 from execution.risk_manager import RiskManager, Position
 from execution.exchange_order_placer import ExchangeOrderPlacer
 
@@ -44,6 +45,8 @@ class CEXExecutor:
         self._client: Any = None
         self._order_placer: ExchangeOrderPlacer | None = None
         self._running = False
+        # Binance allows 1200 req/min; cap at 600/min (10/sec) for safety margin
+        self._rate_limiter = RateLimiter(max_calls=10, period_seconds=1.0)
 
     async def _init_client(self) -> None:
         if self._client is not None:
@@ -73,7 +76,7 @@ class CEXExecutor:
             await self._client.load_markets()
             # Create exchange-side order placer for SL/TP
             working_type = str(cfg.get("working_type", "CONTRACT_PRICE"))
-            self._order_placer = ExchangeOrderPlacer(self._client, working_type=working_type)
+            self._order_placer = ExchangeOrderPlacer(self._client, working_type=working_type, rate_limiter=self._rate_limiter)
             logger.info("{} CEX client initialized", self.exchange_id)
         except Exception as exc:
             logger.warning("{} client init failed: {}", self.exchange_id, exc)
@@ -115,10 +118,12 @@ class CEXExecutor:
             is_emergency = signal.metadata.get("emergency_exit", False)
 
             if is_emergency:
+                await self._rate_limiter.acquire()
                 order = await self._client.create_market_order(
                     symbol=signal.symbol, side=side, amount=amount, params={},
                 )
             else:
+                await self._rate_limiter.acquire()
                 order = await self._client.create_limit_order(
                     symbol=signal.symbol, side=side, amount=amount,
                     price=signal.price, params={},
@@ -213,6 +218,7 @@ class CEXExecutor:
         for attempt in range(max_retries):
             await asyncio.sleep(wait_sec)
             try:
+                await self._rate_limiter.acquire()
                 fetched = await self._client.fetch_order(order_id, signal.symbol)
             except Exception:
                 continue
@@ -227,6 +233,7 @@ class CEXExecutor:
 
         # Cancel the limit order and fall back to market
         try:
+            await self._rate_limiter.acquire()
             await self._client.cancel_order(order_id, signal.symbol)
             logger.info("{} cancelled unfilled limit order {}, placing market order",
                         self.exchange_id, order_id)
@@ -234,6 +241,7 @@ class CEXExecutor:
             logger.warning("{} cancel failed: {}", self.exchange_id, exc)
 
         side = "buy" if signal.is_long else "sell"
+        await self._rate_limiter.acquire()
         market_order = await self._client.create_market_order(
             symbol=signal.symbol, side=side, amount=amount, params={},
         )
@@ -303,7 +311,9 @@ class CEXExecutor:
                 logger.warning("{} failed to cancel orders: {}", self.exchange_id, exc)
         # Close remaining positions at market
         for pos in closed:
-            await self.event_bus.publish("POSITION_CLOSED", pos)
+            await self.event_bus.publish("POSITION_CLOSED", {
+                "position": pos, "reason": "kill_switch", "price": 0,
+            })
 
     async def _handle_user_order_update(self, payload: Any) -> None:
         """Handle fill/cancel/reject from Binance User Data Stream."""
