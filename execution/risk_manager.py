@@ -110,6 +110,23 @@ class CircuitBreaker:
         self._trip_reason = ""
         self._daily_loss = 0.0
 
+    def trip(self, reason: str, pause_seconds: float | None = None) -> None:
+        """Trip the circuit breaker with a reason. Use this instead of direct attribute mutation."""
+        self._tripped = True
+        self._trip_reason = reason
+        self._trip_time = time.time()
+        if pause_seconds is not None:
+            self._pause_seconds = pause_seconds
+        logger.warning("Circuit breaker TRIPPED: {}", reason)
+
+    def clear_if_reason(self, reason: str) -> bool:
+        """Clear the trip only if current reason matches. Returns True if cleared."""
+        if self._tripped and self._trip_reason == reason:
+            self._tripped = False
+            self._trip_reason = ""
+            return True
+        return False
+
 
 class RiskManager:
     def __init__(self, config: Config, event_bus: EventBus) -> None:
@@ -161,16 +178,27 @@ class RiskManager:
         self._current_funding_rates: dict[str, float] = {}  # symbol → rate (decimal)
         self._current_orderbook_depth: dict[str, float] = {}  # symbol → top-of-book USD
         self._kill_switch_file = Path("data/.kill_switch")
+        self._kill_switch_cache: bool = False
+        self._kill_switch_last_check: float = 0.0
+        self._kill_switch_check_interval: float = 5.0  # seconds
         self._circuit_breaker = CircuitBreaker(
             max_daily_loss_pct=float(risk_cfg.get("max_daily_loss_pct", 0.03)),
             max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 0.10)),
             pause_seconds=float(risk_cfg.get("circuit_breaker_pause_seconds", 3600)),
         )
         self._running = False
+        self._lock = asyncio.Lock()
+        self._equity_unreconciled = False
+        # Portfolio-level order rate limit
+        self._max_orders_per_window = int(risk_cfg.get("max_orders_per_window", 5))
+        self._order_window_seconds = float(risk_cfg.get("order_window_seconds", 10.0))
+        self._recent_order_times: list[float] = []
 
     # ── Risk-based position sizing ────────────────────────────────────────
     def calculate_position_size(self, signal: TradingSignal) -> float:
         """size = (equity × risk_per_trade) / |entry − stop|"""
+        if signal.price <= 0:
+            return 0.0
         risk_distance = abs(signal.price - signal.stop_loss)
         if risk_distance == 0:
             return 0.0
@@ -182,6 +210,12 @@ class RiskManager:
             notional = self._equity * self._max_position_pct
 
         notional *= self._leverage
+
+        # Enforce per-symbol leverage cap if configured
+        if self._max_leverage_per_symbol and hasattr(signal, 'symbol'):
+            sym_max_lev = self._max_leverage_per_symbol.get(signal.symbol)
+            if sym_max_lev is not None and self._leverage > sym_max_lev:
+                notional = notional * (sym_max_lev / self._leverage)
 
         # Cap at max position pct of equity
         max_notional = self._equity * self._max_position_pct * self._leverage
@@ -289,14 +323,21 @@ class RiskManager:
         if self._killed:
             return False, "kill_switch_active", 0.0
 
-        # File-based kill switch — manual override
-        if self._kill_switch_file.exists():
+        # File-based kill switch — manual override (cached to avoid hot-path I/O)
+        now = time.time()
+        if now - self._kill_switch_last_check >= self._kill_switch_check_interval:
+            self._kill_switch_cache = self._kill_switch_file.exists()
+            self._kill_switch_last_check = now
+        if self._kill_switch_cache:
             logger.critical("Kill switch FILE detected: {}", self._kill_switch_file)
             self._killed = True
             return False, "kill_switch_file_detected", 0.0
 
         if self._circuit_breaker.tripped:
             return False, f"circuit_breaker: {self._circuit_breaker.trip_reason}", 0.0
+
+        if self._equity_unreconciled:
+            return False, "equity_unreconciled (post kill-switch, awaiting exchange sync)", 0.0
 
         key = f"{signal.exchange}:{signal.symbol}"
         if key in self._positions:
@@ -363,8 +404,56 @@ class RiskManager:
                     f"var_limit_breach (projected={projected_var:.2%}, "
                     f"limit={self._max_portfolio_var_pct:.2%})"
                 ), 0.0
+        elif len(self._return_history) < self._var_min_history and self._equity > 0:
+            # Insufficient history for VaR — apply conservative half-size cap
+            size = min(size, self._equity * self._max_position_pct * self._leverage * 0.5)
+            if size <= 0:
+                return False, "position_size_zero (VaR cold start)", 0.0
 
         return True, "approved", size
+
+    async def approve_and_open(self, signal: TradingSignal) -> tuple[bool, str, float, Position | None]:
+        """Atomically approve signal + open position under lock.
+        Prevents race where two signals for same symbol both pass approve_signal
+        before either calls open_position.
+        Returns (approved, reason, size, position_or_None).
+        """
+        async with self._lock:
+            # Portfolio-level order rate limit
+            now = time.time()
+            cutoff = now - self._order_window_seconds
+            self._recent_order_times = [t for t in self._recent_order_times if t > cutoff]
+            if len(self._recent_order_times) >= self._max_orders_per_window:
+                return False, f"portfolio_rate_limit ({self._max_orders_per_window} orders in {self._order_window_seconds}s)", 0.0, None
+
+            approved, reason, size = self.approve_signal(signal)
+            if not approved:
+                return False, reason, 0.0, None
+            # Open position inline (already holding lock, skip open_position's lock)
+            sl, tp = self.compute_atr_stops(signal)
+            pos = Position(
+                exchange=signal.exchange,
+                symbol=signal.symbol,
+                direction=signal.direction,
+                size=size / signal.price if signal.price > 0 else 0.0,
+                entry_price=signal.price,
+                current_price=signal.price,
+                stop_loss=sl,
+                take_profit=tp,
+                open_time=int(time.time()),
+                highest_since_entry=signal.price,
+                lowest_since_entry=signal.price,
+            )
+            key = f"{signal.exchange}:{signal.symbol}"
+            self._positions[key] = pos
+            self._last_trade_time[signal.symbol] = time.time()
+            self._recent_order_times.append(time.time())
+            logger.info(
+                "Position opened: {}/{} {} size={:.4f} @ {:.2f} SL={:.2f} TP={:.2f} (ATR-based)",
+                signal.exchange, signal.symbol, signal.direction,
+                pos.size, pos.entry_price, pos.stop_loss, pos.take_profit,
+            )
+            return True, "approved", size, pos
 
     def compute_atr_stops(
         self, signal: TradingSignal
@@ -380,59 +469,68 @@ class RiskManager:
             sl = signal.price + sl_distance
             tp = signal.price - sl_distance * self._rr_ratio
 
-        # Fallback: ensure SL is at least min percent away
+        # Fallback: ensure SL is at least min percent away from entry
         fallback_pct = float((self.config.get_value("risk") or {}).get("stop_loss_pct", 0.015))
         if signal.is_long:
             min_sl = signal.price * (1 - fallback_pct)
-            sl = min(sl, min_sl)
+            sl = min(sl, min_sl)  # For longs, move SL further DOWN (lower = wider)
         else:
             max_sl = signal.price * (1 + fallback_pct)
-            sl = max(sl, max_sl)
+            sl = max(sl, max_sl)  # For shorts, move SL further UP (higher = wider)
 
         return sl, tp
 
-    def open_position(self, signal: TradingSignal, size: float) -> Position:
-        sl, tp = self.compute_atr_stops(signal)
+    async def open_position(self, signal: TradingSignal, size: float) -> Position:
+        async with self._lock:
+            sl, tp = self.compute_atr_stops(signal)
 
-        pos = Position(
-            exchange=signal.exchange,
-            symbol=signal.symbol,
-            direction=signal.direction,
-            size=size / signal.price if signal.price > 0 else 0.0,
-            entry_price=signal.price,
-            current_price=signal.price,
-            stop_loss=sl,
-            take_profit=tp,
-            open_time=int(time.time()),
-            highest_since_entry=signal.price,
-            lowest_since_entry=signal.price,
-        )
-        key = f"{signal.exchange}:{signal.symbol}"
-        self._positions[key] = pos
-        self._last_trade_time[signal.symbol] = time.time()
-        logger.info(
-            "Position opened: {}/{} {} size={:.4f} @ {:.2f} SL={:.2f} TP={:.2f} (ATR-based)",
-            signal.exchange, signal.symbol, signal.direction,
-            pos.size, pos.entry_price, pos.stop_loss, pos.take_profit,
-        )
-        return pos
+            pos = Position(
+                exchange=signal.exchange,
+                symbol=signal.symbol,
+                direction=signal.direction,
+                size=size / signal.price if signal.price > 0 else 0.0,
+                entry_price=signal.price,
+                current_price=signal.price,
+                stop_loss=sl,
+                take_profit=tp,
+                open_time=int(time.time()),
+                highest_since_entry=signal.price,
+                lowest_since_entry=signal.price,
+            )
+            key = f"{signal.exchange}:{signal.symbol}"
+            self._positions[key] = pos
+            self._last_trade_time[signal.symbol] = time.time()
+            logger.info(
+                "Position opened: {}/{} {} size={:.4f} @ {:.2f} SL={:.2f} TP={:.2f} (ATR-based)",
+                signal.exchange, signal.symbol, signal.direction,
+                pos.size, pos.entry_price, pos.stop_loss, pos.take_profit,
+            )
+            return pos
 
-    def close_position(self, exchange: str, symbol: str, exit_price: float) -> Position | None:
-        key = f"{exchange}:{symbol}"
-        pos = self._positions.pop(key, None)
-        if pos is None:
-            return None
-        pos.update_price(exit_price)
-        pnl_dollar = pos.pnl
-        self._equity += pnl_dollar
-        self.record_return(pos.pnl_pct)
-        self._circuit_breaker.record_pnl(pos.pnl_pct, self._equity)
-        self._last_trade_time[symbol] = time.time()
-        logger.info(
-            "Position closed: {}/{} pnl={:.2f} ({:.2%}) equity={:.2f} held={:.0f}s",
-            exchange, symbol, pnl_dollar, pos.pnl_pct, self._equity, pos.hold_seconds,
-        )
-        return pos
+    async def close_position(self, exchange: str, symbol: str, exit_price: float) -> Position | None:
+        async with self._lock:
+            key = f"{exchange}:{symbol}"
+            pos = self._positions.pop(key, None)
+            if pos is None:
+                return None
+            pos.update_price(exit_price)
+            pnl_dollar = pos.pnl
+            self._equity += pnl_dollar
+            # Guard: equity must never go below zero — trip kill switch
+            if self._equity <= 0:
+                logger.critical(
+                    "EQUITY ZERO OR NEGATIVE ({:.2f}) — activating kill switch", self._equity
+                )
+                self._equity = 0.0
+                self._killed = True
+            self.record_return(pos.pnl_pct)
+            self._circuit_breaker.record_pnl(pos.pnl_pct, self._equity)
+            self._last_trade_time[symbol] = time.time()
+            logger.info(
+                "Position closed: {}/{} pnl={:.2f} ({:.2%}) equity={:.2f} held={:.0f}s",
+                exchange, symbol, pnl_dollar, pos.pnl_pct, self._equity, pos.hold_seconds,
+            )
+            return pos
 
     # ── Trailing stop / breakeven / time exit ─────────────────────────────
     def manage_position(self, pos: Position) -> str | None:
@@ -473,17 +571,30 @@ class RiskManager:
         return None
 
     # ── Kill switch ───────────────────────────────────────────────────────
-    def activate_kill_switch(self) -> list[Position]:
+    async def activate_kill_switch(self) -> list[Position]:
         """Emergency: close all positions and block new signals."""
-        self._killed = True
-        closed: list[Position] = []
-        for key in list(self._positions.keys()):
-            pos = self._positions[key]
-            closed_pos = self.close_position(pos.exchange, pos.symbol, pos.current_price)
-            if closed_pos:
-                closed.append(closed_pos)
-        logger.critical("KILL SWITCH activated — closed {} positions", len(closed))
-        return closed
+        async with self._lock:
+            self._killed = True
+            closed: list[Position] = []
+            for key in list(self._positions.keys()):
+                pos = self._positions[key]
+                # close_position acquires lock too, so call inner logic directly
+                pos.update_price(pos.current_price)
+                pnl_dollar = pos.pnl
+                self._equity += pnl_dollar
+                if self._equity < 0:
+                    self._equity = 0.0
+                self.record_return(pos.pnl_pct)
+                self._circuit_breaker.record_pnl(pos.pnl_pct, self._equity)
+                self._last_trade_time[pos.symbol] = time.time()
+                self._positions.pop(key, None)
+                closed.append(pos)
+            self._equity_unreconciled = True
+            logger.critical(
+                "KILL SWITCH activated — closed {} positions (equity={:.2f} APPROXIMATE)",
+                len(closed), self._equity,
+            )
+            return closed
 
     def deactivate_kill_switch(self) -> None:
         self._killed = False
@@ -580,33 +691,34 @@ class RiskManager:
             "current_drawdown_pct": self.current_drawdown_pct(),
         }
 
-    def update_prices(self, exchange: str, symbol: str, price: float) -> None:
-        key = f"{exchange}:{symbol}"
-        pos = self._positions.get(key)
-        if pos is None:
-            return
-        pos.update_price(price)
+    async def update_prices(self, exchange: str, symbol: str, price: float) -> None:
+        async with self._lock:
+            key = f"{exchange}:{symbol}"
+            pos = self._positions.get(key)
+            if pos is None:
+                return
+            pos.update_price(price)
 
-        # Run position management (trailing stop, breakeven, time exit)
-        exit_reason = self.manage_position(pos)
-        if exit_reason:
-            logger.info("{} exit triggered for {}/{}", exit_reason, exchange, symbol)
-            self.event_bus.publish_nowait("STOP_LOSS", {
-                "exchange": exchange, "symbol": symbol, "price": price, "reason": exit_reason,
-            })
-            return
+            # Run position management (trailing stop, breakeven, time exit)
+            exit_reason = self.manage_position(pos)
+            if exit_reason:
+                logger.info("{} exit triggered for {}/{}", exit_reason, exchange, symbol)
+                self.event_bus.publish_nowait("STOP_LOSS", {
+                    "exchange": exchange, "symbol": symbol, "price": price, "reason": exit_reason,
+                })
+                return
 
-        if (pos.is_long and price <= pos.stop_loss) or (not pos.is_long and price >= pos.stop_loss):
-            reason = "trailing_stop" if pos.trailing_active else "stop_loss"
-            logger.warning("{} triggered for {}/{} at {:.2f}", reason, exchange, symbol, price)
-            self.event_bus.publish_nowait("STOP_LOSS", {
-                "exchange": exchange, "symbol": symbol, "price": price, "reason": reason,
-            })
-        elif (pos.is_long and price >= pos.take_profit) or (not pos.is_long and price <= pos.take_profit):
-            logger.info("Take profit triggered for {}/{} at {:.2f}", exchange, symbol, price)
-            self.event_bus.publish_nowait("TAKE_PROFIT", {
-                "exchange": exchange, "symbol": symbol, "price": price, "reason": "take_profit",
-            })
+            if (pos.is_long and price <= pos.stop_loss) or (not pos.is_long and price >= pos.stop_loss):
+                reason = "trailing_stop" if pos.trailing_active else "stop_loss"
+                logger.warning("{} triggered for {}/{} at {:.2f}", reason, exchange, symbol, price)
+                self.event_bus.publish_nowait("STOP_LOSS", {
+                    "exchange": exchange, "symbol": symbol, "price": price, "reason": reason,
+                })
+            elif (pos.is_long and price >= pos.take_profit) or (not pos.is_long and price <= pos.take_profit):
+                logger.info("Take profit triggered for {}/{} at {:.2f}", exchange, symbol, price)
+                self.event_bus.publish_nowait("TAKE_PROFIT", {
+                    "exchange": exchange, "symbol": symbol, "price": price, "reason": "take_profit",
+                })
 
     @property
     def positions(self) -> dict[str, Position]:
@@ -618,7 +730,7 @@ class RiskManager:
 
     async def _handle_tick(self, payload: Any) -> None:
         tick = payload
-        self.update_prices(tick.exchange, tick.symbol, tick.price)
+        await self.update_prices(tick.exchange, tick.symbol, tick.price)
 
     async def run(self) -> None:
         self._running = True

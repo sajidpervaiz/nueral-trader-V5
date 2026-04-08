@@ -22,12 +22,50 @@ except ImportError:
 
 from pathlib import Path
 
+
 from core.config import Config
 from core.event_bus import EventBus
 from interface.routes.config import router as config_router, configure_config_routes
 from interface.routes.orders import router as orders_router, configure_order_routes
 from interface.routes.positions import router as positions_router, configure_positions_routes
 from interface.routes.risk import router as risk_router, configure_risk_routes
+
+# Expose a top-level FastAPI app for uvicorn
+def _default_config():
+    # Minimal config for dashboard boot
+    class DummyConfig:
+        paper_mode = True
+        def get_value(self, *args, **kwargs):
+            return {}
+    return DummyConfig()
+
+def _default_event_bus():
+    class DummyEventBus:
+        def subscribe(self, *a, **k):
+            pass
+        async def publish(self, *a, **k):
+            pass
+    return DummyEventBus()
+
+
+# Only create app if FastAPI is available (must be after build_app is defined)
+_APP_ARGS = dict(
+    config=_default_config(),
+    event_bus=_default_event_bus(),
+    risk_manager=None,
+    data_manager=None,
+    order_manager=None,
+    db_handler=None,
+    cache=None,
+    signal_generator=None,
+    news_feed=None,
+    orderbook_feed=None,
+    sentiment_manager=None,
+    dex_feed=None,
+)
+
+# Defer app creation until after build_app is defined
+
 
 # ── In-memory ring buffers for event-sourced data ────────────────────────────
 _news_buffer: deque[dict[str, Any]] = deque(maxlen=50)
@@ -36,6 +74,7 @@ _log_buffer: deque[dict[str, Any]] = deque(maxlen=200)
 _market_cache: dict[str, Any] = {"coins": [], "ts": 0.0}  # TTL cache for market data
 
 # Loguru sink that captures recent log lines for the /api/logs/recent endpoint
+
 def _log_sink(message: Any) -> None:
     record = message.record
     _log_buffer.append({
@@ -45,7 +84,9 @@ def _log_sink(message: Any) -> None:
     })
 
 
-logger.add(_log_sink, level="INFO", format="{message}")
+# Place this after build_app is defined
+# (MUST be after the build_app function definition)
+
 
 
 def build_app(
@@ -62,6 +103,7 @@ def build_app(
     orderbook_feed: Any = None,
     sentiment_manager: Any = None,
     dex_feed: Any = None,
+    executors: list[Any] | None = None,
 ) -> Any:
     if not _FASTAPI:
         return None
@@ -77,6 +119,12 @@ def build_app(
 
     dashboard_cfg = config.get_value("monitoring", "dashboard_api", default={}) or {}
     cors_origins = dashboard_cfg.get("allow_origins") or ["http://localhost", "http://127.0.0.1"]
+    # Block wildcard CORS in non-paper (live) mode
+    if not config.paper_mode and "*" in cors_origins:
+        logger.warning(
+            "CORS wildcard '*' blocked in live mode — restricting to localhost only"
+        )
+        cors_origins = [o for o in cors_origins if o != "*"] or ["http://localhost"]
     auth_cfg = dashboard_cfg.get("auth", {}) if hasattr(dashboard_cfg, "get") else {}
     if not isinstance(auth_cfg, dict):
         auth_cfg = {}
@@ -371,12 +419,46 @@ def build_app(
         """Emergency: close all positions, cancel all orders, block new signals."""
         if risk_manager is None:
             return {"success": False, "error": "risk_manager not available"}
-        closed = risk_manager.activate_kill_switch()
+        closed = await risk_manager.activate_kill_switch()
+        # Directly cancel exchange-side orders (no event-bus race window)
+        cancelled_total = 0
+        for exc in (executors or []):
+            client = getattr(exc, "_client", None)
+            if client and not config.paper_mode:
+                try:
+                    open_orders = await client.fetch_open_orders()
+                    for o in open_orders:
+                        for _attempt in range(3):
+                            try:
+                                rl = getattr(exc, "_rate_limiter", None)
+                                if rl:
+                                    await rl.acquire()
+                                await client.cancel_order(o["id"], o.get("symbol"))
+                                cancelled_total += 1
+                                break
+                            except Exception:
+                                if _attempt == 2:
+                                    logger.error(
+                                        "Kill switch: FAILED to cancel order {} on {}",
+                                        o.get("id"), getattr(exc, "exchange_id", "?"),
+                                    )
+                except Exception as exc_err:
+                    logger.warning("Kill switch order cancel failed: {}", exc_err)
+            # Also clean up protective order tracking
+            placer = getattr(exc, "_order_placer", None)
+            if placer:
+                for sym in list(getattr(placer, "protective_orders", {}).keys()):
+                    try:
+                        await placer.cancel_all_for_symbol(sym)
+                    except Exception:
+                        pass
+        # Notify other subscribers (best-effort, non-critical path)
         if event_bus is not None:
             await event_bus.publish("KILL_SWITCH", {"source": "api"})
         return {
             "success": True,
             "positions_closed": len(closed),
+            "orders_cancelled": cancelled_total,
             "kill_switch_active": True,
         }
 
@@ -667,10 +749,13 @@ def build_app(
         try:
             import aiohttp
             binance_sym = symbol.replace("/", "").replace("-", "").upper()
-            binance_cfg = config.get_value("exchanges", "binance") or {}
-            base_url = "https://fapi.binance.com/fapi/v1/depth" if not binance_cfg.get("testnet", True) else "https://testnet.binancefuture.com/fapi/v1/depth"
+            # Always use mainnet for read-only market data (public endpoint, no auth needed)
+            base_url = "https://fapi.binance.com/fapi/v1/depth"
+            # Binance only accepts specific limit values
+            valid_limits = [5, 10, 20, 50, 100, 500, 1000]
+            binance_limit = min((v for v in valid_limits if v >= depth), default=20)
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as sess:
-                async with sess.get(base_url, params={"symbol": binance_sym, "limit": depth}) as resp:
+                async with sess.get(base_url, params={"symbol": binance_sym, "limit": binance_limit}) as resp:
                     if resp.status == 200:
                         data = await resp.json(content_type=None)
                         bids = [{"price": float(b[0]), "quantity": float(b[1])} for b in data.get("bids", [])[:depth]]
@@ -889,6 +974,10 @@ def build_app(
             order_type_str = str(body.get("order_type", "market")).lower()
             ot = OrderType.MARKET if order_type_str == "market" else OrderType.LIMIT
             price = float(body.get("price", 0)) if ot == OrderType.LIMIT else None
+            if ot == OrderType.LIMIT and (price is None or price <= 0):
+                return {"success": False, "error": "price required and must be > 0 for LIMIT orders"}
+            if size <= 0:
+                return {"success": False, "error": "size must be > 0"}
             if config.paper_mode:
                 # Paper mode: record order locally without hitting exchange
                 success, order, reason = await order_manager.place_order(
@@ -936,7 +1025,7 @@ def build_app(
     async def api_close_all() -> dict[str, Any]:
         if risk_manager is None:
             return {"success": False, "error": "risk_manager not available"}
-        closed = risk_manager.activate_kill_switch()
+        closed = await risk_manager.activate_kill_switch()
         risk_manager.deactivate_kill_switch()
         return {"success": True, "closed": len(closed)}
 
@@ -946,10 +1035,12 @@ def build_app(
         if risk_manager is None:
             return {"success": False, "error": "risk_manager not available"}
         count = 0
-        for pos in risk_manager.positions.values():
-            if hasattr(pos, "stop_loss") and pos.pnl > 0:
-                pos.stop_loss = pos.entry_price
-                count += 1
+        async with risk_manager._lock:
+            for pos in risk_manager._positions.values():
+                if pos.pnl > 0:
+                    pos.stop_loss = pos.entry_price
+                    pos.breakeven_moved = True
+                    count += 1
         return {"success": True, "updated_positions": count}
 
     # ── /api/auto/toggle — auto-trading toggle ────────────────────────────
@@ -994,11 +1085,20 @@ def build_app(
         requested_mode = str(body.get("mode", "")).lower()
         if requested_mode not in ("paper", "live"):
             return {"success": False, "error": "mode must be 'paper' or 'live'"}
-        config.paper_mode = (requested_mode == "paper")
-        logger.info("Trading mode switched to: {}", requested_mode)
+        if requested_mode == "live":
+            # P0: Block runtime switch to live — requires full restart with
+            # LIVE_TRADING_CONFIRMED=true for startup validation, clock sync,
+            # balance checks, and reconciliation.
+            return {
+                "success": False,
+                "error": "Cannot switch to live mode at runtime. "
+                         "Restart with LIVE_TRADING_CONFIRMED=true.",
+            }
+        config.paper_mode = True
+        logger.info("Trading mode switched to: paper")
         return {
             "success": True,
-            "mode": requested_mode,
+            "mode": "paper",
             "paper_mode": config.paper_mode,
         }
 
@@ -1044,7 +1144,7 @@ def build_app(
 
         def _mask(val: str) -> str:
             s = str(val or "")
-            return s[:4] + "****" if len(s) > 8 else ""
+            return "****" if s else ""
 
         binance = exchanges.get("binance", {})
         bybit = exchanges.get("bybit", {})
@@ -1195,7 +1295,45 @@ def build_app(
 
             return StreamingResponse(_sse_fallback(), media_type="text/event-stream")
 
+
     return app
+
+# Top-level FastAPI app for uvicorn import
+def _build_standalone_managers():
+    """Create lightweight OrderManager + RiskManager for standalone dashboard."""
+    cfg = _default_config()
+    bus = _default_event_bus()
+    om = None
+    rm = None
+    try:
+        from core.circuit_breaker import CircuitBreaker
+        from execution.order_manager import OrderManager
+        from execution.risk_manager import RiskManager
+        cb = CircuitBreaker()
+        om = OrderManager(config=cfg, event_bus=bus, circuit_breaker=cb)
+        rm = RiskManager(config=cfg, event_bus=bus)
+    except Exception:
+        pass
+    return cfg, bus, om, rm
+
+if _FASTAPI:
+    _sa_cfg, _sa_bus, _sa_om, _sa_rm = _build_standalone_managers()
+    # Attach loguru sink for /api/logs/recent
+    logger.add(_log_sink, level="DEBUG", format="{message}")
+    app = build_app(
+        config=_sa_cfg,
+        event_bus=_sa_bus,
+        risk_manager=_sa_rm,
+        data_manager=None,
+        order_manager=_sa_om,
+        db_handler=None,
+        cache=None,
+        signal_generator=None,
+        news_feed=None,
+        orderbook_feed=None,
+        sentiment_manager=None,
+        dex_feed=None,
+    )
 
 
 async def run_dashboard(config: Config, app: Any) -> None:

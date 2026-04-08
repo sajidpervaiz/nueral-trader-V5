@@ -909,7 +909,9 @@ class TestCEXExecutorUserStream:
         self.risk_mgr = MagicMock()
         self.risk_mgr._circuit_breaker = MagicMock()
         self.risk_mgr._circuit_breaker._tripped = False
-        self.risk_mgr.close_position = MagicMock(return_value=None)
+        self.risk_mgr.close_position = AsyncMock(return_value=None)
+        self.risk_mgr.open_position = AsyncMock()
+        self.risk_mgr.activate_kill_switch = AsyncMock(return_value=[])
 
         self.executor = CEXExecutor(self.config, self.event_bus, self.risk_mgr, "binance")
 
@@ -917,8 +919,7 @@ class TestCEXExecutorUserStream:
     async def test_user_stream_lost_trips_circuit_breaker(self):
         """User stream disconnect should trip circuit breaker."""
         await self.executor._handle_user_stream_lost({})
-        assert self.risk_mgr._circuit_breaker._tripped is True
-        assert self.risk_mgr._circuit_breaker._trip_reason == "user_stream_disconnected"
+        self.risk_mgr._circuit_breaker.trip.assert_called_once_with("user_stream_disconnected")
 
     @pytest.mark.asyncio
     async def test_sl_fill_from_user_stream(self):
@@ -1170,7 +1171,7 @@ class TestAuditFixes:
         mock_pos = MagicMock()
         mock_pos.stop_loss = 49000.0
         mock_pos.take_profit = 52000.0
-        risk_mgr.open_position.return_value = mock_pos
+        risk_mgr.open_position = AsyncMock(return_value=mock_pos)
 
         executor = CEXExecutor(config, event_bus, risk_mgr, "binance")
         mock_client = AsyncMock()
@@ -1196,9 +1197,10 @@ class TestAuditFixes:
         signal.metadata = {}
 
         result = await executor._live_execute(signal, 500.0)
-        # Circuit breaker should be tripped
-        assert risk_mgr._circuit_breaker._tripped is True
-        assert "sl_placement_failed" in risk_mgr._circuit_breaker._trip_reason
+        # Circuit breaker should be tripped via trip() method
+        risk_mgr._circuit_breaker.trip.assert_called()
+        call_args = risk_mgr._circuit_breaker.trip.call_args
+        assert "sl_placement_failed" in call_args[0][0]
 
     @pytest.mark.asyncio
     async def test_reconciliation_reads_sl_tp_from_exchange_orders(self):
@@ -1462,7 +1464,7 @@ class TestDeepAuditFixes:
             price=50000.0, stop_loss=49000.0, take_profit=52000.0,
             atr=500.0, timestamp=int(time.time()),
         )
-        risk_mgr.open_position(signal, 500.0)
+        await risk_mgr.open_position(signal, 500.0)
 
         # Capture what gets published
         captured = []

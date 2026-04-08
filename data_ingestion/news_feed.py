@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections import OrderedDict
 from typing import Any
 
 import aiohttp
@@ -57,7 +58,7 @@ class NewsFeed:
         self._interval = fetch_interval
         self._running = False
         self._session: aiohttp.ClientSession | None = None
-        self._seen_ids: set[str] = set()
+        self._seen_ids: OrderedDict[str, None] = OrderedDict()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -109,7 +110,7 @@ class NewsFeed:
             aid = str(article.get("id", article.get("url", "")))
             if aid in self._seen_ids:
                 continue
-            self._seen_ids.add(aid)
+            self._seen_ids[aid] = None
 
             title = article.get("title", article.get("description", ""))
             body = article.get("body", "")
@@ -124,9 +125,9 @@ class NewsFeed:
                 "source": "cryptocompare",
             })
 
-        # Limit memory — keep last 500 IDs
-        if len(self._seen_ids) > 500:
-            self._seen_ids = set(list(self._seen_ids)[-300:])
+        # Limit memory — keep most recent 300 IDs (ordered)
+        while len(self._seen_ids) > 500:
+            self._seen_ids.popitem(last=False)
 
     async def run(self) -> None:
         self._running = True

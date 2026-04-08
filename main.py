@@ -181,6 +181,7 @@ async def main() -> None:
         orderbook_feed=orderbook_feed,
         sentiment_manager=sentiment,
         dex_feed=dex_feed,
+        executors=executors,
     )
 
     # Re-add the dashboard log sink (logger.remove() in _setup_logging wipes it)

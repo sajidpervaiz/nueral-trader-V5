@@ -156,12 +156,70 @@ class TechnicalScorer:
 
 
 class MLScorer:
-    def __init__(self) -> None:
+
+    def __init__(self, model_path: str = "ml_model.pkl") -> None:
         self._model = None
+        self._feature_names = None
+        self._model_loaded = False
+        self._model_path = model_path
+        self._load_model()
+
+    def _load_model(self):
+        import os
+        import hashlib
+        import hmac
+        try:
+            if os.path.exists(self._model_path):
+                # P0: Verify model file integrity before loading to prevent
+                # arbitrary code execution via pickle deserialization.
+                expected_digest = os.getenv("ML_MODEL_SHA256", "").strip()
+                if expected_digest:
+                    with open(self._model_path, "rb") as f:
+                        file_hash = hashlib.sha256(f.read()).hexdigest()
+                    if not hmac.compare_digest(file_hash, expected_digest):
+                        logger.critical(
+                            "Model file integrity check FAILED — refusing to load {}",
+                            self._model_path,
+                        )
+                        return
+                    logger.info("Model file SHA-256 verified")
+                else:
+                    logger.warning(
+                        "ML_MODEL_SHA256 env var not set — model integrity not verified. "
+                        "Set ML_MODEL_SHA256=<hex> in production.",
+                    )
+                import joblib
+                model_data = joblib.load(self._model_path)
+                self._model = model_data.get("model")
+                self._feature_names = model_data.get("feature_names")
+                self._model_loaded = True
+                logger.info(f"MLScorer loaded model from {self._model_path}")
+            else:
+                logger.warning(f"MLScorer: model file {self._model_path} not found, using heuristics")
+        except Exception as e:
+            logger.error(f"MLScorer: failed to load model: {e}")
+            self._model = None
+            self._feature_names = None
+            self._model_loaded = False
 
     def score(self, df: pd.DataFrame) -> float:
-        if df is None or len(df) < 50 or self._model is None:
-            return self._heuristic_score(df)
+        if df is None or len(df) < 20:
+            return 0.0
+        if self._model is not None and self._feature_names is not None:
+            try:
+                last = df.iloc[-1]
+                X = last[self._feature_names].values.reshape(1, -1)
+                if hasattr(self._model, "predict_proba"):
+                    proba = self._model.predict_proba(X)
+                    # Use probability of class 1 (up)
+                    score = float(proba[0, 1]) * 2 - 1  # scale to [-1, 1]
+                    return float(np.clip(score, -1.0, 1.0))
+                elif hasattr(self._model, "predict"):
+                    pred = self._model.predict(X)
+                    return float(np.clip(pred[0], -1.0, 1.0))
+            except Exception as e:
+                logger.error(f"MLScorer: model prediction failed: {e}")
+        # Fallback to heuristic
         return self._heuristic_score(df)
 
     def _heuristic_score(self, df: pd.DataFrame) -> float:

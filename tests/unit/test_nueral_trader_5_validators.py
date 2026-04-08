@@ -51,7 +51,7 @@ class TestTickValidator:
 
     def test_suspicious_price_jump_rejected(self, tick_validator: TickValidator) -> None:
         tick_validator.validate(self._fresh_tick(price=50000.0))
-        tick2 = self._fresh_tick(price=60001.0)
+        tick2 = self._fresh_tick(price=65000.0)  # 30% jump exceeds 25% threshold
         assert tick_validator.validate(tick2) is False
 
     def test_small_price_move_passes(self, tick_validator: TickValidator) -> None:

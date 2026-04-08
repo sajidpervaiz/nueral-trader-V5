@@ -10,7 +10,9 @@ EventBus integration: subscribes to events and persists automatically.
 from __future__ import annotations
 
 import datetime
+import json as _json
 import time
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -149,6 +151,57 @@ class TradePersistence:
         self._pool = db_pool
         self._event_bus = event_bus
         self._is_paper = is_paper
+        self._wal_path = Path("data/trade_wal.jsonl")
+        self._wal_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _wal_append(self, method: str, kwargs: dict) -> None:
+        """Append a failed DB write to the local WAL file for later replay."""
+        entry = {"ts": time.time(), "method": method, "kwargs": kwargs}
+        try:
+            with self._wal_path.open("a") as f:
+                f.write(_json.dumps(entry, default=str) + "\n")
+            logger.debug("WAL: buffered {} call", method)
+        except Exception as exc:
+            logger.error("WAL append failed: {}", exc)
+
+    async def replay_wal(self) -> int:
+        """Replay buffered WAL entries to DB. Returns count of successfully replayed entries."""
+        if not self._wal_path.exists():
+            return 0
+        if self._pool is None:
+            return 0
+
+        lines = self._wal_path.read_text().strip().splitlines()
+        if not lines:
+            return 0
+
+        replayed = 0
+        remaining: list[str] = []
+
+        for line in lines:
+            try:
+                entry = _json.loads(line)
+                method_name = entry["method"]
+                kwargs = entry["kwargs"]
+                method = getattr(self, method_name, None)
+                if method:
+                    await method(**kwargs)
+                    replayed += 1
+                else:
+                    logger.warning("WAL: unknown method {}", method_name)
+                    remaining.append(line)
+            except Exception:
+                remaining.append(line)
+
+        # Rewrite WAL with only failed entries
+        if remaining:
+            self._wal_path.write_text("\n".join(remaining) + "\n")
+        else:
+            self._wal_path.unlink(missing_ok=True)
+
+        if replayed:
+            logger.info("WAL: replayed {} entries, {} remaining", replayed, len(remaining))
+        return replayed
 
     async def migrate(self) -> None:
         """Run trading-specific DDL migrations."""
@@ -200,6 +253,14 @@ class TradePersistence:
         metadata: dict | None = None,
     ) -> None:
         if self._pool is None:
+            self._wal_append("persist_order", {
+                "order_id": order_id, "client_order_id": client_order_id,
+                "exchange": exchange, "symbol": symbol, "side": side,
+                "order_type": order_type, "quantity": quantity, "price": price,
+                "status": status, "filled_qty": filled_qty,
+                "avg_fill_price": avg_fill_price, "total_fee": total_fee,
+                "reduce_only": reduce_only, "metadata": metadata,
+            })
             return
         try:
             import json
@@ -225,6 +286,14 @@ class TradePersistence:
                 )
         except Exception as exc:
             logger.error("Failed to persist order {}: {}", order_id, exc)
+            self._wal_append("persist_order", {
+                "order_id": order_id, "client_order_id": client_order_id,
+                "exchange": exchange, "symbol": symbol, "side": side,
+                "order_type": order_type, "quantity": quantity, "price": price,
+                "status": status, "filled_qty": filled_qty,
+                "avg_fill_price": avg_fill_price, "total_fee": total_fee,
+                "reduce_only": reduce_only, "metadata": metadata,
+            })
 
     # ── Fill persistence ──────────────────────────────────────────────────
 
@@ -244,6 +313,12 @@ class TradePersistence:
         trade_time: datetime.datetime | None = None,
     ) -> None:
         if self._pool is None:
+            self._wal_append("persist_fill", {
+                "fill_id": fill_id, "order_id": order_id, "exchange": exchange,
+                "symbol": symbol, "side": side, "quantity": quantity, "price": price,
+                "fee": fee, "fee_currency": fee_currency, "realized_pnl": realized_pnl,
+                "is_maker": is_maker, "trade_time": str(trade_time) if trade_time else None,
+            })
             return
         try:
             async with self._pool.acquire() as conn:
@@ -258,10 +333,16 @@ class TradePersistence:
                     """,
                     fill_id, order_id, exchange, symbol, side,
                     quantity, price, fee, fee_currency, realized_pnl,
-                    is_maker, trade_time or datetime.datetime.utcnow(),
+                    is_maker, trade_time or datetime.datetime.now(datetime.UTC),
                 )
         except Exception as exc:
             logger.error("Failed to persist fill {}: {}", fill_id, exc)
+            self._wal_append("persist_fill", {
+                "fill_id": fill_id, "order_id": order_id, "exchange": exchange,
+                "symbol": symbol, "side": side, "quantity": quantity, "price": price,
+                "fee": fee, "fee_currency": fee_currency, "realized_pnl": realized_pnl,
+                "is_maker": is_maker, "trade_time": str(trade_time) if trade_time else None,
+            })
 
     # ── Position persistence ──────────────────────────────────────────────
 
@@ -281,9 +362,11 @@ class TradePersistence:
                     """
                     INSERT INTO positions (exchange, symbol, direction, entry_price, size, open_time, is_paper)
                     VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (exchange, symbol) WHERE close_time IS NULL
+                    DO UPDATE SET entry_price = EXCLUDED.entry_price, size = EXCLUDED.size
                     """,
                     exchange, symbol, direction, entry_price, size,
-                    datetime.datetime.utcnow(), self._is_paper,
+                    datetime.datetime.now(datetime.UTC), self._is_paper,
                 )
         except Exception as exc:
             logger.error("Failed to persist position open {}/{}: {}", exchange, symbol, exc)
@@ -306,7 +389,7 @@ class TradePersistence:
                         exit_price = $1, pnl = $2, pnl_pct = $3, close_time = $4
                     WHERE exchange = $5 AND symbol = $6 AND close_time IS NULL
                     """,
-                    exit_price, pnl, pnl_pct, datetime.datetime.utcnow(),
+                    exit_price, pnl, pnl_pct, datetime.datetime.now(datetime.UTC),
                     exchange, symbol,
                 )
         except Exception as exc:
@@ -326,7 +409,7 @@ class TradePersistence:
                     INSERT INTO equity_snapshots (time, equity, unrealized_pnl, open_positions, drawdown_pct)
                     VALUES ($1, $2, $3, $4, $5)
                     """,
-                    datetime.datetime.utcnow(), equity, unrealized_pnl, open_positions, drawdown_pct,
+                    datetime.datetime.now(datetime.UTC), equity, unrealized_pnl, open_positions, drawdown_pct,
                 )
         except Exception as exc:
             logger.debug("equity_snapshot error: {}", exc)
@@ -345,7 +428,7 @@ class TradePersistence:
                     INSERT INTO risk_blocks (time, symbol, reason, signal_score, signal_direction)
                     VALUES ($1, $2, $3, $4, $5)
                     """,
-                    datetime.datetime.utcnow(), symbol, reason, signal_score, signal_direction,
+                    datetime.datetime.now(datetime.UTC), symbol, reason, signal_score, signal_direction,
                 )
         except Exception as exc:
             logger.debug("risk_block persist error: {}", exc)
@@ -364,7 +447,7 @@ class TradePersistence:
                     INSERT INTO errors (time, component, error_type, message)
                     VALUES ($1, $2, $3, $4)
                     """,
-                    datetime.datetime.utcnow(), component, error_type, message,
+                    datetime.datetime.now(datetime.UTC), component, error_type, message,
                 )
         except Exception as exc:
             logger.debug("error persist failed: {}", exc)

@@ -61,7 +61,7 @@ class KrakenExecutor(CEXExecutor):
                 timestamp=int(time.time()),
                 raw=order,
             )
-            self.risk_manager.open_position(signal, size)
+            await self.risk_manager.open_position(signal, size)
             await self.event_bus.publish("ORDER_FILLED", result)
             return result
         except Exception as exc:

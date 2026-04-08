@@ -165,7 +165,11 @@ class CEXWebSocketManager:
                     logger.info("{} WebSocket connected and subscribed", exchange)
 
                     # Reset sequence tracking on reconnect to avoid false gap alerts
-                    self._last_sequence.pop(exchange, None)
+                    keys_to_remove = [
+                        k for k in self._last_sequence if k == exchange or k.startswith(f"{exchange}:")
+                    ]
+                    for k in keys_to_remove:
+                        self._last_sequence.pop(k, None)
 
                     async for raw in ws:
                         if not self._running:

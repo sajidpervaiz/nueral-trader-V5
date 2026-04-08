@@ -93,6 +93,12 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 """
 
+# Partial unique index: only one open position per exchange+symbol at a time
+CREATE_POSITIONS_UNIQUE_IDX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_open_unique
+    ON positions (exchange, symbol) WHERE close_time IS NULL;
+"""
+
 TIMESCALE_HYPERTABLES = [
     "SELECT create_hypertable('ticks', 'time', if_not_exists => TRUE);",
     "SELECT create_hypertable('candles', 'time', if_not_exists => TRUE);",
@@ -107,6 +113,7 @@ ALL_DDL = [
     CREATE_FUNDING_RATES,
     CREATE_OPEN_INTEREST,
     CREATE_POSITIONS,
+    CREATE_POSITIONS_UNIQUE_IDX,
 ]
 
 
