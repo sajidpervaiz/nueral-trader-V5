@@ -110,13 +110,10 @@ class StartupReconciler:
                 self._safe_mode = True
                 result.safe_mode = True
                 # Trip circuit breaker to prevent new entries
-                self.risk_manager._circuit_breaker._tripped = True
-                self.risk_manager._circuit_breaker._trip_reason = (
-                    f"reconciliation_mismatch ({len(result.mismatches)} issues)"
+                self.risk_manager._circuit_breaker.trip(
+                    f"reconciliation_mismatch ({len(result.mismatches)} issues)",
+                    pause_seconds=86400.0,
                 )
-                self.risk_manager._circuit_breaker._trip_time = time.time()
-                # Set a very long pause so it doesn't auto-reset
-                self.risk_manager._circuit_breaker._pause_seconds = 86400.0
                 logger.critical(
                     "SAFE MODE ACTIVATED — {} mismatches detected. No new entries allowed.",
                     len(result.mismatches),
@@ -136,10 +133,10 @@ class StartupReconciler:
             result.safe_mode = True
             self._safe_mode = True
             # Trip circuit breaker
-            self.risk_manager._circuit_breaker._tripped = True
-            self.risk_manager._circuit_breaker._trip_reason = f"reconciliation_failed: {exc}"
-            self.risk_manager._circuit_breaker._trip_time = time.time()
-            self.risk_manager._circuit_breaker._pause_seconds = 86400.0
+            self.risk_manager._circuit_breaker.trip(
+                f"reconciliation_failed: {exc}",
+                pause_seconds=86400.0,
+            )
 
         return result
 
@@ -288,23 +285,50 @@ class StartupReconciler:
             # Check existing open orders for this symbol and read prices back
             key = f"binance:{symbol}"
             pos = self.risk_manager._positions.get(key)
+            sl_order_id: str | None = None
+            tp_order_id: str | None = None
+            sl_price_found: float = 0.0
+            tp_price_found: float = 0.0
             for order in result.exchange_open_orders:
                 if order["symbol"] != symbol or not order.get("reduce_only", False):
                     continue
                 if order["type"] in ("stop_market", "stop", "STOP_MARKET", "STOP"):
                     has_sl = True
+                    sl_order_id = str(order.get("id", ""))
                     # Read SL price from exchange into in-memory position
-                    sl_price = float(order.get("stop_price", 0) or 0)
-                    if pos and sl_price > 0:
-                        pos.stop_loss = sl_price
-                        logger.info("Read SL price from exchange for {}: {:.2f}", symbol, sl_price)
+                    sl_price_found = float(order.get("stop_price", 0) or 0)
+                    if pos and sl_price_found > 0:
+                        pos.stop_loss = sl_price_found
+                        logger.info("Read SL price from exchange for {}: {:.2f}", symbol, sl_price_found)
                 if order["type"] in ("take_profit_market", "take_profit", "TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
                     has_tp = True
+                    tp_order_id = str(order.get("id", ""))
                     # Read TP price from exchange into in-memory position
-                    tp_price = float(order.get("stop_price", 0) or 0)
-                    if pos and tp_price > 0:
-                        pos.take_profit = tp_price
-                        logger.info("Read TP price from exchange for {}: {:.2f}", symbol, tp_price)
+                    tp_price_found = float(order.get("stop_price", 0) or 0)
+                    if pos and tp_price_found > 0:
+                        pos.take_profit = tp_price_found
+                        logger.info("Read TP price from exchange for {}: {:.2f}", symbol, tp_price_found)
+
+            # Register existing exchange SL/TP in order_placer so OCO cancel logic works
+            if (has_sl or has_tp) and pos and self._order_placer:
+                from execution.exchange_order_placer import ProtectiveOrders
+                prot = ProtectiveOrders(
+                    symbol=symbol,
+                    direction=pos.direction,
+                    quantity=ep["size"],
+                    entry_price=ep["entry_price"],
+                    sl_price=sl_price_found,
+                    tp_price=tp_price_found,
+                    sl_order_id=sl_order_id,
+                    tp_order_id=tp_order_id,
+                    sl_placed=has_sl,
+                    tp_placed=has_tp,
+                )
+                self._order_placer._protective[symbol] = prot
+                logger.info(
+                    "Registered existing protective orders for {} (SL={}, TP={})",
+                    symbol, sl_order_id, tp_order_id,
+                )
 
             if not has_sl:
                 result.positions_without_sl.append(symbol)

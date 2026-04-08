@@ -155,7 +155,7 @@ async def close_position(
 
         # Current implementation is full close. Quantity is accepted for API compatibility.
         close_price = float(price if price is not None else pos.current_price)
-        closed = manager.close_position(venue, symbol, close_price)
+        closed = await manager.close_position(venue, symbol, close_price)
         if closed is None:
             raise HTTPException(status_code=404, detail="Position not found")
 
@@ -194,7 +194,7 @@ async def close_all_positions(
         closed_count = 0
         realized_total = 0.0
         for pos in positions:
-            closed = manager.close_position(pos.exchange, pos.symbol, pos.current_price)
+            closed = await manager.close_position(pos.exchange, pos.symbol, pos.current_price)
             if closed is not None:
                 closed_count += 1
                 realized_total += float(closed.pnl)

@@ -90,6 +90,12 @@ class SmartOrderRouter:
 
         self._lock = asyncio.Lock()
 
+        # Live tracking of venue metrics (EWMA-updated from real fills)
+        self._observed_fees: Dict[Venue, List[float]] = {v: [] for v in Venue}
+        self._observed_latencies: Dict[Venue, List[float]] = {v: [] for v in Venue}
+        self._fill_success_count: Dict[Venue, int] = {v: 0 for v in Venue}
+        self._fill_total_count: Dict[Venue, int] = {v: 0 for v in Venue}
+
     async def initialize(self) -> None:
         """Initialize router by fetching initial venue scores."""
         logger.info("Initializing Smart Order Router")
@@ -121,9 +127,11 @@ class SmartOrderRouter:
         Returns:
             Routing decision with venue(s) and execution plan
         """
-        async with self._lock:
-            await self._refresh_scores_if_needed(symbol)
+        # Refresh venue scores OUTSIDE the lock to avoid blocking
+        # other coroutines during network I/O (orderbook fetches).
+        await self._refresh_scores_if_needed(symbol)
 
+        async with self._lock:
             available_venues = [
                 (venue, score)
                 for venue, score in self.venue_scores.items()
@@ -349,7 +357,9 @@ class SmartOrderRouter:
         return slippage_cost + fee_cost
 
     def _get_venue_fee(self, venue: Venue) -> float:
-        """Get venue's trading fee."""
+        """Get venue's trading fee — uses observed average if available."""
+        if self._observed_fees.get(venue):
+            return sum(self._observed_fees[venue]) / len(self._observed_fees[venue])
         fee_map = {
             Venue.BINANCE: 0.001,
             Venue.BYBIT: 0.001,
@@ -359,7 +369,9 @@ class SmartOrderRouter:
         return fee_map.get(venue, 0.001)
 
     def _get_venue_latency(self, venue: Venue) -> float:
-        """Get venue's average latency in ms."""
+        """Get venue's average latency in ms — uses observed average if available."""
+        if self._observed_latencies.get(venue):
+            return sum(self._observed_latencies[venue]) / len(self._observed_latencies[venue])
         latency_map = {
             Venue.BINANCE: 50,
             Venue.BYBIT: 45,
@@ -369,7 +381,10 @@ class SmartOrderRouter:
         return latency_map.get(venue, 100)
 
     def _get_venue_reliability(self, venue: Venue) -> float:
-        """Get venue's reliability score (0-1)."""
+        """Get venue's reliability score (0-1) — uses observed fill rate if available."""
+        total = self._fill_total_count.get(venue, 0)
+        if total >= 10:  # Need minimum sample before trusting observed data
+            return self._fill_success_count.get(venue, 0) / total
         reliability_map = {
             Venue.BINANCE: 0.99,
             Venue.BYBIT: 0.97,
@@ -377,6 +392,29 @@ class SmartOrderRouter:
             Venue.HYPERLIQUID: 0.90,
         }
         return reliability_map.get(venue, 0.95)
+
+    def record_fill_metrics(
+        self,
+        venue: Venue,
+        fee_rate: float,
+        latency_ms: float,
+        success: bool,
+    ) -> None:
+        """Record observed fill metrics for live tracking. Call after each order execution."""
+        max_history = 200
+        fees = self._observed_fees.setdefault(venue, [])
+        fees.append(fee_rate)
+        if len(fees) > max_history:
+            self._observed_fees[venue] = fees[-max_history:]
+
+        lats = self._observed_latencies.setdefault(venue, [])
+        lats.append(latency_ms)
+        if len(lats) > max_history:
+            self._observed_latencies[venue] = lats[-max_history:]
+
+        self._fill_total_count[venue] = self._fill_total_count.get(venue, 0) + 1
+        if success:
+            self._fill_success_count[venue] = self._fill_success_count.get(venue, 0) + 1
 
     def update_routing_weights(self, weights: Dict[str, float]) -> None:
         """Update routing weight configuration."""

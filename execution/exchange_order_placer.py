@@ -6,10 +6,13 @@ after an entry fill, so positions are ALWAYS protected even if the bot crashes.
 
 Implements manual OCO: when SL fills → cancel TP, when TP fills → cancel SL.
 Handles partial fills by adjusting protective order quantities.
+Supports both one-way mode (reduceOnly) and hedge mode (positionSide).
+Enforces tick-size and step-size rounding per symbol.
 """
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -52,6 +55,8 @@ class ExchangeOrderPlacer:
     - Partial fills adjust SL/TP quantity to match filled qty
     - OCO-like: SL fill cancels TP, TP fill cancels SL
     - workingType is configurable (MARK_PRICE or CONTRACT_PRICE)
+    - Supports hedge mode (positionSide=LONG/SHORT) and one-way mode (reduceOnly)
+    - Enforces tick-size / step-size rounding from exchange market info
     """
 
     def __init__(
@@ -59,13 +64,55 @@ class ExchangeOrderPlacer:
         client: Any,
         working_type: str = "CONTRACT_PRICE",
         rate_limiter: Any = None,
+        hedge_mode: bool = False,
     ) -> None:
         self._client = client
         self._working_type = working_type
         self._rate_limiter = rate_limiter
+        self._hedge_mode = hedge_mode
         # symbol → ProtectiveOrders
         self._protective: dict[str, ProtectiveOrders] = {}
         self._lock = asyncio.Lock()
+
+    # ── Precision helpers ─────────────────────────────────────────────────
+
+    def _get_market(self, symbol: str) -> dict | None:
+        """Retrieve the CCXT market entry for a symbol (cached by load_markets)."""
+        if self._client is None:
+            return None
+        markets = getattr(self._client, "markets", None)
+        if not isinstance(markets, dict):
+            return None
+        return markets.get(symbol)
+
+    def round_price(self, symbol: str, price: float) -> float:
+        """Round a price to the symbol's tick size (price precision)."""
+        market = self._get_market(symbol)
+        if market:
+            precision = market.get("precision", {})
+            tick = precision.get("price")
+            if tick is not None and tick > 0:
+                return _round_to_precision(price, tick)
+        return price
+
+    def round_quantity(self, symbol: str, qty: float) -> float:
+        """Round a quantity to the symbol's step size (amount precision)."""
+        market = self._get_market(symbol)
+        if market:
+            precision = market.get("precision", {})
+            step = precision.get("amount")
+            if step is not None and step > 0:
+                return _round_to_precision(qty, step)
+        return qty
+
+    def _position_side_param(self, direction: str) -> dict[str, str]:
+        """Return positionSide params for hedge mode, empty dict for one-way."""
+        if not self._hedge_mode:
+            return {}
+        # In hedge mode, the *position* side is set (not the order side).
+        # For a long position, protective (close) orders carry positionSide=LONG.
+        # For a short position, protective (close) orders carry positionSide=SHORT.
+        return {"positionSide": "LONG" if direction == "long" else "SHORT"}
 
     @property
     def protective_orders(self) -> dict[str, ProtectiveOrders]:
@@ -84,8 +131,15 @@ class ExchangeOrderPlacer:
         Place exchange-side STOP_MARKET and TAKE_PROFIT_MARKET immediately
         after entry fill. SL is always placed first; TP failure does not
         prevent SL from existing.
+
+        Prices and quantities are rounded to exchange tick/step size.
         """
         async with self._lock:
+            # Round to exchange precision
+            sl_price = self.round_price(symbol, sl_price)
+            tp_price = self.round_price(symbol, tp_price)
+            quantity = self.round_quantity(symbol, quantity)
+
             prot = ProtectiveOrders(
                 symbol=symbol,
                 direction=direction,
@@ -102,6 +156,7 @@ class ExchangeOrderPlacer:
                     side=prot.close_side,
                     quantity=quantity,
                     stop_price=sl_price,
+                    direction=direction,
                 )
                 prot.sl_order_id = sl_order.get("id", "")
                 prot.sl_placed = True
@@ -125,6 +180,7 @@ class ExchangeOrderPlacer:
                     side=prot.close_side,
                     quantity=quantity,
                     stop_price=tp_price,
+                    direction=direction,
                 )
                 prot.tp_order_id = tp_order.get("id", "")
                 prot.tp_placed = True
@@ -147,6 +203,7 @@ class ExchangeOrderPlacer:
             if prot is None:
                 return
 
+            new_quantity = self.round_quantity(symbol, new_quantity)
             old_qty = prot.quantity
             prot.quantity = new_quantity
             logger.info(
@@ -165,6 +222,7 @@ class ExchangeOrderPlacer:
                         side=prot.close_side,
                         quantity=new_quantity,
                         stop_price=prot.sl_price,
+                        direction=prot.direction,
                     )
                     prot.sl_order_id = sl_order.get("id", "")
                     logger.info("SL adjusted for {} new_qty={:.6f}", symbol, new_quantity)
@@ -182,6 +240,7 @@ class ExchangeOrderPlacer:
                         side=prot.close_side,
                         quantity=new_quantity,
                         stop_price=prot.tp_price,
+                        direction=prot.direction,
                     )
                     prot.tp_order_id = tp_order.get("id", "")
                     logger.info("TP adjusted for {} new_qty={:.6f}", symbol, new_quantity)
@@ -250,14 +309,21 @@ class ExchangeOrderPlacer:
 
     async def _place_stop_market(
         self, symbol: str, side: str, quantity: float, stop_price: float,
+        direction: str = "long",
     ) -> dict:
-        """Place STOP_MARKET order on Binance Futures."""
-        params = {
+        """Place STOP_MARKET order on Binance Futures.
+
+        In hedge mode, includes positionSide=LONG/SHORT instead of reduceOnly.
+        """
+        params: dict[str, Any] = {
             "stopPrice": stop_price,
-            "reduceOnly": True,
             "workingType": self._working_type,
             "type": "STOP_MARKET",
         }
+        if self._hedge_mode:
+            params.update(self._position_side_param(direction))
+        else:
+            params["reduceOnly"] = True
         if self._rate_limiter:
             await self._rate_limiter.acquire()
         order = await self._client.create_order(
@@ -271,14 +337,21 @@ class ExchangeOrderPlacer:
 
     async def _place_take_profit_market(
         self, symbol: str, side: str, quantity: float, stop_price: float,
+        direction: str = "long",
     ) -> dict:
-        """Place TAKE_PROFIT_MARKET order on Binance Futures."""
-        params = {
+        """Place TAKE_PROFIT_MARKET order on Binance Futures.
+
+        In hedge mode, includes positionSide=LONG/SHORT instead of reduceOnly.
+        """
+        params: dict[str, Any] = {
             "stopPrice": stop_price,
-            "reduceOnly": True,
             "workingType": self._working_type,
             "type": "TAKE_PROFIT_MARKET",
         }
+        if self._hedge_mode:
+            params.update(self._position_side_param(direction))
+        else:
+            params["reduceOnly"] = True
         if self._rate_limiter:
             await self._rate_limiter.acquire()
         order = await self._client.create_order(
@@ -289,3 +362,18 @@ class ExchangeOrderPlacer:
             params=params,
         )
         return order
+
+
+# ── Module-level helper ──────────────────────────────────────────────────────
+
+def _round_to_precision(value: float, precision: float) -> float:
+    """Round *value* down to the nearest multiple of *precision*.
+
+    Uses floor rounding so we never exceed available balance / position size.
+    Example: _round_to_precision(0.12345, 0.001) → 0.123
+    """
+    if precision <= 0:
+        return value
+    decimals = max(0, -math.floor(math.log10(precision))) if precision < 1 else 0
+    floored = math.floor(value / precision) * precision
+    return round(floored, decimals)

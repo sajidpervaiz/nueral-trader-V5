@@ -112,12 +112,12 @@ class TestHackerSignalInjection:
         assert not approved
         assert "risk_reward" in reason
 
-    def test_reject_when_killed(self):
+    async def test_reject_when_killed(self):
         """Kill switch active must block ALL signals."""
         cfg = _make_config()
         bus = EventBus()
         rm = RiskManager(cfg, bus)
-        rm.activate_kill_switch()
+        await rm.activate_kill_switch()
         signal = _make_signal()
         approved, reason, _ = rm.approve_signal(signal)
         assert not approved
@@ -192,7 +192,7 @@ class TestOpsReconnection:
 class TestRiskDailyLossHalt:
     """Simulate 10 consecutive losses.  Circuit breaker MUST halt trading."""
 
-    def test_10_losses_trips_circuit_breaker(self):
+    async def test_10_losses_trips_circuit_breaker(self):
         """After 10 consecutive losing trades, circuit breaker should trip."""
         cfg = _make_config({"risk.max_daily_loss_pct": "0.03"})
         bus = EventBus()
@@ -210,10 +210,10 @@ class TestRiskDailyLossHalt:
             )
             
             # Force open a position
-            pos = rm.open_position(signal, 2000.0)
+            pos = await rm.open_position(signal, 2000.0)
             # Close at a loss (0.5% each)
             loss_price = pos.entry_price * 0.995 if pos.is_long else pos.entry_price * 1.005
-            rm.close_position(pos.exchange, pos.symbol, loss_price)
+            await rm.close_position(pos.exchange, pos.symbol, loss_price)
 
         # After 10 × 0.5% = 5% loss, should exceed 3% daily limit
         assert rm._circuit_breaker.tripped, (
@@ -356,6 +356,8 @@ class TestKillSwitchFile:
         
         # Create kill switch file
         kill_file.touch()
+        # Force cache refresh (cache interval is 5s)
+        rm._kill_switch_last_check = 0.0
         
         signal2 = _make_signal(symbol="NEW/USDT:USDT")
         approved2, reason2, _ = rm.approve_signal(signal2)

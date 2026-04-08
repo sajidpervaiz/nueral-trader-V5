@@ -14,7 +14,7 @@ from loguru import logger
 from core.config import Config
 from core.event_bus import EventBus
 from core.circuit_breaker import CircuitBreaker
-from core.idempotency import IdempotencyManager
+from core.persistent_idempotency import PersistentIdempotencyManager
 from core.retry import RetryPolicy
 
 
@@ -94,8 +94,8 @@ class Order:
     cumulative_quantity: float = 0.0
     average_fill_price: float = 0.0
     total_fee: float = 0.0
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
+    created_at: int = field(default_factory=lambda: int(time.time() * 1000))
+    updated_at: int = field(default_factory=lambda: int(time.time() * 1000))
     submitted_at: Optional[int] = None
     filled_at: Optional[int] = None
     exchange_order_id: Optional[str] = None
@@ -122,23 +122,8 @@ class Order:
         ))
         self.updated_at = time.time()
 
-    def update_fill(self, fill_qty: float, fill_price: float):
-        """Update order with fill information."""
-        total_value = (self.avg_fill_price * self.filled_quantity) + (fill_price * fill_qty)
-        self.filled_quantity += fill_qty
-        self.remaining_quantity = max(0.0, self.quantity - self.filled_quantity)
-
-        if self.filled_quantity > 0:
-            self.avg_fill_price = total_value / self.filled_quantity
-
-        self.updated_at = time.time()
-
-        if self.filled_quantity >= self.quantity:
-            self.status = OrderStatus.FILLED
-            self.add_stage(OrderLifecycleStage.COMPLETE_FILL)
-        else:
-            self.status = OrderStatus.PARTIALLY_FILLED
-            self.add_stage(OrderLifecycleStage.PARTIAL_FILL)
+    # NOTE: Fill tracking is handled exclusively by OrderManager.record_fill()
+    # which manages deduplication, audit logging, and lifecycle stages.
 
 
 class OrderManager:
@@ -155,34 +140,109 @@ class OrderManager:
         config: Config,
         event_bus: EventBus,
         circuit_breaker: CircuitBreaker,
+        audit_log_path: str = "order_audit_log.jsonl",
+        order_state_path: str = "order_state.json",
     ):
         self.config = config
         self.event_bus = event_bus
         self.circuit_breaker = circuit_breaker
-        
         # Order storage
         self.orders: Dict[str, Order] = {}
         self.client_order_map: Dict[str, Order] = {}
         self.exchange_order_map: Dict[str, Order] = {}
         self.pending_orders: Dict[str, Order] = {}
         self.user_orders: Dict[str, Dict[str, Order]] = {}
-        
-        # Idempotency manager
-        self.idempotency = IdempotencyManager(ttl=86400, max_size=50000)
-        
+        # Idempotency manager (persistent)
+        self.idempotency = PersistentIdempotencyManager(ttl=86400, max_size=50000, filepath="idempotency_store.json")
         # Retry policy
         self.retry_policy = RetryPolicy(max_attempts=3, base_delay=0.1)
-        
         # Self-trade prevention window
         self.self_trade_window_ms = 60000
-        
         # Audit trail
         self.audit_log: List[Dict] = []
         self.max_audit_log_size = 100000
         self.smart_router: Any = None
-        
         self._lock = asyncio.Lock()
         self._running = False
+        self._audit_log_path = audit_log_path
+        self._order_state_path = order_state_path
+        self._load_audit_log()
+        self._load_order_state()
+
+    def _save_audit_log(self):
+        import json
+        try:
+            with open(self._audit_log_path, "w") as f:
+                for entry in self.audit_log:
+                    f.write(json.dumps(entry) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to save audit log: {e}")
+
+    def _append_audit_entry(self, entry: dict) -> None:
+        """Append a single audit entry (O(1) I/O instead of rewriting entire log)."""
+        import json
+        try:
+            with open(self._audit_log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to append audit entry: {e}")
+
+    def _load_audit_log(self):
+        import json
+        import os
+        if os.path.exists(self._audit_log_path):
+            try:
+                with open(self._audit_log_path, "r") as f:
+                    self.audit_log = [json.loads(line) for line in f]
+            except Exception as e:
+                logger.error(f"Failed to load audit log: {e}")
+
+    def _save_order_state(self):
+        import json
+        try:
+            state = {
+                "orders": {k: self._order_to_dict(v) for k, v in self.orders.items()},
+                "client_order_map": list(self.client_order_map.keys()),
+                "exchange_order_map": [list(k) for k in self.exchange_order_map.keys()],
+            }
+            with open(self._order_state_path, "w") as f:
+                json.dump(state, f)
+        except Exception as e:
+            logger.error(f"Failed to save order state: {e}")
+
+    def _load_order_state(self):
+        import json
+        import os
+        if os.path.exists(self._order_state_path):
+            try:
+                with open(self._order_state_path, "r") as f:
+                    state = json.load(f)
+                # Only restore orders, not full object graph
+                self.orders = {k: self._dict_to_order(v) for k, v in state.get("orders", {}).items()}
+                self.client_order_map = {k: self.orders[k] for k in state.get("client_order_map", []) if k in self.orders}
+                self.exchange_order_map = {tuple(k): self.orders[k[0]] for k in state.get("exchange_order_map", []) if k[0] in self.orders}
+            except Exception as e:
+                logger.error(f"Failed to load order state: {e}")
+
+    def _order_to_dict(self, order: 'Order') -> dict:
+        from dataclasses import asdict
+        d = asdict(order)
+        d["side"] = order.side.value
+        d["order_type"] = order.order_type.value
+        d["status"] = order.status.value
+        d["stages"] = [asdict(s) for s in order.stages]
+        d["fills"] = [asdict(f) for f in order.fills]
+        return d
+
+    def _dict_to_order(self, d: dict) -> 'Order':
+        # Reconstruct enums and dataclasses
+        d = dict(d)
+        d["side"] = OrderSide(d["side"])
+        d["order_type"] = OrderType(d["order_type"])
+        d["status"] = OrderStatus(d["status"])
+        d["stages"] = [OrderStage(OrderLifecycleStage(s["stage"]), s["timestamp"], s.get("metadata", {})) for s in d.get("stages", [])]
+        d["fills"] = [OrderFill(**f) for f in d.get("fills", [])]
+        return Order(**d)
 
     def attach_router(self, router: Any) -> None:
         """Attach an optional smart order router for auto venue selection."""
@@ -354,7 +414,7 @@ class OrderManager:
 
         for order in open_orders:
             if order.side != side:
-                age_ms = int(time.time() * 1000) - int(order.created_at * 1000)
+                age_ms = int(time.time() * 1000) - order.created_at
                 if age_ms < self.self_trade_window_ms:
                     return f"opposing_order_open ({order.client_order_id})"
 
@@ -396,6 +456,11 @@ class OrderManager:
             if not order:
                 logger.error(f"Order {client_order_id} not found for fill")
                 return None
+
+            # P0-1: Guard against duplicate fill processing
+            if any(f.fill_id == fill_id for f in order.fills):
+                logger.warning(f"Duplicate fill_id {fill_id} for {client_order_id} — skipping")
+                return order
 
             fill = OrderFill(
                 fill_id=fill_id,
@@ -464,6 +529,12 @@ class OrderManager:
         # Enforce size limit
         if len(self.audit_log) > self.max_audit_log_size:
             self.audit_log = self.audit_log[-self.max_audit_log_size:]
+        # Append single entry instead of rewriting entire file on every op
+        self._append_audit_entry(entry)
+    def save_state(self):
+        """Persist audit log and order state to disk."""
+        self._save_audit_log()
+        self._save_order_state()
 
     def get_order(self, client_order_id: str) -> Optional[Order]:
         """Get order by client ID"""
@@ -513,14 +584,46 @@ class OrderManager:
             "audit_log_size": len(self.audit_log),
         }
 
+    _TERMINAL_STATUSES = frozenset({
+        OrderStatus.FILLED, OrderStatus.CANCELLED,
+        OrderStatus.REJECTED, OrderStatus.EXPIRED,
+    })
+    _ORDER_TTL_SEC = 3600  # keep terminal-state orders for 1 hour
+
     async def run(self) -> None:
-        """Start order manager"""
+        """Start order manager with periodic cleanup of terminal-state orders."""
         self._running = True
         logger.info("OrderManager started")
         while self._running:
             await asyncio.sleep(60)
+            await self._cleanup_old_orders()
+
+    async def _cleanup_old_orders(self) -> None:
+        """Remove orders in terminal states older than _ORDER_TTL_SEC."""
+        now = time.time() * 1000  # updated_at is milliseconds
+        cutoff = now - self._ORDER_TTL_SEC * 1000
+        stale_ids = [
+            oid for oid, order in self.orders.items()
+            if order.status in self._TERMINAL_STATUSES
+            and order.updated_at < cutoff
+        ]
+        if not stale_ids:
+            return
+        async with self._lock:
+            for oid in stale_ids:
+                order = self.orders.pop(oid, None)
+                if order is None:
+                    continue
+                self.client_order_map.pop(order.client_order_id, None)
+                if order.exchange_order_id:
+                    self.exchange_order_map.pop(order.exchange_order_id, None)
+                self.pending_orders.pop(oid, None)
+                if order.user_id and order.user_id in self.user_orders:
+                    self.user_orders[order.user_id].pop(oid, None)
+            logger.info("Cleaned up {} terminal-state orders", len(stale_ids))
 
     async def stop(self) -> None:
-        """Stop order manager"""
+        """Stop order manager and persist state"""
         self._running = False
-        logger.info("OrderManager stopped")
+        self.save_state()
+        logger.info("OrderManager stopped and state saved")

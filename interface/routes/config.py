@@ -86,8 +86,8 @@ def _effective_venues() -> dict[str, dict[str, Any]]:
         enabled = _VENUE_OVERRIDES.get(venue, enabled_cfg)
         out[str(venue)] = {
             "enabled": enabled,
-            "api_key": str(venue_cfg.get("api_key", "") or ""),
-            "api_secret": str(venue_cfg.get("api_secret", "") or ""),
+            "api_key_configured": bool(venue_cfg.get("api_key")),
+            "api_secret_configured": bool(venue_cfg.get("api_secret")),
         }
     return out
 
@@ -193,7 +193,7 @@ async def get_venue_configs():
 
         out: list[VenueConfig] = []
         for venue, data in venues.items():
-            api_keys_configured = bool(data["api_key"] and data["api_secret"])
+            api_keys_configured = bool(data["api_key_configured"] and data["api_secret_configured"])
             connected = data["enabled"] and api_keys_configured
             if not data["enabled"]:
                 status = "disabled"

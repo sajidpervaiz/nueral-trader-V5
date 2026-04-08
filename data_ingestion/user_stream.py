@@ -97,15 +97,34 @@ class UserDataStream:
         return key
 
     async def _keepalive_listen_key(self) -> None:
-        """PUT /fapi/v1/listenKey — extend listen key validity."""
+        """PUT /fapi/v1/listenKey — extend listen key validity with retry."""
         if not self._listen_key:
             return
-        try:
-            await self._http_request("PUT", "/fapi/v1/listenKey")
-            self._last_keepalive = time.time()
-            logger.debug("User data stream listenKey keepalive sent")
-        except Exception as exc:
-            logger.warning("listenKey keepalive failed: {}", exc)
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                await self._http_request("PUT", "/fapi/v1/listenKey")
+                self._last_keepalive = time.time()
+                logger.debug("User data stream listenKey keepalive sent")
+                return
+            except Exception as exc:
+                logger.warning(
+                    "listenKey keepalive attempt {}/{} failed: {}",
+                    attempt, max_retries, exc,
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(2 ** attempt)  # 2s, 4s backoff
+        # All retries exhausted — invalidate key to force reconnect
+        logger.error(
+            "listenKey keepalive failed after {} retries — forcing reconnect",
+            max_retries,
+        )
+        self._listen_key = None
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
 
     async def _keepalive_loop(self) -> None:
         """Background task to send keepalive every 30 minutes."""

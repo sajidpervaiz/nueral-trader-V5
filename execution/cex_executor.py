@@ -11,6 +11,7 @@ from loguru import logger
 from core.config import Config
 from core.event_bus import EventBus
 from engine.signal_generator import TradingSignal
+from execution.order_manager import OrderManager
 from execution.rate_limiter import RateLimiter
 from execution.risk_manager import RiskManager, Position
 from execution.exchange_order_placer import ExchangeOrderPlacer
@@ -37,11 +38,13 @@ class CEXExecutor:
         event_bus: EventBus,
         risk_manager: RiskManager,
         exchange_id: str,
+        order_manager: OrderManager | None = None,
     ) -> None:
         self.config = config
         self.event_bus = event_bus
         self.risk_manager = risk_manager
         self.exchange_id = exchange_id
+        self._order_manager = order_manager
         self._client: Any = None
         self._order_placer: ExchangeOrderPlacer | None = None
         self._running = False
@@ -74,10 +77,37 @@ class CEXExecutor:
             if cfg.get("testnet"):
                 self._client.set_sandbox_mode(True)
             await self._client.load_markets()
+            # Detect hedge mode (dual position side)
+            hedge_mode = bool(cfg.get("hedge_mode", False))
+            if not hedge_mode:
+                try:
+                    pm = await self._client.fapiPrivateGetPositionSideDual()
+                    hedge_mode = bool(pm.get("dualSidePosition", False))
+                except Exception:
+                    pass  # default to one-way
             # Create exchange-side order placer for SL/TP
             working_type = str(cfg.get("working_type", "CONTRACT_PRICE"))
-            self._order_placer = ExchangeOrderPlacer(self._client, working_type=working_type, rate_limiter=self._rate_limiter)
-            logger.info("{} CEX client initialized", self.exchange_id)
+            self._order_placer = ExchangeOrderPlacer(
+                self._client,
+                working_type=working_type,
+                rate_limiter=self._rate_limiter,
+                hedge_mode=hedge_mode,
+            )
+
+            # ── Set leverage and margin mode for all configured symbols ───
+            leverage = int(cfg.get("leverage", self.risk_manager._leverage if hasattr(self.risk_manager, '_leverage') else 1))
+            margin_mode = str(cfg.get("margin_mode", "isolated")).lower()
+            symbols = cfg.get("symbols", [])
+            for sym in symbols:
+                try:
+                    await self._client.set_margin_mode(margin_mode, sym)
+                except Exception as e:
+                    logger.debug("{} set_margin_mode({}, {}): {}", self.exchange_id, margin_mode, sym, e)
+                try:
+                    await self._client.set_leverage(leverage, sym)
+                except Exception as e:
+                    logger.debug("{} set_leverage({}, {}): {}", self.exchange_id, leverage, sym, e)
+            logger.info("{} CEX client initialized (leverage={}, margin={})", self.exchange_id, leverage, margin_mode)
         except Exception as exc:
             logger.warning("{} client init failed: {}", self.exchange_id, exc)
             self._client = None
@@ -86,6 +116,25 @@ class CEXExecutor:
         if self.config.paper_mode:
             return await self._paper_execute(signal, size)
         return await self._live_execute(signal, size)
+
+    async def _paper_execute_with_pos(self, signal: TradingSignal, size: float, pos: Any) -> OrderResult:
+        """Paper execute with pre-opened position (from approve_and_open)."""
+        slippage = self.config.get_value("backtest", "slippage_pct") or 0.0002
+        fill_price = signal.price * (1 + slippage if signal.is_long else 1 - slippage)
+        result = OrderResult(
+            order_id=f"paper_{int(time.time()*1000)}",
+            exchange=signal.exchange,
+            symbol=signal.symbol,
+            direction=signal.direction,
+            price=fill_price,
+            quantity=size / fill_price if fill_price > 0 else 0,
+            status="filled",
+            is_paper=True,
+            timestamp=int(time.time()),
+        )
+        await self.event_bus.publish("ORDER_FILLED", result)
+        logger.info("Paper order filled: {} {}/{} @ {:.2f}", signal.direction.upper(), signal.exchange, signal.symbol, fill_price)
+        return result
 
     async def _paper_execute(self, signal: TradingSignal, size: float) -> OrderResult:
         slippage = self.config.get_value("backtest", "slippage_pct") or 0.0002
@@ -101,14 +150,15 @@ class CEXExecutor:
             is_paper=True,
             timestamp=int(time.time()),
         )
-        pos = self.risk_manager.open_position(signal, size)
+        pos = await self.risk_manager.open_position(signal, size)
         await self.event_bus.publish("ORDER_FILLED", result)
         logger.info("Paper order filled: {} {}/{} @ {:.2f}", signal.direction.upper(), signal.exchange, signal.symbol, fill_price)
         return result
 
-    async def _live_execute(self, signal: TradingSignal, size: float) -> OrderResult | None:
+    async def _live_execute(self, signal: TradingSignal, size: float, reserved_pos: Any = None) -> OrderResult | None:
         """Execute using LIMIT order for entries; MARKET only for emergency exits.
-        Places exchange-side SL/TP after fill for crash protection."""
+        Places exchange-side SL/TP after fill for crash protection.
+        If reserved_pos is provided, position was already opened atomically — skip re-opening."""
         if self._client is None:
             logger.error("No live client for {} — cannot execute", self.exchange_id)
             return None
@@ -146,7 +196,13 @@ class CEXExecutor:
                 raw=order,
             )
             if result.status in ("filled", "closed"):
-                pos = self.risk_manager.open_position(signal, filled_qty * fill_price)
+                # Use pre-reserved position if available, otherwise open fresh
+                if reserved_pos is not None:
+                    pos = reserved_pos
+                    pos.current_price = fill_price
+                    pos.size = filled_qty
+                else:
+                    pos = await self.risk_manager.open_position(signal, filled_qty * fill_price)
                 await self.event_bus.publish("ORDER_FILLED", result)
 
                 # ── Place exchange-side SL/TP (crash protection) ──────────
@@ -170,18 +226,21 @@ class CEXExecutor:
                             signal.symbol, exc,
                         )
                         # Position is unprotected — trip circuit breaker to prevent more entries
-                        self.risk_manager._circuit_breaker._tripped = True
-                        self.risk_manager._circuit_breaker._trip_reason = (
+                        self.risk_manager._circuit_breaker.trip(
                             f"sl_placement_failed:{signal.symbol}"
                         )
-                        self.risk_manager._circuit_breaker._trip_time = time.time()
                         await self.event_bus.publish("ALERT_CRITICAL", {
                             "type": "sl_placement_failed",
                             "symbol": signal.symbol,
                             "error": str(exc),
                         })
             elif result.status == "partially_filled" and filled_qty > 0:
-                pos = self.risk_manager.open_position(signal, filled_qty * fill_price)
+                if reserved_pos is not None:
+                    pos = reserved_pos
+                    pos.current_price = fill_price
+                    pos.size = filled_qty
+                else:
+                    pos = await self.risk_manager.open_position(signal, filled_qty * fill_price)
                 await self.event_bus.publish("ORDER_PARTIALLY_FILLED", result)
                 # Place protective orders for partial fill qty
                 if self._order_placer:
@@ -196,11 +255,9 @@ class CEXExecutor:
                         )
                     except Exception as exc:
                         logger.critical("SL placement failed for partial fill {}: {}", signal.symbol, exc)
-                        self.risk_manager._circuit_breaker._tripped = True
-                        self.risk_manager._circuit_breaker._trip_reason = (
+                        self.risk_manager._circuit_breaker.trip(
                             f"sl_placement_failed:{signal.symbol}"
                         )
-                        self.risk_manager._circuit_breaker._trip_time = time.time()
             else:
                 logger.warning("{} order not filled: status={}", self.exchange_id, result.status)
                 await self.event_bus.publish("ORDER_FAILED", result)
@@ -238,12 +295,27 @@ class CEXExecutor:
             logger.info("{} cancelled unfilled limit order {}, placing market order",
                         self.exchange_id, order_id)
         except Exception as exc:
-            logger.warning("{} cancel failed: {}", self.exchange_id, exc)
+            logger.warning("{} cancel failed (may already be filled): {}", self.exchange_id, exc)
+
+        # P0: Re-fetch order to check what filled during cancel race
+        already_filled = 0.0
+        try:
+            await self._rate_limiter.acquire()
+            final_state = await self._client.fetch_order(order_id, signal.symbol)
+            already_filled = float(final_state.get("filled", 0))
+            if final_state.get("status") in ("closed", "filled"):
+                return final_state  # fully filled during cancel — no market needed
+        except Exception:
+            already_filled = 0.0
+
+        remaining = amount - already_filled
+        if remaining <= 0:
+            return final_state
 
         side = "buy" if signal.is_long else "sell"
         await self._rate_limiter.acquire()
         market_order = await self._client.create_market_order(
-            symbol=signal.symbol, side=side, amount=amount, params={},
+            symbol=signal.symbol, side=side, amount=remaining, params={},
         )
         return market_order
 
@@ -251,11 +323,24 @@ class CEXExecutor:
         signal: TradingSignal = payload
         if signal.exchange != self.exchange_id:
             return
-        approved, reason, size = self.risk_manager.approve_signal(signal)
-        if not approved:
-            logger.debug("Signal rejected for {}/{}: {}", signal.exchange, signal.symbol, reason)
-            return
-        await self.execute_signal(signal, size)
+
+        if self.config.paper_mode:
+            # Atomic approve + open under lock (no race window)
+            approved, reason, size, pos = await self.risk_manager.approve_and_open(signal)
+            if not approved:
+                logger.debug("Signal rejected for {}/{}: {}", signal.exchange, signal.symbol, reason)
+                return
+            await self._paper_execute_with_pos(signal, size, pos)
+        else:
+            # For live: approve + reserve slot atomically, then execute on exchange
+            approved, reason, size, pos = await self.risk_manager.approve_and_open(signal)
+            if not approved:
+                logger.debug("Signal rejected for {}/{}: {}", signal.exchange, signal.symbol, reason)
+                return
+            result = await self._live_execute(signal, size, pos)
+            if result is None:
+                # Exchange failed — release the reserved position
+                await self.risk_manager.close_position(signal.exchange, signal.symbol, signal.price)
 
     async def _handle_stop_loss(self, payload: Any) -> None:
         exchange = payload.get("exchange", "")
@@ -263,7 +348,7 @@ class CEXExecutor:
         price = float(payload.get("price", 0))
         if exchange != self.exchange_id:
             return
-        pos = self.risk_manager.close_position(exchange, symbol, price)
+        pos = await self.risk_manager.close_position(exchange, symbol, price)
         if pos:
             # OCO: SL triggered → cancel TP on exchange
             if self._order_placer:
@@ -279,7 +364,7 @@ class CEXExecutor:
         price = float(payload.get("price", 0))
         if exchange != self.exchange_id:
             return
-        pos = self.risk_manager.close_position(exchange, symbol, price)
+        pos = await self.risk_manager.close_position(exchange, symbol, price)
         if pos:
             # OCO: TP triggered → cancel SL on exchange
             if self._order_placer:
@@ -292,7 +377,7 @@ class CEXExecutor:
     async def _handle_kill_switch(self, payload: Any) -> None:
         """Emergency: cancel all open orders, close all positions at market."""
         logger.critical("KILL SWITCH received on {} executor", self.exchange_id)
-        closed = self.risk_manager.activate_kill_switch()
+        closed = await self.risk_manager.activate_kill_switch()
         # Cancel all protective orders tracking
         if self._order_placer:
             for symbol in list(self._order_placer.protective_orders.keys()):
@@ -302,10 +387,17 @@ class CEXExecutor:
             try:
                 open_orders = await self._client.fetch_open_orders()
                 for o in open_orders:
-                    try:
-                        await self._client.cancel_order(o["id"], o.get("symbol"))
-                    except Exception:
-                        pass
+                    for _attempt in range(3):
+                        try:
+                            await self._rate_limiter.acquire()
+                            await self._client.cancel_order(o["id"], o.get("symbol"))
+                            break
+                        except Exception as cancel_exc:
+                            if _attempt == 2:
+                                logger.error(
+                                    "Kill switch: FAILED to cancel order {} after 3 attempts: {}",
+                                    o.get('id'), cancel_exc,
+                                )
                 logger.info("{} cancelled {} open orders", self.exchange_id, len(open_orders))
             except Exception as exc:
                 logger.warning("{} failed to cancel orders: {}", self.exchange_id, exc)
@@ -340,6 +432,18 @@ class CEXExecutor:
                 symbol, filled_qty, filled_price, cum_qty, total_qty, realized_pnl,
             )
 
+            # ── Sync fill into OrderManager ───────────────────────────────
+            client_oid = str(payload.get("client_order_id", ""))
+            trade_id = str(payload.get("trade_id", ""))
+            if self._order_manager and client_oid:
+                await self._order_manager.record_fill(
+                    client_order_id=client_oid,
+                    fill_id=trade_id or f"fill_{int(time.time()*1000)}",
+                    quantity=filled_qty,
+                    price=filled_price,
+                    fee=commission,
+                )
+
             # Detect if this is a SL or TP fill (reduce_only protective order)
             if reduce_only and order_type in ("STOP_MARKET", "STOP"):
                 await self._on_exchange_sl_filled(symbol, filled_price)
@@ -353,6 +457,9 @@ class CEXExecutor:
             await self.event_bus.publish("FILL_CONFIRMED", payload)
 
         elif exec_type == "CANCELED":
+            client_oid = str(payload.get("client_order_id", ""))
+            if self._order_manager and client_oid:
+                await self._order_manager.cancel_order(client_oid, reason="exchange_cancel")
             logger.info("Order cancelled via user stream: {} orderId={}", symbol, payload.get("order_id"))
             await self.event_bus.publish("ORDER_CANCELLED_EXCHANGE", payload)
 
@@ -366,7 +473,7 @@ class CEXExecutor:
     async def _on_exchange_sl_filled(self, symbol: str, price: float) -> None:
         """Exchange-side SL triggered — sync internal state."""
         logger.warning("Exchange SL triggered for {} @ {:.2f}", symbol, price)
-        pos = self.risk_manager.close_position(self.exchange_id, symbol, price)
+        pos = await self.risk_manager.close_position(self.exchange_id, symbol, price)
         if pos:
             if self._order_placer:
                 await self._order_placer.handle_sl_filled(symbol)
@@ -378,7 +485,7 @@ class CEXExecutor:
     async def _on_exchange_tp_filled(self, symbol: str, price: float) -> None:
         """Exchange-side TP triggered — sync internal state."""
         logger.info("Exchange TP triggered for {} @ {:.2f}", symbol, price)
-        pos = self.risk_manager.close_position(self.exchange_id, symbol, price)
+        pos = await self.risk_manager.close_position(self.exchange_id, symbol, price)
         if pos:
             if self._order_placer:
                 await self._order_placer.handle_tp_filled(symbol)
@@ -391,17 +498,12 @@ class CEXExecutor:
         """User data stream disconnected — enter safety mode."""
         logger.critical("User data stream LOST — entering safety mode, blocking new trades")
         # Trip the circuit breaker to prevent new entries while stream is down
-        self.risk_manager._circuit_breaker._tripped = True
-        self.risk_manager._circuit_breaker._trip_reason = "user_stream_disconnected"
-        self.risk_manager._circuit_breaker._trip_time = time.time()
+        self.risk_manager._circuit_breaker.trip("user_stream_disconnected")
 
     async def _handle_user_stream_connected(self, payload: Any) -> None:
         """User data stream reconnected — un-trip circuit breaker if it was tripped by disconnect."""
         logger.info("User data stream reconnected — resuming normal operation")
-        cb = self.risk_manager._circuit_breaker
-        if cb._tripped and cb._trip_reason == "user_stream_disconnected":
-            cb._tripped = False
-            cb._trip_reason = ""
+        if self.risk_manager._circuit_breaker.clear_if_reason("user_stream_disconnected"):
             logger.info("Circuit breaker reset after user stream reconnection")
 
     async def run(self) -> None:

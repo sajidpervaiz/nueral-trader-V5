@@ -9,7 +9,7 @@ from data_ingestion.normalizer import Tick, Candle
 
 
 MAX_AGE_SECONDS = 60
-MAX_PRICE_DEVIATION_PCT = 0.10
+MAX_PRICE_DEVIATION_PCT = 0.25  # 25% — crypto-appropriate for flash crashes
 MIN_VOLUME = 0.0
 
 
@@ -51,6 +51,9 @@ class TickValidator:
                     last,
                     tick.price,
                 )
+                # Still update last_price so next tick is measured from new level.
+                # Prevents permanent blindness after a large but legitimate move.
+                self._last_prices[key] = tick.price
                 return False
 
         self._last_prices[key] = tick.price

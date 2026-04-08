@@ -3,9 +3,11 @@ Model Trainer with optional LightGBM/XGBoost and portable fallbacks.
 """
 
 import time
-import pickle
 import itertools
 import importlib
+import hashlib
+import hmac
+import os
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
@@ -390,8 +392,8 @@ class ModelTrainer:
             if joblib is not None:
                 joblib.dump(model_data, filepath)
             else:
-                with open(filepath, "wb") as f:
-                    pickle.dump(model_data, f)
+                logger.error("joblib not installed — refusing to save with pickle")
+                return False
             return True
         except Exception as e:
             logger.error(f"Error saving model: {e}")
@@ -399,11 +401,26 @@ class ModelTrainer:
 
     def load_model(self, filepath: str, model_id: str) -> bool:
         try:
-            if joblib is not None:
-                data = joblib.load(filepath)
-            else:
+            if joblib is None:
+                logger.error("joblib not installed — refusing to load model with pickle")
+                return False
+            # Verify file integrity before loading
+            expected_digest = os.getenv("ML_MODEL_SHA256", "").strip()
+            if expected_digest:
                 with open(filepath, "rb") as f:
-                    data = pickle.load(f)
+                    file_hash = hashlib.sha256(f.read()).hexdigest()
+                if not hmac.compare_digest(file_hash, expected_digest):
+                    logger.critical(
+                        "Model file integrity check FAILED — refusing to load {}",
+                        filepath,
+                    )
+                    return False
+                logger.info("Model file SHA-256 verified for {}", filepath)
+            else:
+                logger.warning(
+                    "ML_MODEL_SHA256 env var not set — model integrity not verified.",
+                )
+            data = joblib.load(filepath)
             trained = TrainedModel(
                 model_type=data["model_type"],
                 model=data["model"],
