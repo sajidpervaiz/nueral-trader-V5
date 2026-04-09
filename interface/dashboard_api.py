@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import re
 import time
 from collections import defaultdict, deque
 from typing import Any
@@ -87,6 +89,21 @@ def _log_sink(message: Any) -> None:
 # Place this after build_app is defined
 # (MUST be after the build_app function definition)
 
+# ── Input validation for query parameters ─────────────────────────────────
+_VALID_SYMBOL = re.compile(r"^[A-Za-z0-9]{1,20}(/[A-Za-z0-9]{1,10})?(:[A-Za-z0-9]{1,10})?$")
+_VALID_TIMEFRAME = re.compile(r"^[1-9][0-9]?[smhdwM]$")
+
+def _validate_symbol(symbol: str) -> str:
+    """Validate symbol format; raise ValueError on bad input."""
+    if not _VALID_SYMBOL.match(symbol):
+        raise ValueError(f"Invalid symbol format: {symbol!r}")
+    return symbol
+
+def _validate_timeframe(timeframe: str) -> str:
+    """Validate timeframe format; raise ValueError on bad input."""
+    if not _VALID_TIMEFRAME.match(timeframe):
+        raise ValueError(f"Invalid timeframe format: {timeframe!r}")
+    return timeframe
 
 
 def build_app(
@@ -104,6 +121,8 @@ def build_app(
     sentiment_manager: Any = None,
     dex_feed: Any = None,
     executors: list[Any] | None = None,
+    user_stream: Any = None,
+    reconciliation_result: Any = None,
 ) -> Any:
     if not _FASTAPI:
         return None
@@ -173,7 +192,7 @@ def build_app(
                     auth_header = request.headers.get("authorization", "")
                     if auth_header.lower().startswith("bearer "):
                         provided = auth_header[7:].strip()
-                if provided != api_key:
+                if not hmac.compare_digest(provided, api_key):
                     return JSONResponse(status_code=401, content={"detail": "unauthorized"})
             elif require_api_key and not api_key:
                 return JSONResponse(status_code=503, content={"detail": "api_auth_misconfigured"})
@@ -241,11 +260,68 @@ def build_app(
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "status": "ok",
             "paper_mode": config.paper_mode,
             "timestamp": int(time.time()),
+            "uptime_seconds": int(time.time()) - app.state.started_at,
         }
+
+        # Risk snapshot
+        if risk_manager is not None:
+            try:
+                rm = risk_manager
+                result["risk"] = {
+                    "equity": getattr(rm, "equity", 0.0),
+                    "open_positions": len(getattr(rm, "positions", {})),
+                    "circuit_breaker_active": getattr(rm, "circuit_breaker_active", False),
+                    "kill_switch": getattr(rm, "kill_switch", False),
+                    "daily_loss": getattr(rm, "daily_loss", 0.0),
+                }
+            except Exception:
+                result["risk"] = {"error": "unavailable"}
+
+        # Safe mode
+        try:
+            from core.safe_mode import SafeModeManager
+            sm = getattr(risk_manager, "safe_mode", None) if risk_manager else None
+            if sm is not None and isinstance(sm, SafeModeManager):
+                status = sm.get_status()
+                result["safe_mode"] = {
+                    "active": status.get("safe_mode_active", False),
+                    "reasons": [r["reason"] for r in status.get("active_reasons", [])],
+                }
+        except Exception:
+            pass
+
+        # Alert manager
+        try:
+            from monitoring.alert_manager import AlertManager
+            am = getattr(app.state, "alert_manager", None)
+            if am is not None and isinstance(am, AlertManager):
+                result["alerts"] = am.get_status()
+        except Exception:
+            pass
+
+        # Component health (if a HealthChecker is attached)
+        try:
+            from monitoring.health_checks import HealthChecker
+            hc = getattr(app.state, "health_checker", None)
+            if hc is not None and isinstance(hc, HealthChecker):
+                hcr = await hc.check_all_components()
+                result["status"] = hcr.overall_status.value.lower()
+                result["components"] = {
+                    name: {
+                        "status": comp.status.value,
+                        "latency_ms": round(comp.latency_ms, 1),
+                        "message": comp.message,
+                    }
+                    for name, comp in hcr.components.items()
+                }
+        except Exception:
+            pass
+
+        return result
 
     @app.get("/positions")
     async def get_positions() -> dict[str, Any]:
@@ -545,6 +621,11 @@ def build_app(
         timeframe: str = Query("1m"),
     ) -> dict[str, Any]:
         import time as _time
+        try:
+            symbol = _validate_symbol(symbol)
+            timeframe = _validate_timeframe(timeframe)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
 
         # Build all symbol variants to try
         clean_sym = symbol.replace("/", "").replace(":USDT", "").upper()
@@ -733,7 +814,11 @@ def build_app(
         symbol: str = Query("BTC/USDT"),
         depth: int = Query(8),
     ) -> dict[str, Any]:
-        depth = int(depth)
+        try:
+            symbol = _validate_symbol(symbol)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        depth = max(1, min(depth, 50))
         # Check event-bus cache first
         for key, cached in _orderbook_cache.items():
             if symbol.replace("/", "") in key.replace("/", "").replace(":", ""):
@@ -808,9 +893,15 @@ def build_app(
             "volume_ratio": 1.0,
         }
 
-    # ── /api/dex/pools — DEX liquidity pools ──────────────────────────────
+    # ── /api/dex/pools — DEX liquidity pools (cached with backoff) ──────
+    _dex_cache: dict[str, Any] = {"data": {"pools": []}, "ts": 0.0, "fail_until": 0.0}
+
     @app.get("/api/dex/pools")
     async def api_dex_pools() -> dict[str, Any]:
+        now = time.time()
+        # Return cached data if fresh (60s) or in backoff window after failure
+        if now - _dex_cache["ts"] < 60 or now < _dex_cache["fail_until"]:
+            return _dex_cache["data"]
         try:
             import aiohttp
             query = '{ pools(first: 5, orderBy: totalValueLockedUSD, orderDirection: desc, where: { feeTier_in: [500, 3000] }) { token0 { symbol } token1 { symbol } totalValueLockedUSD } }'
@@ -823,7 +914,7 @@ def build_app(
                     if resp.status == 200:
                         data = await resp.json(content_type=None)
                         pools = data.get("data", {}).get("pools", [])
-                        return {
+                        result = {
                             "pools": [
                                 {
                                     "pair": f"{p['token0']['symbol']}/{p['token1']['symbol']}",
@@ -832,9 +923,15 @@ def build_app(
                                 for p in pools
                             ]
                         }
+                        _dex_cache["data"] = result
+                        _dex_cache["ts"] = now
+                        _dex_cache["fail_until"] = 0.0
+                        return result
         except Exception as exc:
             logger.debug("DEX pools fetch error: {}", exc)
-        return {"pools": []}
+        # On failure: backoff 120s before retrying
+        _dex_cache["fail_until"] = now + 120
+        return _dex_cache["data"]
 
     # ── /api/news — live news feed ────────────────────────────────────────
     @app.get("/api/news")
@@ -901,6 +998,44 @@ def build_app(
             "logs": {"source": "loguru_ringbuffer"},
             "auto": {"source": "signal_generator" if signal_generator else "unavailable"},
             "signals": {"source": "6_factor_composite" if signal_generator else "unavailable"},
+        }
+
+    # ── /api/reconciliation/status — startup reconciliation state ─────────
+    @app.get("/api/reconciliation/status")
+    async def api_reconciliation_status() -> dict[str, Any]:
+        if reconciliation_result is None:
+            return {"available": False, "safe_mode": False}
+        return {
+            "available": True,
+            "reconciliation_id": getattr(reconciliation_result, "reconciliation_id", ""),
+            "success": bool(reconciliation_result.success),
+            "safe_mode": bool(reconciliation_result.safe_mode),
+            "exchange_positions": len(reconciliation_result.exchange_positions),
+            "db_positions": len(getattr(reconciliation_result, "db_positions", [])),
+            "open_orders": len(reconciliation_result.exchange_open_orders),
+            "mismatches": list(reconciliation_result.mismatches),
+            "positions_without_sl": list(reconciliation_result.positions_without_sl),
+            "actions_taken": list(reconciliation_result.actions_taken),
+            "balance": reconciliation_result.balance,
+            "leverage_settings": getattr(reconciliation_result, "leverage_settings", {}),
+        }
+
+    # ── /api/user-stream/status — user data stream health ─────────────────
+    @app.get("/api/user-stream/status")
+    async def api_user_stream_status() -> dict[str, Any]:
+        if user_stream is None:
+            return {"available": False, "connected": False}
+        metrics = getattr(user_stream, "metrics", {})
+        return {
+            "available": True,
+            "connected": bool(getattr(user_stream, "connected", False)),
+            "disconnect_duration": float(getattr(user_stream, "disconnect_duration", 0.0)),
+            "fills_processed": int(metrics.get("fills_processed", 0)),
+            "fills_deduped": int(metrics.get("fills_deduped", 0)),
+            "state_transitions": int(metrics.get("state_transitions", 0)),
+            "invalid_transitions": int(metrics.get("invalid_transitions", 0)),
+            "reconnects": int(metrics.get("reconnects", 0)),
+            "messages_received": int(metrics.get("messages_received", 0)),
         }
 
     # ── /api/backtest/summary — backtest metrics ──────────────────────────
@@ -1063,6 +1198,15 @@ def build_app(
                 "trailing_mode": body.get("trailing_mode", "none"),
                 "auto_sl_tp": bool(body.get("auto_sl_tp", False)),
             }
+        # Start/stop paper feed when auto trading is toggled in paper mode
+        if config.paper_mode:
+            try:
+                if enabled:
+                    await start_paper_feed()
+                else:
+                    await stop_paper_feed()
+            except Exception as exc:
+                logger.warning("Paper feed toggle error: {}", exc)
         return {"success": True, "auto_trading_enabled": enabled, "mode": "paper" if config.paper_mode else "live"}
 
     # ── /api/auto/status — auto-trading status ────────────────────────────
@@ -1117,7 +1261,27 @@ def build_app(
                     "size": o.cumulative_quantity or o.quantity,
                     "pnl": float(o.metadata.get("pnl", 0)),
                 })
+        # Include paper trades from standalone paper executor
+        if _FASTAPI and '_paper_trades' in globals():
+            for pt in _paper_trades[-50:]:
+                trades.append({
+                    "time": pt.get("timestamp", 0) * 1000,
+                    "symbol": pt.get("symbol", ""),
+                    "side": pt.get("direction", ""),
+                    "price": pt.get("price", 0),
+                    "size": pt.get("quantity", 0),
+                    "pnl": 0,
+                    "paper": True,
+                    "score": pt.get("score", 0),
+                })
         return {"trades": trades}
+
+    # ── /api/paper/trades — paper trade log ───────────────────────────────
+    @app.get("/api/paper/trades")
+    async def api_paper_trades() -> dict[str, Any]:
+        if _FASTAPI and '_paper_trades' in globals():
+            return {"trades": list(_paper_trades[-100:]), "count": len(_paper_trades)}
+        return {"trades": [], "count": 0}
 
     # ── /api/config — GET config for settings modal ───────────────────────
     @app.get("/api/config")
@@ -1237,6 +1401,11 @@ def build_app(
         symbol: str = Query("BTC/USDT"),
         timeframe: str = Query("1m"),
     ) -> dict[str, Any]:
+        try:
+            symbol = _validate_symbol(symbol)
+            timeframe = _validate_timeframe(timeframe)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
         # Assemble a full snapshot from all data sources
         status = (await api_status())
         fg = (await api_feargreed())
@@ -1248,6 +1417,8 @@ def build_app(
         candles = (await api_candles(symbol=symbol, timeframe=timeframe))
         market = (await api_market(per_page=20))
         dex = (await api_dex_pools())
+        recon = (await api_reconciliation_status())
+        ustream = (await api_user_stream_status())
         return {
             "status": status,
             "feargreed": fg,
@@ -1258,6 +1429,8 @@ def build_app(
             "candles": candles,
             "market": market,
             "dex": dex,
+            "reconciliation": recon,
+            "user_stream": ustream,
         }
 
     # ── /api/realtime/stream — SSE streaming ──────────────────────────────
@@ -1267,6 +1440,12 @@ def build_app(
         symbol: str = Query("BTC/USDT"),
         timeframe: str = Query("1m"),
     ):
+        try:
+            symbol = _validate_symbol(symbol)
+            timeframe = _validate_timeframe(timeframe)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+
         async def _event_generator():
             while True:
                 if await request.is_disconnected():
@@ -1300,35 +1479,172 @@ def build_app(
 
 # Top-level FastAPI app for uvicorn import
 def _build_standalone_managers():
-    """Create lightweight OrderManager + RiskManager for standalone dashboard."""
+    """Create lightweight managers + paper trading stack for standalone dashboard."""
     cfg = _default_config()
-    bus = _default_event_bus()
+    # Use real EventBus so CANDLE → SignalGenerator → SIGNAL pipeline works
+    from core.event_bus import EventBus as RealEventBus
+    bus = RealEventBus()
     om = None
     rm = None
+    sg = None
+    dm = None
     try:
         from core.circuit_breaker import CircuitBreaker
         from execution.order_manager import OrderManager
         from execution.risk_manager import RiskManager
+        from analysis.data_manager import DataManager
+        from engine.signal_generator import SignalGenerator
         cb = CircuitBreaker()
         om = OrderManager(config=cfg, event_bus=bus, circuit_breaker=cb)
         rm = RiskManager(config=cfg, event_bus=bus)
-    except Exception:
-        pass
-    return cfg, bus, om, rm
+        dm = DataManager(config=cfg, event_bus=bus)
+        sg = SignalGenerator(config=cfg, event_bus=bus, data_manager=dm)
+        sg.set_auto_trading(False)
+        # Paper mode: lower thresholds so signals can fire with limited data feeds
+        if cfg.paper_mode:
+            sg._min_factors = 1
+            sg._min_score = 0.03  # Low threshold — only tech+ML active, allow weak signals
+            # Redistribute weights: boost tech+ML since sentiment/macro/news/orderbook are 0
+            sg._tech_weight = 0.50
+            sg._ml_weight = 0.40
+            sg._sentiment_weight = 0.02
+            sg._macro_weight = 0.02
+            sg._news_weight = 0.04
+            sg._orderbook_weight = 0.02
+            # Disable HTF confirmation — too restrictive with limited seeded data
+            sg._confirmation_tfs = []
+            sg._min_signal_interval = 30  # Allow faster signals in paper mode
+    except Exception as exc:
+        logger.warning("Standalone manager init partial: {}", exc)
+    return cfg, bus, om, rm, sg, dm
 
 if _FASTAPI:
-    _sa_cfg, _sa_bus, _sa_om, _sa_rm = _build_standalone_managers()
+    _sa_cfg, _sa_bus, _sa_om, _sa_rm, _sa_sg, _sa_dm = _build_standalone_managers()
     # Attach loguru sink for /api/logs/recent
     logger.add(_log_sink, level="DEBUG", format="{message}")
+
+    # Start DataManager + SignalGenerator event subscriptions
+    async def _start_paper_stack():
+        """Start paper trading components in background."""
+        try:
+            if _sa_dm is not None:
+                await _sa_dm.run()
+            if _sa_sg is not None:
+                await _sa_sg.run()
+        except Exception as exc:
+            logger.error("Paper stack startup error: {}", exc)
+
+    # Paper feed management
+    _paper_feed_task = None
+    _paper_stack_task = None
+    _paper_sg_task = None
+    _paper_bus_task = None
+    _paper_exec_task = None
+    _paper_trades: list[dict] = []
+
+    async def _ensure_paper_stack():
+        """Ensure EventBus, DataManager and SignalGenerator are running (idempotent)."""
+        global _paper_stack_task, _paper_sg_task, _paper_bus_task, _paper_exec_task
+        # EventBus must be running to dispatch events
+        if _paper_bus_task is None and _sa_bus is not None:
+            async def _run_bus():
+                try:
+                    await _sa_bus.run()
+                except Exception as exc:
+                    logger.error("EventBus run error: {}", exc)
+            _paper_bus_task = asyncio.create_task(_run_bus())
+        if _paper_stack_task is None and _sa_dm is not None:
+            async def _run_dm():
+                try:
+                    await _sa_dm.run()
+                except Exception as exc:
+                    logger.error("DataManager run error: {}", exc)
+            _paper_stack_task = asyncio.create_task(_run_dm())
+        if _paper_sg_task is None and _sa_sg is not None:
+            async def _run_sg():
+                try:
+                    await _sa_sg.run()
+                except Exception as exc:
+                    logger.error("SignalGenerator run error: {}", exc)
+            _paper_sg_task = asyncio.create_task(_run_sg())
+        # Paper executor: subscribe to SIGNAL events and log paper trades
+        if _paper_exec_task is None and _sa_bus is not None:
+            async def _handle_signal(signal):
+                """Paper executor: simulates trade execution for signals."""
+                import time as _time
+                trade_id = f"paper_{int(_time.time()*1000)}"
+                direction = getattr(signal, 'direction', 'unknown')
+                symbol = getattr(signal, 'symbol', '??')
+                price = getattr(signal, 'price', 0)
+                score = getattr(signal, 'score', 0)
+                sl = getattr(signal, 'stop_loss', 0)
+                tp = getattr(signal, 'take_profit', 0)
+                # Calculate position size (risk-based from config)
+                equity = 100000.0
+                risk_pct = 0.02
+                size_usd = equity * risk_pct
+                qty = size_usd / price if price > 0 else 0
+                paper_trade = {
+                    "id": trade_id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "price": price,
+                    "quantity": round(qty, 6),
+                    "notional": round(size_usd, 2),
+                    "score": round(score, 3),
+                    "stop_loss": round(sl, 2),
+                    "take_profit": round(tp, 2),
+                    "status": "FILLED",
+                    "timestamp": int(_time.time()),
+                    "reasons": getattr(signal, 'reasons', []),
+                }
+                _paper_trades.append(paper_trade)
+                logger.info(
+                    "📄 PAPER TRADE: {} {} {:.6f} @ ${:.2f} (score={:.2f}, sl={:.2f}, tp={:.2f}) [{}]",
+                    direction.upper(), symbol, qty, price, score, sl, tp, trade_id,
+                )
+                await _sa_bus.publish("ORDER_FILLED", paper_trade)
+            _sa_bus.subscribe("SIGNAL", _handle_signal)
+            _paper_exec_task = True  # sentinel — handler is registered, not a task
+            logger.info("Paper executor subscribed to SIGNAL events")
+
+    async def start_paper_feed():
+        """Start PaperFeed to emit CANDLE events from Binance public API."""
+        global _paper_feed_task
+        if _paper_feed_task is not None:
+            return  # already running
+        try:
+            from data_ingestion.paper_feed import PaperFeed
+            await _ensure_paper_stack()
+            symbols_cfg = _sa_cfg.get_value("exchanges", "binance", "symbols") or ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+            feed = PaperFeed(
+                event_bus=_sa_bus,
+                symbols=symbols_cfg,
+                timeframes=["1m", "15m", "1h", "4h"],
+                poll_interval=30.0,
+            )
+            _paper_feed_task = asyncio.create_task(feed.run())
+            logger.info("Paper feed started for auto-trading")
+        except Exception as exc:
+            logger.error("Failed to start paper feed: {}", exc)
+
+    async def stop_paper_feed():
+        """Stop PaperFeed."""
+        global _paper_feed_task
+        if _paper_feed_task is not None:
+            _paper_feed_task.cancel()
+            _paper_feed_task = None
+            logger.info("Paper feed stopped")
+
     app = build_app(
         config=_sa_cfg,
         event_bus=_sa_bus,
         risk_manager=_sa_rm,
-        data_manager=None,
+        data_manager=_sa_dm,
         order_manager=_sa_om,
         db_handler=None,
         cache=None,
-        signal_generator=None,
+        signal_generator=_sa_sg,
         news_feed=None,
         orderbook_feed=None,
         sentiment_manager=None,

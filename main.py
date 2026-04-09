@@ -45,6 +45,9 @@ from execution.reconciliation import StartupReconciler
 from storage.db_handler import DBHandler
 from storage.cache import Cache
 from storage.trade_persistence import TradePersistence
+from storage.audit_repository import AuditRepository
+from storage.audit_event_persistence import AuditEventPersistence
+from storage.state_recovery import StateRecovery
 
 from monitoring.metrics import Metrics
 
@@ -100,11 +103,27 @@ async def main() -> None:
 
     # ── Trade persistence (production audit trail) ────────────────────────
     trade_persistence: TradePersistence | None = None
+    audit_repo: AuditRepository | None = None
     if db.available:
         trade_persistence = TradePersistence(db._pool, event_bus, is_paper=config.paper_mode)
         await trade_persistence.migrate()
         trade_persistence.subscribe_events()
-        logger.info("Trade persistence layer initialized")
+
+        # Audit repository + event wiring (signals, risk, user stream, recon, errors)
+        audit_repo = AuditRepository(db._pool)
+        audit_events = AuditEventPersistence(audit_repo, event_bus)
+        audit_events.subscribe_all()
+
+        # DB state recovery — rebuild OrderManager state from DB
+        recovery = StateRecovery(audit_repo)
+        recovery_result = await recovery.recover()
+        if recovery_result.safe_mode:
+            logger.warning("Recovery detected safe_mode from last reconciliation")
+
+        logger.info(
+            "Audit trail initialized — recovered {} orders, {} positions",
+            recovery_result.orders_recovered, recovery_result.positions_recovered,
+        )
 
     ws_manager = CEXWebSocketManager(config, event_bus)
     dex_feed = DEXRPCFeed(config, event_bus)
@@ -138,6 +157,7 @@ async def main() -> None:
     user_stream = UserDataStream(config, event_bus)
 
     # ── Pre-trade validation (live mode only) ─────────────────────────────
+    recon_result = None
     if not config.paper_mode:
         binance_executor = by_exchange.get("binance")
         client = getattr(binance_executor, "_client", None) if binance_executor else None
@@ -147,11 +167,14 @@ async def main() -> None:
             await binance_executor._init_client()
             client = getattr(binance_executor, "_client", None)
 
-        # Step 1: Startup validation (API keys, balance, clock, permissions)
+        # Step 1: Startup validation (API keys, balance, clock, permissions,
+        #         leverage, margin mode, symbol specs, order feasibility)
         try:
             validator = StartupValidator(config, client=client)
             validation_result = await validator.validate_all()
             logger.info("Startup validation: {}", validation_result.get("checks", {}))
+            for w in validation_result.get("warnings", []):
+                logger.warning("Startup warning: {}", w)
         except ValidationError as exc:
             logger.critical("STARTUP VALIDATION FAILED: {}", exc)
             logger.critical("Bot cannot start in live mode. Fix the issue and restart.")
@@ -166,6 +189,8 @@ async def main() -> None:
                 risk_manager=risk_mgr,
                 client=client,
                 order_placer=order_placer,
+                trade_persistence=trade_persistence,
+                order_manager=order_mgr,
             )
             recon_result = await reconciler.reconcile()
             if recon_result.safe_mode:
@@ -182,6 +207,8 @@ async def main() -> None:
         sentiment_manager=sentiment,
         dex_feed=dex_feed,
         executors=executors,
+        user_stream=user_stream,
+        reconciliation_result=recon_result,
     )
 
     # Re-add the dashboard log sink (logger.remove() in _setup_logging wipes it)
@@ -209,6 +236,39 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _signal_handler)
 
+    # ── ARMS-V2.1: Periodic risk tasks ────────────────────────────────────
+    async def _periodic_liq_check(rm: RiskManager, stop_ev: asyncio.Event) -> None:
+        """Run liquidation distance check every 60s."""
+        while not stop_ev.is_set():
+            try:
+                actions = rm.run_periodic_liq_check()
+                for action in actions:
+                    logger.warning("Liq check action: {}", action)
+                    await event_bus.publish("LIQ_CHECK_ACTION", action)
+            except Exception as exc:
+                logger.error("Periodic liq check failed: {}", exc)
+            try:
+                await asyncio.wait_for(stop_ev.wait(), timeout=60.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    async def _periodic_funding_check(rm: RiskManager, stop_ev: asyncio.Event) -> None:
+        """Run funding re-check for existing positions every 8h."""
+        while not stop_ev.is_set():
+            try:
+                actions = rm.check_funding_existing_positions()
+                for action in actions:
+                    logger.warning("Funding recheck action: {}", action)
+                    await event_bus.publish("FUNDING_RECHECK_ACTION", action)
+            except Exception as exc:
+                logger.error("Periodic funding check failed: {}", exc)
+            try:
+                await asyncio.wait_for(stop_ev.wait(), timeout=8 * 3600.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+
     tasks = [
         asyncio.create_task(dispatcher.start(), name="dispatcher"),
         asyncio.create_task(ws_manager.run(), name="cex_ws"),
@@ -222,6 +282,8 @@ async def main() -> None:
         asyncio.create_task(telegram.run(), name="telegram"),
         asyncio.create_task(order_mgr.run(), name="order_manager"),
         asyncio.create_task(user_stream.run(), name="user_data_stream"),
+        asyncio.create_task(_periodic_liq_check(risk_mgr, stop_event), name="liq_check"),
+        asyncio.create_task(_periodic_funding_check(risk_mgr, stop_event), name="funding_recheck"),
     ]
 
     for executor in executors:

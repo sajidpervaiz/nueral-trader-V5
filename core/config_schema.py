@@ -44,6 +44,7 @@ class RiskConfig(BaseModel):
     take_profit_pct: float = Field(0.03, ge=0.001, le=1.0)
     kelly_fraction: float = Field(0.25, ge=0.0, le=1.0)
     min_liquidity_usd: float = Field(100_000, ge=0)
+    min_balance_usd: float = Field(100, ge=0)
     initial_equity: float = Field(100_000, gt=0)
     sizing_method: str = "risk_based"
     risk_per_trade_pct: float = Field(0.01, ge=0.001, le=0.1)
@@ -79,6 +80,28 @@ class RiskConfig(BaseModel):
         if v not in allowed:
             raise ValueError(f"sizing_method must be one of {allowed}")
         return v
+
+    @model_validator(mode="after")
+    def _risk_coherence(self) -> "RiskConfig":
+        # stop_loss must be smaller than take_profit
+        if self.stop_loss_pct >= self.take_profit_pct:
+            raise ValueError(
+                f"stop_loss_pct ({self.stop_loss_pct}) must be < "
+                f"take_profit_pct ({self.take_profit_pct})"
+            )
+        # max_drawdown must be larger than daily loss limit
+        if self.max_drawdown_pct < self.max_daily_loss_pct:
+            raise ValueError(
+                f"max_drawdown_pct ({self.max_drawdown_pct}) must be >= "
+                f"max_daily_loss_pct ({self.max_daily_loss_pct})"
+            )
+        # Per-symbol leverage caps must not exceed default_leverage * 2 as sanity
+        for sym, lev in self.max_leverage_per_symbol.items():
+            if lev <= 0:
+                raise ValueError(f"leverage for {sym} must be > 0, got {lev}")
+            if lev > 125:
+                raise ValueError(f"leverage for {sym} ({lev}) exceeds exchange max (125)")
+        return self
 
 
 class SignalsConfig(BaseModel):
@@ -173,7 +196,7 @@ class AppConfig(BaseModel):
     @model_validator(mode="after")
     def _safety_checks(self) -> "AppConfig":
         if not self.system.paper_mode:
-            # Require testnet or explicit live confirmation
+            # Live mode: require API keys for all enabled exchanges
             for name, exc in self.exchanges.items():
                 if exc.enabled and not exc.testnet:
                     if not exc.api_key:
@@ -181,6 +204,22 @@ class AppConfig(BaseModel):
                             f"Exchange '{name}' is live (testnet=false) but has no API key. "
                             "Set paper_mode=true or provide credentials."
                         )
+                if exc.enabled:
+                    if not exc.symbols:
+                        raise ValueError(
+                            f"Exchange '{name}' is enabled but has no symbols configured."
+                        )
+            # Live mode: enforce non-zero min_balance
+            if self.risk.min_balance_usd <= 0:
+                raise ValueError(
+                    "risk.min_balance_usd must be > 0 in live mode"
+                )
+            # Live mode: leverage sanity
+            if self.risk.default_leverage > 20:
+                raise ValueError(
+                    f"risk.default_leverage ({self.risk.default_leverage}) > 20 is "
+                    "too dangerous for live trading. Reduce leverage."
+                )
         return self
 
 

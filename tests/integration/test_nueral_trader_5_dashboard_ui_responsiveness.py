@@ -148,7 +148,7 @@ def test_dashboard_root_serves_ui_html(ui_client: TestClient) -> None:
     resp = ui_client.get("/")
     assert resp.status_code == 200
     body = resp.text
-    assert "toggleTradingMode()" in body
+    assert "toggleAuto()" in body
     assert "executeTrade('BUY')" in body
     assert "/api/realtime/stream" in body
 

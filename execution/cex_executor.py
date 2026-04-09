@@ -10,6 +10,7 @@ from loguru import logger
 
 from core.config import Config
 from core.event_bus import EventBus
+from core.safe_mode import SafeModeReason
 from engine.signal_generator import TradingSignal
 from execution.order_manager import OrderManager
 from execution.rate_limiter import RateLimiter
@@ -71,7 +72,6 @@ class CEXExecutor:
             params["password"] = passphrase
         if cfg.get("testnet"):
             params["options"] = {"defaultType": cfg.get("type", "future")}
-            params["urls"] = {"api": params.get("urls", {}).get("test", {})}
         try:
             self._client = cls(params)
             if cfg.get("testnet"):
@@ -499,12 +499,18 @@ class CEXExecutor:
         logger.critical("User data stream LOST — entering safety mode, blocking new trades")
         # Trip the circuit breaker to prevent new entries while stream is down
         self.risk_manager._circuit_breaker.trip("user_stream_disconnected")
+        # Activate safe mode
+        self.risk_manager.safe_mode.activate(
+            SafeModeReason.USER_STREAM_LOST,
+            detail=f"exchange={self.exchange_id}",
+        )
 
     async def _handle_user_stream_connected(self, payload: Any) -> None:
         """User data stream reconnected — un-trip circuit breaker if it was tripped by disconnect."""
         logger.info("User data stream reconnected — resuming normal operation")
         if self.risk_manager._circuit_breaker.clear_if_reason("user_stream_disconnected"):
             logger.info("Circuit breaker reset after user stream reconnection")
+        self.risk_manager.safe_mode.deactivate(SafeModeReason.USER_STREAM_LOST)
 
     async def run(self) -> None:
         self._running = True

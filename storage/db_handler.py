@@ -171,7 +171,7 @@ class DBHandler:
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     "INSERT INTO ticks(time, exchange, symbol, price, volume, side) VALUES($1, $2, $3, $4, $5, $6)",
-                    datetime.datetime.utcnow(), exchange, symbol, price, volume, side,
+                    datetime.datetime.now(datetime.UTC), exchange, symbol, price, volume, side,
                 )
         except Exception as exc:
             logger.debug("insert_tick error: {}", exc)
@@ -186,7 +186,7 @@ class DBHandler:
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     "INSERT INTO funding_rates(time, exchange, symbol, funding_rate, predicted_rate) VALUES($1,$2,$3,$4,$5)",
-                    datetime.datetime.utcnow(), exchange, symbol, rate, predicted,
+                    datetime.datetime.now(datetime.UTC), exchange, symbol, rate, predicted,
                 )
         except Exception as exc:
             logger.debug("insert_funding_rate error: {}", exc)
@@ -201,7 +201,7 @@ class DBHandler:
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     "INSERT INTO open_interest(time, exchange, symbol, oi_usd, oi_contracts, oi_change_24h) VALUES($1,$2,$3,$4,$5,$6)",
-                    datetime.datetime.utcnow(), exchange, symbol, oi_usd, oi_contracts, oi_change,
+                    datetime.datetime.now(datetime.UTC), exchange, symbol, oi_usd, oi_contracts, oi_change,
                 )
         except Exception as exc:
             logger.debug("insert_open_interest error: {}", exc)

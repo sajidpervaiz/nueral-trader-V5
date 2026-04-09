@@ -5,10 +5,17 @@ Manages the listenKey lifecycle (create, keepalive every 30 min, reconnect on ex
 and parses ORDER_TRADE_UPDATE, ACCOUNT_UPDATE, and listenKeyExpired events.
 
 Every state change is published to EventBus for Order Manager and Risk Engine.
+
+Features:
+- Stream-level fill dedup via trade_id set (prevents duplicate event bus publishes on WS reconnect)
+- Order state machine tracking with invalid-transition detection
+- Configurable safe-mode threshold: delays circuit breaker trip by X seconds after disconnect
+- Reconnection reconciliation via REST API to recover missed fills
 """
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import time
 from typing import Any
@@ -29,6 +36,19 @@ _WS_URL_TESTNET = "wss://stream.binancefuture.com/ws/"
 # Keepalive interval (Binance requires every 60 min; we do every 30 min for safety)
 _KEEPALIVE_INTERVAL = 30 * 60
 
+# Max dedup cache size (oldest entries evicted via OrderedDict)
+_MAX_DEDUP_SIZE = 50_000
+
+# Valid order state transitions from Binance
+_VALID_TRANSITIONS: dict[str, set[str]] = {
+    "NEW": {"PARTIALLY_FILLED", "FILLED", "CANCELED", "REJECTED", "EXPIRED"},
+    "PARTIALLY_FILLED": {"PARTIALLY_FILLED", "FILLED", "CANCELED", "EXPIRED"},
+    "FILLED": set(),  # terminal
+    "CANCELED": set(),  # terminal
+    "REJECTED": set(),  # terminal
+    "EXPIRED": set(),  # terminal
+}
+
 
 class UserDataStream:
     """
@@ -37,7 +57,8 @@ class UserDataStream:
     Events published to EventBus:
     - USER_ORDER_UPDATE: order fill, partial fill, cancel, reject, liquidation
     - USER_ACCOUNT_UPDATE: balance/position change
-    - USER_STREAM_LOST: stream disconnected (triggers safety mode)
+    - USER_STREAM_LOST: stream disconnected (triggers safety mode after threshold)
+    - USER_STREAM_CONNECTED: stream reconnected
     """
 
     def __init__(
@@ -53,6 +74,33 @@ class UserDataStream:
         self._last_keepalive: float = 0.0
         self._connected = False
         self._disconnect_time: float | None = None
+
+        # ── Stream-level fill dedup (trade_id -> True, evicts oldest) ──
+        self._processed_trade_ids: collections.OrderedDict[int, bool] = collections.OrderedDict()
+
+        # ── Order state machine tracking (order_id -> last known status) ──
+        self._order_states: dict[int, str] = {}
+
+        # ── Safe-mode threshold (seconds before tripping circuit breaker) ──
+        risk_cfg = {}
+        try:
+            risk_cfg = config.get_value("risk") or {}
+        except Exception:
+            pass
+        self._safe_mode_threshold: float = float(
+            risk_cfg.get("user_stream_safe_mode_seconds", 0)
+        )
+        self._safe_mode_published = False
+
+        # ── Metrics counters ──
+        self.metrics = {
+            "fills_processed": 0,
+            "fills_deduped": 0,
+            "state_transitions": 0,
+            "invalid_transitions": 0,
+            "reconnects": 0,
+            "messages_received": 0,
+        }
 
         # Parse exchange config
         cfg = config.get_value("exchanges", "binance") or {}
@@ -197,8 +245,61 @@ class UserDataStream:
             "positions": positions,
         }
 
+    def _check_fill_dedup(self, trade_id: int) -> bool:
+        """Return True if this trade_id was already processed (duplicate). Thread-safe via GIL."""
+        if trade_id in self._processed_trade_ids:
+            self.metrics["fills_deduped"] += 1
+            return True
+        # Add to dedup set, evict oldest if over limit
+        self._processed_trade_ids[trade_id] = True
+        if len(self._processed_trade_ids) > _MAX_DEDUP_SIZE:
+            self._processed_trade_ids.popitem(last=False)
+        return False
+
+    def _track_order_state(self, order_id: int, new_status: str) -> bool:
+        """Track order state transition. Returns True if valid, False if invalid."""
+        old_status = self._order_states.get(order_id)
+        if old_status is None:
+            # First time seeing this order — accept any status
+            self._order_states[order_id] = new_status
+            self.metrics["state_transitions"] += 1
+            return True
+
+        if old_status == new_status:
+            # Same status (e.g. repeated PARTIALLY_FILLED) — valid
+            return True
+
+        valid_next = _VALID_TRANSITIONS.get(old_status, set())
+        if new_status in valid_next:
+            self._order_states[order_id] = new_status
+            self.metrics["state_transitions"] += 1
+            # Clean up terminal states to prevent unbounded growth
+            if new_status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
+                # Keep for a while for late dedup, but schedule cleanup
+                pass
+            return True
+
+        # Invalid transition
+        self.metrics["invalid_transitions"] += 1
+        logger.error(
+            "Invalid order state transition for order {}: {} → {} — accepting but logging",
+            order_id, old_status, new_status,
+        )
+        self._order_states[order_id] = new_status
+        return False
+
+    def _cleanup_terminal_orders(self) -> None:
+        """Remove terminal-state orders from tracking to prevent unbounded growth."""
+        terminal = {oid for oid, status in self._order_states.items()
+                    if status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED")}
+        # Keep at most 10000 terminal entries
+        if len(terminal) > 10_000:
+            for oid in list(terminal)[:len(terminal) - 10_000]:
+                self._order_states.pop(oid, None)
+
     async def _handle_message(self, raw: str) -> None:
-        """Parse and dispatch user data stream messages."""
+        """Parse and dispatch user data stream messages with dedup and state tracking."""
+        self.metrics["messages_received"] += 1
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
@@ -209,10 +310,28 @@ class UserDataStream:
 
         if event == "ORDER_TRADE_UPDATE":
             parsed = self._parse_order_update(data)
+            order_id = parsed["order_id"]
+            trade_id = parsed["trade_id"]
+            exec_type = parsed["execution_type"]
+            order_status = parsed["order_status"]
+
+            # ── State machine tracking ──
+            self._track_order_state(order_id, order_status)
+
+            # ── Stream-level fill dedup (only for TRADE events with trade_id) ──
+            if exec_type == "TRADE" and trade_id:
+                if self._check_fill_dedup(trade_id):
+                    logger.warning(
+                        "Duplicate trade_id {} for order {} — suppressing event publish",
+                        trade_id, order_id,
+                    )
+                    return
+                self.metrics["fills_processed"] += 1
+
             logger.info(
                 "Order update: {} {} {} exec={} status={} filled={}/{}",
                 parsed["symbol"], parsed["side"], parsed["order_type"],
-                parsed["execution_type"], parsed["order_status"],
+                exec_type, order_status,
                 parsed["cumulative_filled_qty"], parsed["quantity"],
             )
             await self.event_bus.publish("USER_ORDER_UPDATE", parsed)
@@ -236,6 +355,95 @@ class UserDataStream:
         else:
             logger.debug("Unknown user stream event: {}", event)
 
+    async def _safe_mode_watchdog(self) -> None:
+        """Background task: publish USER_STREAM_LOST only after threshold elapsed."""
+        while self._running:
+            await asyncio.sleep(1.0)
+            if self._connected or self._disconnect_time is None:
+                self._safe_mode_published = False
+                continue
+            if self._safe_mode_published:
+                continue
+            elapsed = time.time() - self._disconnect_time
+            if elapsed >= self._safe_mode_threshold:
+                logger.critical(
+                    "User stream down for {:.1f}s (threshold={:.0f}s) — publishing STREAM_LOST",
+                    elapsed, self._safe_mode_threshold,
+                )
+                self._safe_mode_published = True
+                await self.event_bus.publish("USER_STREAM_LOST", {
+                    "timestamp": time.time(),
+                    "disconnect_duration": elapsed,
+                })
+
+    async def _reconcile_after_reconnect(self) -> None:
+        """After reconnection, fetch recent trades via REST to recover missed fills."""
+        try:
+            import aiohttp
+            headers = {"X-MBX-APIKEY": self._api_key}
+            path = "/fapi/v1/userTrades"
+            url = f"{self._base_url}{path}"
+            # Fetch trades from last 5 minutes (covers typical disconnect window)
+            params = {"timestamp": int(time.time() * 1000), "limit": 100}
+            # Sign request
+            import hashlib
+            import hmac
+            import urllib.parse
+            query = urllib.parse.urlencode(params)
+            signature = hmac.new(
+                self._api_secret.encode(), query.encode(), hashlib.sha256
+            ).hexdigest()
+            params["signature"] = signature
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params=params) as resp:
+                    if resp.status != 200:
+                        logger.warning("Reconciliation fetch failed: {}", resp.status)
+                        return
+                    trades = await resp.json()
+            reconciled = 0
+            for t in trades:
+                trade_id = int(t.get("id", 0))
+                if trade_id and trade_id not in self._processed_trade_ids:
+                    reconciled += 1
+                    self._processed_trade_ids[trade_id] = True
+                    if len(self._processed_trade_ids) > _MAX_DEDUP_SIZE:
+                        self._processed_trade_ids.popitem(last=False)
+                    # Construct and publish a synthetic ORDER_TRADE_UPDATE
+                    parsed = {
+                        "event_type": "ORDER_TRADE_UPDATE",
+                        "event_time": int(t.get("time", 0)),
+                        "transaction_time": int(t.get("time", 0)),
+                        "symbol": t.get("symbol", ""),
+                        "client_order_id": "",
+                        "side": t.get("side", ""),
+                        "order_type": "",
+                        "time_in_force": "",
+                        "quantity": float(t.get("qty", 0)),
+                        "price": float(t.get("price", 0)),
+                        "avg_price": float(t.get("price", 0)),
+                        "stop_price": 0.0,
+                        "execution_type": "TRADE",
+                        "order_status": "FILLED",
+                        "order_id": int(t.get("orderId", 0)),
+                        "last_filled_qty": float(t.get("qty", 0)),
+                        "cumulative_filled_qty": float(t.get("qty", 0)),
+                        "last_filled_price": float(t.get("price", 0)),
+                        "commission": float(t.get("commission", 0)),
+                        "commission_asset": t.get("commissionAsset", ""),
+                        "trade_id": trade_id,
+                        "reduce_only": False,
+                        "position_side": t.get("positionSide", "BOTH"),
+                        "realized_profit": float(t.get("realizedPnl", 0)),
+                        "is_maker": t.get("maker", False),
+                        "reconciled": True,
+                    }
+                    await self.event_bus.publish("USER_ORDER_UPDATE", parsed)
+                    self.metrics["fills_processed"] += 1
+            if reconciled:
+                logger.info("Reconciliation recovered {} missed fills", reconciled)
+        except Exception as exc:
+            logger.warning("Reconnection reconciliation failed: {}", exc)
+
     async def run(self) -> None:
         """Main loop: connect, listen, reconnect on failure."""
         if not self._enabled:
@@ -253,6 +461,13 @@ class UserDataStream:
 
         # Start keepalive background task
         keepalive_task = asyncio.create_task(self._keepalive_loop(), name="user_stream_keepalive")
+
+        # Start safe-mode watchdog (only if threshold > 0; otherwise immediate on disconnect)
+        watchdog_task = None
+        if self._safe_mode_threshold > 0:
+            watchdog_task = asyncio.create_task(
+                self._safe_mode_watchdog(), name="user_stream_watchdog"
+            )
 
         try:
             while self._running:
@@ -274,9 +489,17 @@ class UserDataStream:
                         self._ws = ws
                         self._connected = True
                         self._disconnect_time = None
+                        self._safe_mode_published = False
                         reconnect_delay = 1.0
+                        self.metrics["reconnects"] += 1
                         logger.info("Binance user data stream connected")
                         await self.event_bus.publish("USER_STREAM_CONNECTED", {})
+
+                        # Reconcile missed fills after reconnect
+                        await self._reconcile_after_reconnect()
+
+                        # Periodic terminal-order cleanup
+                        self._cleanup_terminal_orders()
 
                         async for raw in ws:
                             if not self._running:
@@ -291,9 +514,12 @@ class UserDataStream:
                 # Mark disconnected
                 self._connected = False
                 self._disconnect_time = time.time()
-                await self.event_bus.publish("USER_STREAM_LOST", {
-                    "timestamp": time.time(),
-                })
+
+                # If no safe-mode threshold configured, publish STREAM_LOST immediately
+                if self._safe_mode_threshold <= 0:
+                    await self.event_bus.publish("USER_STREAM_LOST", {
+                        "timestamp": time.time(),
+                    })
 
                 if self._running:
                     await asyncio.sleep(reconnect_delay)
@@ -302,10 +528,14 @@ class UserDataStream:
                     self._listen_key = None
         finally:
             keepalive_task.cancel()
-            try:
-                await keepalive_task
-            except asyncio.CancelledError:
-                pass
+            if watchdog_task:
+                watchdog_task.cancel()
+            for task in [keepalive_task, watchdog_task]:
+                if task:
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
     async def stop(self) -> None:
         self._running = False

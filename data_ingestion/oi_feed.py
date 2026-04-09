@@ -59,7 +59,7 @@ class OpenInterestFeed:
                         exchange="binance",
                         symbol=symbol,
                         oi_contracts=float(data.get("openInterest", 0)),
-                        oi_usd=float(data.get("openInterest", 0)),
+                        oi_usd=float(data.get("openInterestNotional", 0)),
                         timestamp=int(time.time()),
                     )
                     results.append(oi)

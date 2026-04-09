@@ -14,16 +14,19 @@ class RateLimiter:
         self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            cutoff = now - self._period
-            while self._calls and self._calls[0] < cutoff:
-                self._calls.popleft()
-            if len(self._calls) >= self._max_calls:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                cutoff = now - self._period
+                while self._calls and self._calls[0] < cutoff:
+                    self._calls.popleft()
+                if len(self._calls) < self._max_calls:
+                    self._calls.append(time.monotonic())
+                    return
                 sleep_time = self._period - (now - self._calls[0])
-                if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
-            self._calls.append(time.monotonic())
+            # Sleep OUTSIDE the lock so other coroutines aren't blocked
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
 
     def __call__(self, fn: Any) -> Any:
         async def wrapper(*args: Any, **kwargs: Any) -> Any:

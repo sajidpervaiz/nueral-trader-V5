@@ -3,6 +3,7 @@ Retry Policy with exponential backoff and jitter.
 """
 
 import asyncio
+import functools
 import random
 import time
 from typing import Callable, Optional, Type, List
@@ -120,6 +121,7 @@ def with_retry(policy: Optional[RetryPolicy] = None):
         policy = RetryPolicy()
 
     def decorator(func: Callable):
+        @functools.wraps(func)
         async def async_wrapper(*args, **kwargs):
             last_exception = None
 
@@ -148,6 +150,7 @@ def with_retry(policy: Optional[RetryPolicy] = None):
 
             raise last_exception
 
+        @functools.wraps(func)
         def sync_wrapper(*args, **kwargs):
             last_exception = None
 

@@ -197,6 +197,14 @@ class SmartOrderRouter:
         if self.venue_scores and (now - self._last_score_refresh) < self.score_refresh_interval_sec:
             return
 
+        # Claim the refresh slot first to prevent concurrent refresh storms
+        async with self._lock:
+            # Double-check after acquiring lock
+            if self.venue_scores and (time.time() - self._last_score_refresh) < self.score_refresh_interval_sec:
+                return
+            self._last_score_refresh = time.time()
+
+        # Fetch scores OUTSIDE the lock to avoid blocking order routing
         refreshed: Dict[Venue, VenueScore] = {}
         for venue, executor in self.executors.items():
             if executor is None:
@@ -204,8 +212,8 @@ class SmartOrderRouter:
             refreshed[venue] = await self._calculate_venue_score(venue, symbol)
 
         if refreshed:
-            self.venue_scores = refreshed
-            self._last_score_refresh = now
+            async with self._lock:
+                self.venue_scores = refreshed
 
     async def execute_routed_order(
         self,

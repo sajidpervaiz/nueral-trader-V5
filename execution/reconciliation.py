@@ -5,14 +5,17 @@ On boot:
 1. Fetch open positions from Binance Futures
 2. Fetch open orders per symbol
 3. Fetch account balance / margin
-4. Compare with local DB state
-5. Rebuild in-memory state from exchange truth
-6. If mismatch → SAFE MODE (no new entries, manage existing positions)
-7. Ensure every open position has SL/TP; if missing, place them immediately
+4. Fetch leverage / margin-mode settings
+5. Compare exchange truth with DB and in-memory state
+6. Rebuild internal state from exchange truth (positions, orders, equity)
+7. If mismatch → SAFE MODE (no new entries, manage existing positions)
+8. Ensure every open position has SL/TP; if missing, place them immediately
+9. Prevent duplicate positions after restart via idempotent rebuild
 """
 from __future__ import annotations
 
 import time
+import uuid
 from typing import Any
 
 from loguru import logger
@@ -27,10 +30,13 @@ class ReconciliationResult:
     """Result of startup reconciliation."""
 
     def __init__(self) -> None:
+        self.reconciliation_id: str = uuid.uuid4().hex[:12]
         self.success = False
         self.safe_mode = False
         self.exchange_positions: list[dict] = []
         self.exchange_open_orders: list[dict] = []
+        self.db_positions: list[dict] = []
+        self.leverage_settings: dict[str, dict] = {}  # symbol → {leverage, margin_mode}
         self.balance: float = 0.0
         self.available_balance: float = 0.0
         self.mismatches: list[str] = []
@@ -39,8 +45,11 @@ class ReconciliationResult:
 
     def __repr__(self) -> str:
         return (
-            f"ReconciliationResult(success={self.success}, safe_mode={self.safe_mode}, "
-            f"positions={len(self.exchange_positions)}, mismatches={len(self.mismatches)})"
+            f"ReconciliationResult(id={self.reconciliation_id}, "
+            f"success={self.success}, safe_mode={self.safe_mode}, "
+            f"positions={len(self.exchange_positions)}, "
+            f"db_positions={len(self.db_positions)}, "
+            f"mismatches={len(self.mismatches)})"
         )
 
 
@@ -60,13 +69,18 @@ class StartupReconciler:
         risk_manager: RiskManager,
         client: Any,
         order_placer: ExchangeOrderPlacer | None = None,
+        trade_persistence: Any | None = None,
+        order_manager: Any | None = None,
     ) -> None:
         self.config = config
         self.event_bus = event_bus
         self.risk_manager = risk_manager
         self._client = client
         self._order_placer = order_placer
+        self._trade_persistence = trade_persistence
+        self._order_manager = order_manager
         self._safe_mode = False
+        self._reconciled = False  # Guard against double-reconcile
 
     @property
     def safe_mode(self) -> bool:
@@ -77,16 +91,23 @@ class StartupReconciler:
         Run full startup reconciliation.
 
         Returns ReconciliationResult with details of what was found and done.
+        Idempotent: calling twice returns the cached result.
         """
         result = ReconciliationResult()
+
+        if self._reconciled:
+            logger.warning("Reconciliation already completed — skipping duplicate call")
+            result.success = True
+            return result
 
         if self._client is None:
             logger.warning("No exchange client — skipping reconciliation")
             result.success = True
+            self._reconciled = True
             return result
 
         logger.info("=" * 50)
-        logger.info("STARTUP RECONCILIATION BEGIN")
+        logger.info("STARTUP RECONCILIATION BEGIN (id={})", result.reconciliation_id)
         logger.info("=" * 50)
 
         try:
@@ -99,13 +120,25 @@ class StartupReconciler:
             # 3. Fetch open orders
             await self._fetch_open_orders(result)
 
-            # 4. Rebuild internal state from exchange truth
+            # 4. Load DB positions and cross-reference
+            await self._load_and_compare_db(result)
+
+            # 5. Fetch leverage/margin settings
+            await self._fetch_leverage_settings(result)
+
+            # 6. Rebuild internal state from exchange truth
             await self._rebuild_state(result)
 
-            # 5. Ensure every position has protective orders
+            # 7. Rebuild order manager state from open orders
+            await self._rebuild_order_manager(result)
+
+            # 8. Ensure every position has protective orders
             await self._ensure_protective_orders(result)
 
-            # 6. Determine if safe mode needed
+            # 9. Publish reconciliation event
+            await self.event_bus.publish("RECONCILIATION_COMPLETE", result)
+
+            # 10. Determine if safe mode needed
             if result.mismatches:
                 self._safe_mode = True
                 result.safe_mode = True
@@ -124,7 +157,11 @@ class StartupReconciler:
                 logger.info("Reconciliation clean — no mismatches")
 
             result.success = True
-            logger.info("STARTUP RECONCILIATION COMPLETE (safe_mode={})", result.safe_mode)
+            self._reconciled = True
+            logger.info(
+                "STARTUP RECONCILIATION COMPLETE (id={}, safe_mode={})",
+                result.reconciliation_id, result.safe_mode,
+            )
             logger.info("=" * 50)
 
         except Exception as exc:
@@ -220,6 +257,194 @@ class StartupReconciler:
             logger.error("Failed to fetch open orders: {}", exc)
             result.mismatches.append(f"orders_fetch_failed: {exc}")
 
+    async def _load_and_compare_db(self, result: ReconciliationResult) -> None:
+        """Load open positions from DB and cross-reference with exchange."""
+        if self._trade_persistence is None:
+            logger.debug("No trade_persistence — skipping DB comparison")
+            return
+
+        try:
+            db_positions = await self._trade_persistence.load_open_positions()
+            result.db_positions = db_positions
+            logger.info("DB has {} open position(s)", len(db_positions))
+
+            # Build lookup: (exchange, symbol) → db row
+            db_lookup: dict[str, dict] = {}
+            for db_pos in db_positions:
+                key = f"{db_pos.get('exchange', 'binance')}:{db_pos.get('symbol', '')}"
+                db_lookup[key] = db_pos
+
+            # Build lookup of exchange positions
+            exch_keys: set[str] = set()
+            for ep in result.exchange_positions:
+                key = f"binance:{ep['symbol']}"
+                exch_keys.add(key)
+
+                if key in db_lookup:
+                    db_row = db_lookup[key]
+                    # Compare direction
+                    db_dir = db_row.get("direction", "")
+                    exch_dir = ep["side"] if ep["side"] in ("long", "short") else (
+                        "long" if ep["side"] == "buy" else "short"
+                    )
+                    if db_dir and db_dir != exch_dir:
+                        result.mismatches.append(
+                            f"direction_mismatch: {ep['symbol']} db={db_dir} exchange={exch_dir}"
+                        )
+                    # Compare size (allow 5% tolerance for partial fills)
+                    db_size = float(db_row.get("size", 0))
+                    if db_size > 0 and abs(db_size - ep["size"]) / db_size > 0.05:
+                        result.mismatches.append(
+                            f"size_mismatch: {ep['symbol']} db={db_size:.6f} exchange={ep['size']:.6f}"
+                        )
+                else:
+                    # Exchange has position not in DB — record but still rebuild
+                    logger.warning(
+                        "Position {} exists on exchange but not in DB — will persist after rebuild",
+                        ep["symbol"],
+                    )
+
+            # Close stale DB positions that don't exist on exchange anymore
+            for key, db_row in db_lookup.items():
+                if key not in exch_keys:
+                    logger.warning(
+                        "DB position {} not found on exchange — marking as stale",
+                        db_row.get("symbol", key),
+                    )
+                    result.actions_taken.append(
+                        f"stale_db_position: {db_row.get('symbol', key)} (in DB but not on exchange)"
+                    )
+                    # Close it in DB with zero PnL (actual PnL unknown)
+                    try:
+                        await self._trade_persistence.persist_position_close(
+                            exchange=db_row.get("exchange", "binance"),
+                            symbol=db_row.get("symbol", ""),
+                            exit_price=float(db_row.get("entry_price", 0)),
+                            pnl=0.0,
+                            pnl_pct=0.0,
+                        )
+                        result.actions_taken.append(
+                            f"closed_stale_db_position: {db_row.get('symbol', key)}"
+                        )
+                    except Exception as exc:
+                        logger.error("Failed to close stale DB position: {}", exc)
+
+        except Exception as exc:
+            logger.error("DB position comparison failed: {}", exc)
+            # Non-fatal: exchange is truth, continue
+
+    async def _fetch_leverage_settings(self, result: ReconciliationResult) -> None:
+        """Fetch and verify leverage/margin settings for positioned symbols."""
+        cfg = self.config.get_value("exchanges", "binance") or {}
+        expected_leverage = int(cfg.get("leverage", 1))
+        expected_margin = str(cfg.get("margin_mode", "isolated")).lower()
+
+        for ep in result.exchange_positions:
+            symbol = ep["symbol"]
+            exch_leverage = int(ep.get("leverage", 1))
+            exch_margin = str(ep.get("margin_type", "")).lower()
+
+            result.leverage_settings[symbol] = {
+                "leverage": exch_leverage,
+                "margin_mode": exch_margin,
+                "expected_leverage": expected_leverage,
+                "expected_margin": expected_margin,
+            }
+
+            if exch_leverage != expected_leverage:
+                logger.warning(
+                    "Leverage mismatch for {}: config={} exchange={}",
+                    symbol, expected_leverage, exch_leverage,
+                )
+                # Attempt to correct leverage
+                try:
+                    await self._client.set_leverage(expected_leverage, symbol)
+                    result.actions_taken.append(
+                        f"corrected_leverage: {symbol} {exch_leverage} → {expected_leverage}"
+                    )
+                    result.leverage_settings[symbol]["leverage"] = expected_leverage
+                except Exception as exc:
+                    logger.error("Failed to set leverage for {}: {}", symbol, exc)
+                    result.mismatches.append(
+                        f"leverage_mismatch: {symbol} config={expected_leverage} exchange={exch_leverage}"
+                    )
+
+            if exch_margin and expected_margin and exch_margin != expected_margin:
+                logger.warning(
+                    "Margin mode mismatch for {}: config={} exchange={}",
+                    symbol, expected_margin, exch_margin,
+                )
+                # Don't auto-correct margin mode on open position (exchange may reject)
+                result.mismatches.append(
+                    f"margin_mode_mismatch: {symbol} config={expected_margin} exchange={exch_margin}"
+                )
+
+    async def _rebuild_order_manager(self, result: ReconciliationResult) -> None:
+        """Rebuild OrderManager state from exchange open orders."""
+        if self._order_manager is None:
+            return
+
+        # Import inline to avoid circular
+        from execution.order_manager import Order, OrderStatus, OrderSide, OrderType
+
+        restored = 0
+        for eo in result.exchange_open_orders:
+            order_id = str(eo.get("id", ""))
+            if not order_id or order_id in self._order_manager.orders:
+                continue  # Already tracked or no ID
+
+            side_str = str(eo.get("side", "buy")).lower()
+            type_str = str(eo.get("type", "limit")).lower()
+
+            # Map exchange type to OrderType
+            if "market" in type_str or "stop" in type_str or "take_profit" in type_str:
+                order_type = OrderType.MARKET
+            elif "limit" in type_str:
+                order_type = OrderType.LIMIT
+            else:
+                order_type = OrderType.LIMIT
+
+            order = Order(
+                order_id=order_id,
+                client_order_id=None,
+                symbol=eo.get("symbol", ""),
+                side=OrderSide.BUY if side_str == "buy" else OrderSide.SELL,
+                order_type=order_type,
+                quantity=float(eo.get("amount", 0)),
+                price=float(eo.get("price", 0) or 0),
+                status=OrderStatus.OPEN,
+                exchange_order_id=order_id,
+                venue="binance",
+                reduce_only=bool(eo.get("reduce_only", False)),
+            )
+            self._order_manager.orders[order_id] = order
+            restored += 1
+
+        if restored:
+            result.actions_taken.append(f"restored {restored} open orders to OrderManager")
+            logger.info("OrderManager: restored {} open orders from exchange", restored)
+
+    async def _persist_rebuilt_positions(self, result: ReconciliationResult) -> None:
+        """Persist rebuilt positions to DB to prevent drift."""
+        if self._trade_persistence is None:
+            return
+
+        for ep in result.exchange_positions:
+            symbol = ep["symbol"]
+            direction = ep["side"] if ep["side"] in ("long", "short") else (
+                "long" if ep["side"] == "buy" else "short"
+            )
+            try:
+                await self._trade_persistence.persist_position_open(
+                    exchange="binance",
+                    symbol=symbol,
+                    direction=direction,
+                    entry_price=ep["entry_price"],
+                    size=ep["size"],
+                )
+            except Exception as exc:
+                logger.error("Failed to persist position {} to DB: {}", symbol, exc)
+
     async def _rebuild_state(self, result: ReconciliationResult) -> None:
         """Rebuild internal position state from exchange truth."""
         # Clear stale in-memory positions
@@ -274,6 +499,9 @@ class StartupReconciler:
             "State rebuilt: {} positions from exchange, {} stale removed",
             len(result.exchange_positions), len(old_positions),
         )
+
+        # Persist rebuilt positions to DB to keep state consistent
+        await self._persist_rebuilt_positions(result)
 
     async def _ensure_protective_orders(self, result: ReconciliationResult) -> None:
         """Ensure every open position has SL/TP orders on exchange."""

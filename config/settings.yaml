@@ -173,6 +173,9 @@ risk:
   # Circuit breaker
   circuit_breaker_pause_seconds: 3600
 
+  # User data stream safe-mode: seconds of disconnect before blocking new trades (0 = immediate)
+  user_stream_safe_mode_seconds: 5
+
   # VaR
   max_portfolio_var_pct: 0.08
   returns_window: 250
@@ -246,6 +249,89 @@ jupyter:
   token: "${JUPYTER_TOKEN:-}"
   allow_root: false
 
+# ── ARMS-V2.1 Strategy Configuration ─────────────────────────────────────────
+arms:
+  regime:
+    adx_threshold: 25.0
+    strong_adx_threshold: 30.0
+    ema200_slope_threshold: 0.0015
+    bb_squeeze_percentile: 20.0
+    confirmation_candles: 2
+    cooldown_candles: 2
+
+  strategy_modules:
+    trend_continuation:
+      rsi_pullback_low: 40.0
+      rsi_pullback_high: 60.0
+      volume_min_ratio: 1.2
+      rsi_percentile_low: 25.0
+      rsi_percentile_high: 75.0
+      ema_touch_pct: 0.005
+    breakout_expansion:
+      bb_squeeze_percentile: 20.0
+      volume_breakout_ratio: 2.0
+      breakout_margin_pct: 0.001
+      consolidation_range_pct: 0.02
+      volume_decay_candles: 3
+    mean_reversion:
+      adx_max: 18.0
+      adx_confirm_candles: 5
+      rsi_oversold: 30.0
+      rsi_overbought: 70.0
+      max_trades_per_24h: 2
+      max_hold_candles: 12
+
+  pair_tiers:
+    tier_1_volume_usd: 200000000
+    tier_2_volume_usd: 75000000
+    tier_3_volume_usd: 30000000
+    max_spread_bps: 15.0
+    min_depth_usd: 50000
+    filter_interval_seconds: 14400
+
+  risk:
+    tier1_risk_pct: 0.0075
+    tier2_risk_pct: 0.005
+    tier3_risk_pct: 0.0025
+    weekly_loss_limit_pct: 0.06
+    monthly_loss_limit_pct: 0.10
+    dd_graduation_trades: 3
+    max_group_exposure_pct: 0.15
+    funding_recheck_seconds: 28800
+    event_blackout_before_min: 30
+    event_blackout_after_min: 15
+    weekend_sizing_mult: 0.25
+    weekend_halt: false
+    liq_monitor_interval_seconds: 60.0
+    drawdown_phases:
+      normal_max_dd: 0.05
+      caution_max_dd: 0.08
+      defensive_max_dd: 0.12
+    tp_tiers:
+      - r_multiple: 1.5
+        close_pct: 0.33
+      - r_multiple: 2.5
+        close_pct: 0.33
+    liquidation_safety:
+      warning_distance_pct: 0.15
+      partial_close_distance_pct: 0.10
+      emergency_close_distance_pct: 0.05
+    sessions:
+      asia: ["00:00", "08:00"]
+      london: ["07:00", "16:00"]
+      new_york: ["13:00", "22:00"]
+    order_splitting:
+      twap_threshold_usd: 50000
+      twap_slices: 5
+      twap_duration_seconds: 300
+      iceberg_threshold_usd: 100000
+      iceberg_visible_pct: 0.20
+    shadow_sl:
+      primary_timeout_seconds: 5.0
+      max_retries: 3
+      shadow_check_interval: 1.0
+      fallback_grace_seconds: 10.0
+
 # ── Observability ─────────────────────────────────────────────────────────────
 monitoring:
   prometheus:
@@ -265,3 +351,16 @@ monitoring:
     enabled: false
     token: "${TELEGRAM_BOT_TOKEN}"
     chat_id: "${TELEGRAM_CHAT_ID}"
+  alerts:
+    throttle_seconds: 300
+    telegram:
+      enabled: false
+      token: "${TELEGRAM_BOT_TOKEN}"
+      chat_id: "${TELEGRAM_CHAT_ID}"
+    discord:
+      enabled: false
+      webhook_url: "${DISCORD_WEBHOOK_URL}"
+    webhook:
+      enabled: false
+      url: "${ALERT_WEBHOOK_URL}"
+      secret: "${ALERT_WEBHOOK_SECRET}"

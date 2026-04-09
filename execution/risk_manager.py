@@ -11,6 +11,7 @@ from loguru import logger
 
 from core.config import Config
 from core.event_bus import EventBus
+from core.safe_mode import SafeModeManager, SafeModeReason
 from engine.signal_generator import TradingSignal
 
 
@@ -129,9 +130,10 @@ class CircuitBreaker:
 
 
 class RiskManager:
-    def __init__(self, config: Config, event_bus: EventBus) -> None:
+    def __init__(self, config: Config, event_bus: EventBus, safe_mode: SafeModeManager | None = None) -> None:
         self.config = config
         self.event_bus = event_bus
+        self.safe_mode = safe_mode or SafeModeManager()
         risk_cfg = config.get_value("risk") or {}
 
         # ── Position sizing ───────────────────────────────────────────────
@@ -194,6 +196,132 @@ class RiskManager:
         self._order_window_seconds = float(risk_cfg.get("order_window_seconds", 10.0))
         self._recent_order_times: list[float] = []
 
+        # ── ARMS-V2.1: Drawdown recovery protocol (4 phases) ─────────────
+        self._drawdown_phases = {
+            "normal": {"max_dd": 0.05, "size_mult": 1.0, "max_positions": self._max_open},
+            "caution": {"max_dd": 0.08, "size_mult": 0.5, "max_positions": max(1, self._max_open - 2)},
+            "defensive": {"max_dd": 0.12, "size_mult": 0.25, "max_positions": 1},
+            "emergency": {"max_dd": 1.0, "size_mult": 0.0, "max_positions": 0},
+        }
+        self._current_dd_phase = "normal"
+
+        # ── ARMS-V2.1: ATR percentile-based volatility scaling ────────────
+        self._atr_pctile_bands = [
+            (25, 1.25),   # <25th percentile → +25%
+            (50, 1.0),    # 25-50th → normal
+            (75, 0.75),   # 50-75th → -25%
+            (90, 0.50),   # 75-90th → -50%
+            (100, 0.25),  # >90th → -75%
+        ]
+
+        # ── ARMS-V2.1: Adaptive SL multiplier by ATR percentile ──────────
+        self._atr_sl_bands = [
+            (25, 1.2),    # tight markets → tight stop
+            (50, 1.5),    # normal
+            (75, 2.0),    # volatile → wider
+            (100, 2.5),   # very volatile → very wide
+        ]
+
+        # ── ARMS-V2.1: Tiered take-profit ────────────────────────────────
+        self._tp_tiers = [
+            {"r_multiple": 1.5, "close_pct": 0.33},  # TP1: 1.5R, close 33%
+            {"r_multiple": 2.5, "close_pct": 0.33},  # TP2: 2.5R, close 33%
+            # TP3: remaining 34% — trail
+        ]
+
+        # ── ARMS-V2.1: Session time filters ──────────────────────────────
+        self._sessions = {
+            "asia": ("00:00", "08:00"),
+            "london": ("07:00", "16:00"),
+            "new_york": ("13:00", "22:00"),
+            "asia_london_overlap": ("07:00", "08:00"),
+            "london_ny_overlap": ("13:00", "16:00"),
+        }
+
+        # ── ARMS-V2.1: Correlation tracking ──────────────────────────────
+        self._price_history: dict[str, list[float]] = {}
+        self._correlation_window = 30  # days
+        self._max_correlated_exposure = 0.15  # 15% of equity
+
+        # ── ARMS-V2.1: Funding rate directional bias (graduated) ─────────
+        self._funding_bias_tiers = [
+            (10.0, 1.0),    # < 10bps — no reduction
+            (25.0, 0.75),   # 10-25bps — 25% reduction
+            (50.0, 0.50),   # 25-50bps — 50% reduction
+            (100.0, 0.0),   # > 50bps — block
+        ]
+
+        # ── ARMS-V2.1: Liquidation safety layer ──────────────────────────
+        self._liq_warning_distance_pct = 0.15   # 15% from liq → warning
+        self._liq_partial_close_pct = 0.10      # 10% from liq → partial close
+        self._liq_emergency_close_pct = 0.05    # 5% from liq → full close
+
+        # ── ARMS-V2.1: Per-tier base risk (§8) ───────────────────────────
+        arms_cfg = (config.get_value("arms") or {}).get("risk", {})
+        self._tier_risk_pct: dict[int, float] = {
+            1: float(arms_cfg.get("tier1_risk_pct", 0.0075)),   # 0.75%
+            2: float(arms_cfg.get("tier2_risk_pct", 0.005)),    # 0.50%
+            3: float(arms_cfg.get("tier3_risk_pct", 0.0025)),   # 0.25%
+            4: 0.0,
+        }
+
+        # ── ARMS-V2.1: Weekly/monthly loss caps (§10) ────────────────────
+        self._weekly_loss: float = 0.0
+        self._monthly_loss: float = 0.0
+        self._weekly_loss_limit = float(arms_cfg.get("weekly_loss_limit_pct", 0.06))  # 6%
+        self._monthly_loss_limit = float(arms_cfg.get("monthly_loss_limit_pct", 0.10))  # 10%
+        self._last_weekly_reset: float = time.time()
+        self._last_monthly_reset: float = time.time()
+
+        # ── ARMS-V2.1: Drawdown graduation (§11) — 3 consecutive profits ─
+        self._consecutive_profitable: int = 0
+        self._dd_graduation_threshold: int = int(arms_cfg.get("dd_graduation_trades", 3))
+
+        # ── ARMS-V2.1: Correlation groups (§8) ───────────────────────────
+        self._correlation_groups: dict[str, list[str]] = {
+            "btc_group": ["BTC/USDT", "BTC/USDC", "BTC/USD", "BTCUSDT", "BTCUSDC"],
+            "eth_group": ["ETH/USDT", "ETH/USDC", "ETH/USD", "ETHUSDT", "ETHUSDC"],
+        }
+        self._max_group_exposure_pct = float(arms_cfg.get("max_group_exposure_pct", 0.15))
+
+        # ── ARMS-V2.1: 8h funding re-check (§9) ─────────────────────────
+        self._funding_recheck_interval = float(arms_cfg.get("funding_recheck_seconds", 28800))  # 8h
+        self._last_funding_recheck: float = 0.0
+
+        # ── ARMS-V2.1: ADX/ATR-linked max leverage (§10) ────────────────
+        self._adx_leverage_bands = [
+            (20, 5.0),   # Low ADX → max 5x
+            (30, 3.0),   # Medium ADX → max 3x
+            (50, 2.0),   # High ADX → max 2x
+            (100, 1.0),  # Very high → 1x only
+        ]
+        self._atr_leverage_bands = [
+            (50, 5.0),   # Low ATR pctile → max 5x
+            (75, 3.0),   # Moderate → max 3x
+            (90, 2.0),   # High → max 2x
+            (100, 1.0),  # Extreme → 1x only
+        ]
+
+        # ── ARMS-V2.1: Event blackout (§12) ──────────────────────────────
+        self._event_blackout_keywords = [
+            "FOMC", "CPI", "NFP", "Non-Farm", "Fed Rate",
+            "ECB Rate", "BOJ Rate", "GDP",
+        ]
+        self._event_blackout_minutes_before = int(arms_cfg.get("event_blackout_before_min", 30))
+        self._event_blackout_minutes_after = int(arms_cfg.get("event_blackout_after_min", 15))
+        self._upcoming_events: list[dict[str, Any]] = []  # [{name, timestamp}]
+
+        # ── ARMS-V2.1: Weekend rules (§12) ───────────────────────────────
+        self._weekend_sizing_mult = float(arms_cfg.get("weekend_sizing_mult", 0.25))
+        self._weekend_halt = bool(arms_cfg.get("weekend_halt", False))
+
+        # ── ARMS-V2.1: Margin mode tracking (§10.1) ─────────────────────
+        self._margin_modes: dict[str, str] = {}  # symbol → "isolated" | "cross"
+
+        # ── ARMS-V2.1: 60s liquidation monitoring (§10.1) ────────────────
+        self._liq_monitor_interval = float(arms_cfg.get("liq_monitor_interval_seconds", 60.0))
+        self._last_liq_check: float = 0.0
+
     # ── Risk-based position sizing ────────────────────────────────────────
     def calculate_position_size(self, signal: TradingSignal) -> float:
         """size = (equity × risk_per_trade) / |entry − stop|"""
@@ -221,6 +349,397 @@ class RiskManager:
         max_notional = self._equity * self._max_position_pct * self._leverage
         notional = min(notional, max_notional)
         return max(0.0, notional)
+
+    # ── ARMS-V2.1: ATR percentile volatility scaling ─────────────────────
+    def get_atr_volatility_multiplier(self, atr_percentile: float) -> float:
+        """Returns sizing multiplier based on ATR percentile band."""
+        for threshold, mult in self._atr_pctile_bands:
+            if atr_percentile <= threshold:
+                return mult
+        return 0.25
+
+    # ── ARMS-V2.1: Adaptive SL multiplier ────────────────────────────────
+    def get_adaptive_sl_multiplier(self, atr_percentile: float) -> float:
+        """Returns SL multiplier adjusted for volatility regime."""
+        for threshold, mult in self._atr_sl_bands:
+            if atr_percentile <= threshold:
+                return mult
+        return 2.5
+
+    # ── ARMS-V2.1: Drawdown recovery phase ───────────────────────────────
+    def update_drawdown_phase(self) -> str:
+        """Update and return current drawdown recovery phase.
+
+        Phases escalate automatically by DD threshold but only de-escalate
+        via consecutive profitable trades (graduation rule §11).
+        """
+        dd = self.current_drawdown_pct()
+        old_phase = self._current_dd_phase
+        phase_order = ["normal", "caution", "defensive", "emergency"]
+
+        # Determine the phase dictated by current drawdown level
+        if dd < self._drawdown_phases["normal"]["max_dd"]:
+            dd_phase = "normal"
+        elif dd < self._drawdown_phases["caution"]["max_dd"]:
+            dd_phase = "caution"
+        elif dd < self._drawdown_phases["defensive"]["max_dd"]:
+            dd_phase = "defensive"
+        else:
+            dd_phase = "emergency"
+
+        # Only escalate automatically; de-escalation requires graduation
+        old_idx = phase_order.index(old_phase)
+        new_idx = phase_order.index(dd_phase)
+        if new_idx > old_idx:
+            # Escalate
+            self._current_dd_phase = dd_phase
+            self._consecutive_profitable = 0  # Reset on escalation
+        # De-escalation handled by record_trade_result → _graduate_dd_phase
+
+        if old_phase != self._current_dd_phase:
+            logger.warning("Drawdown phase: {} → {} (dd={:.2%})", old_phase, self._current_dd_phase, dd)
+        return self._current_dd_phase
+
+    def get_drawdown_size_multiplier(self) -> float:
+        phase = self.update_drawdown_phase()
+        return float(self._drawdown_phases[phase]["size_mult"])
+
+    def get_drawdown_max_positions(self) -> int:
+        phase = self.update_drawdown_phase()
+        return int(self._drawdown_phases[phase]["max_positions"])
+
+    # ── ARMS-V2.1: Tiered take-profit levels ─────────────────────────────
+    def compute_tiered_tp(
+        self, entry_price: float, sl_distance: float, is_long: bool,
+    ) -> list[dict[str, float]]:
+        """Compute TP1, TP2, TP3 (trail) levels from risk distance."""
+        tps: list[dict[str, float]] = []
+        for tier in self._tp_tiers:
+            r_dist = sl_distance * tier["r_multiple"]
+            if is_long:
+                tp_price = entry_price + r_dist
+            else:
+                tp_price = entry_price - r_dist
+            tps.append({"price": tp_price, "close_pct": tier["close_pct"]})
+        # TP3 = trailing (remaining position)
+        remaining = 1.0 - sum(t["close_pct"] for t in tps)
+        tps.append({"price": 0.0, "close_pct": remaining, "trail": True})
+        return tps
+
+    # ── ARMS-V2.1: Session filter ────────────────────────────────────────
+    def get_active_sessions(self) -> list[str]:
+        """Returns list of currently active trading sessions."""
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        current_time = now.strftime("%H:%M")
+        active = []
+        for name, (start, end) in self._sessions.items():
+            if start <= end:
+                if start <= current_time <= end:
+                    active.append(name)
+            else:  # wraps midnight
+                if current_time >= start or current_time <= end:
+                    active.append(name)
+        return active
+
+    # ── ARMS-V2.1: Funding rate directional bias ─────────────────────────
+    def get_funding_size_multiplier(self, symbol: str, direction: str) -> float:
+        """Graduated funding rate penalty. Returns sizing multiplier 0.0–1.0."""
+        rate = self._current_funding_rates.get(symbol, 0.0)
+        rate_bps = abs(rate) * 10000
+
+        # Direction check: funding positive = longs pay → penalize longs
+        if rate > 0 and direction == "long":
+            pass  # adverse
+        elif rate < 0 and direction == "short":
+            pass  # adverse
+        else:
+            return 1.0  # favorable or neutral
+
+        for threshold, mult in self._funding_bias_tiers:
+            if rate_bps <= threshold:
+                return mult
+        return 0.0
+
+    # ── ARMS-V2.1: Correlation-adjusted exposure ─────────────────────────
+    def update_price_history(self, symbol: str, price: float) -> None:
+        if symbol not in self._price_history:
+            self._price_history[symbol] = []
+        self._price_history[symbol].append(price)
+        # Keep only correlation_window days worth (assuming ~24 data points per day)
+        max_len = self._correlation_window * 24
+        if len(self._price_history[symbol]) > max_len:
+            self._price_history[symbol] = self._price_history[symbol][-max_len:]
+
+    def compute_correlation(self, sym_a: str, sym_b: str) -> float:
+        """30-day Pearson correlation between two symbols."""
+        hist_a = self._price_history.get(sym_a, [])
+        hist_b = self._price_history.get(sym_b, [])
+        if len(hist_a) < 30 or len(hist_b) < 30:
+            return 0.0
+        min_len = min(len(hist_a), len(hist_b))
+        a = np.array(hist_a[-min_len:])
+        b = np.array(hist_b[-min_len:])
+        ret_a = np.diff(a) / a[:-1]
+        ret_b = np.diff(b) / b[:-1]
+        if len(ret_a) < 10:
+            return 0.0
+        cc = np.corrcoef(ret_a, ret_b)
+        val = float(cc[0, 1])
+        return val if not np.isnan(val) else 0.0
+
+    def check_correlation_exposure(self, symbol: str, direction: str) -> tuple[bool, str]:
+        """Check if adding this position would create excessive correlated exposure."""
+        for key, pos in self._positions.items():
+            other_sym = pos.symbol
+            if other_sym == symbol:
+                continue
+            corr = self.compute_correlation(symbol, other_sym)
+            # High positive correlation and same direction → concentrated risk
+            if corr > 0.7 and pos.direction == direction:
+                combined_exposure = (
+                    abs(pos.size * pos.current_price)
+                    + self._equity * self._max_position_pct
+                )
+                if combined_exposure / self._equity > self._max_correlated_exposure:
+                    return False, f"correlated_with_{other_sym}(r={corr:.2f})"
+        return True, ""
+
+    # ── ARMS-V2.1: Liquidation safety layer ──────────────────────────────
+    def check_liquidation_distance(self, pos: Position) -> str | None:
+        """Returns action needed based on distance to estimated liquidation price.
+        Returns: None, 'warning', 'partial_close', 'emergency_close'
+        """
+        if self._leverage <= 1.0:
+            return None
+
+        # Estimate liquidation price
+        margin_ratio = 1.0 / self._leverage
+        if pos.is_long:
+            liq_price = pos.entry_price * (1 - margin_ratio * 0.9)
+            distance_pct = (pos.current_price - liq_price) / pos.current_price if pos.current_price > 0 else 1.0
+        else:
+            liq_price = pos.entry_price * (1 + margin_ratio * 0.9)
+            distance_pct = (liq_price - pos.current_price) / pos.current_price if pos.current_price > 0 else 1.0
+
+        if distance_pct <= self._liq_emergency_close_pct:
+            return "emergency_close"
+        if distance_pct <= self._liq_partial_close_pct:
+            return "partial_close"
+        if distance_pct <= self._liq_warning_distance_pct:
+            return "warning"
+        return None
+
+    # ── ARMS-V2.1: Per-tier risk sizing (§8) ─────────────────────────────
+    def get_tier_risk_pct(self, tier: int) -> float:
+        """Returns risk-per-trade % for the given pair tier."""
+        return self._tier_risk_pct.get(tier, self._risk_per_trade)
+
+    # ── ARMS-V2.1: Weekly/monthly loss checks (§10) ──────────────────────
+    def check_weekly_monthly_limits(self) -> tuple[bool, str]:
+        """Check if weekly or monthly loss limits have been breached."""
+        now = time.time()
+        # Auto-reset weekly (every 7 days)
+        if now - self._last_weekly_reset >= 7 * 86400:
+            self._weekly_loss = 0.0
+            self._last_weekly_reset = now
+        # Auto-reset monthly (every 30 days)
+        if now - self._last_monthly_reset >= 30 * 86400:
+            self._monthly_loss = 0.0
+            self._last_monthly_reset = now
+
+        if abs(self._weekly_loss) >= self._weekly_loss_limit:
+            return False, f"weekly_loss_limit ({self._weekly_loss:.2%} >= {self._weekly_loss_limit:.2%})"
+        if abs(self._monthly_loss) >= self._monthly_loss_limit:
+            return False, f"monthly_loss_limit ({self._monthly_loss:.2%} >= {self._monthly_loss_limit:.2%})"
+        return True, ""
+
+    def _record_loss_for_period(self, pnl_pct: float) -> None:
+        """Accumulate losses into weekly/monthly trackers."""
+        if pnl_pct < 0:
+            self._weekly_loss += pnl_pct
+            self._monthly_loss += pnl_pct
+
+    # ── ARMS-V2.1: Drawdown graduation via consecutive profits (§11) ────
+    def record_trade_result(self, profitable: bool) -> None:
+        """Track consecutive profitable trades for DD phase graduation."""
+        if profitable:
+            self._consecutive_profitable += 1
+            if (
+                self._consecutive_profitable >= self._dd_graduation_threshold
+                and self._current_dd_phase != "normal"
+            ):
+                self._graduate_dd_phase()
+                self._consecutive_profitable = 0
+        else:
+            self._consecutive_profitable = 0
+
+    def _graduate_dd_phase(self) -> None:
+        """Step back one drawdown phase after consecutive profitable trades."""
+        phase_order = ["emergency", "defensive", "caution", "normal"]
+        try:
+            idx = phase_order.index(self._current_dd_phase)
+        except ValueError:
+            return
+        if idx < len(phase_order) - 1:
+            new_phase = phase_order[idx + 1]
+            logger.info(
+                "DD graduation: {} → {} after {} consecutive profits",
+                self._current_dd_phase, new_phase, self._dd_graduation_threshold,
+            )
+            self._current_dd_phase = new_phase
+
+    # ── ARMS-V2.1: Correlation group check (§8) ──────────────────────────
+    def _get_correlation_group(self, symbol: str) -> str | None:
+        """Returns the group name if symbol belongs to a correlation group."""
+        for group_name, symbols in self._correlation_groups.items():
+            if symbol in symbols:
+                return group_name
+        return None
+
+    def check_group_exposure(self, symbol: str) -> tuple[bool, str]:
+        """Check BTC/ETH correlation group hard limit (§8)."""
+        group = self._get_correlation_group(symbol)
+        if group is None:
+            return True, ""
+        # Sum notional of all open positions in same group
+        group_symbols = set(self._correlation_groups[group])
+        group_notional = 0.0
+        for key, pos in self._positions.items():
+            if pos.symbol in group_symbols:
+                group_notional += abs(pos.size * pos.current_price)
+        max_notional = self._equity * self._max_group_exposure_pct
+        if group_notional >= max_notional:
+            return False, f"{group}_exposure_limit ({group_notional:.0f} >= {max_notional:.0f})"
+        return True, ""
+
+    # ── ARMS-V2.1: 8h funding re-check for existing positions (§9) ──────
+    def check_funding_existing_positions(self) -> list[dict[str, Any]]:
+        """Periodic 8h check: reduce positions if funding now adverse."""
+        now = time.time()
+        if now - self._last_funding_recheck < self._funding_recheck_interval:
+            return []
+        self._last_funding_recheck = now
+        actions: list[dict[str, Any]] = []
+        for key, pos in self._positions.items():
+            mult = self.get_funding_size_multiplier(pos.symbol, pos.direction)
+            if mult < 0.5:
+                actions.append({
+                    "symbol": pos.symbol,
+                    "action": "reduce",
+                    "funding_mult": mult,
+                    "reason": f"funding_adverse_for_{pos.direction}",
+                })
+                logger.warning(
+                    "8h funding re-check: {} {} — mult={:.2f}, suggesting reduction",
+                    pos.symbol, pos.direction, mult,
+                )
+        return actions
+
+    # ── ARMS-V2.1: ADX/ATR-linked dynamic leverage (§10) ────────────────
+    def get_dynamic_leverage(self, adx: float, atr_percentile: float) -> float:
+        """Returns max allowed leverage based on ADX and ATR conditions."""
+        adx_max_lev = self._leverage
+        for threshold, max_lev in self._adx_leverage_bands:
+            if adx <= threshold:
+                adx_max_lev = max_lev
+                break
+
+        atr_max_lev = self._leverage
+        for threshold, max_lev in self._atr_leverage_bands:
+            if atr_percentile <= threshold:
+                atr_max_lev = max_lev
+                break
+
+        return min(adx_max_lev, atr_max_lev, self._leverage)
+
+    # ── ARMS-V2.1: 3×ATR(4H) liquidation distance (§10.1) ──────────────
+    def check_atr_liq_distance(self, pos: Position, atr_4h: float) -> str | None:
+        """Check if position is within 3×ATR(4H) of estimated liquidation price."""
+        if self._leverage <= 1.0 or atr_4h <= 0:
+            return None
+        margin_ratio = 1.0 / self._leverage
+        if pos.is_long:
+            liq_price = pos.entry_price * (1 - margin_ratio * 0.9)
+            distance = pos.current_price - liq_price
+        else:
+            liq_price = pos.entry_price * (1 + margin_ratio * 0.9)
+            distance = liq_price - pos.current_price
+
+        min_distance = 3.0 * atr_4h
+        if distance < min_distance:
+            if distance < atr_4h:
+                return "emergency_close"
+            elif distance < 2 * atr_4h:
+                return "partial_close"
+            else:
+                return "warning"
+        return None
+
+    # ── ARMS-V2.1: Event blackout (§12) ──────────────────────────────────
+    def add_upcoming_event(self, name: str, timestamp: float) -> None:
+        """Register an upcoming high-impact event for blackout checking."""
+        self._upcoming_events.append({"name": name, "timestamp": timestamp})
+        # Prune past events
+        now = time.time()
+        self._upcoming_events = [
+            e for e in self._upcoming_events
+            if e["timestamp"] > now - self._event_blackout_minutes_after * 60
+        ]
+
+    def is_event_blackout(self) -> tuple[bool, str]:
+        """Check if we're within an event blackout window."""
+        now = time.time()
+        for event in self._upcoming_events:
+            before_start = event["timestamp"] - self._event_blackout_minutes_before * 60
+            after_end = event["timestamp"] + self._event_blackout_minutes_after * 60
+            if before_start <= now <= after_end:
+                return True, f"event_blackout:{event['name']}"
+        return False, ""
+
+    # ── ARMS-V2.1: Weekend rules (§12) ───────────────────────────────────
+    def is_weekend(self) -> bool:
+        """Check if current day is Saturday or Sunday (UTC)."""
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return now.weekday() >= 5  # 5=Saturday, 6=Sunday
+
+    def get_weekend_sizing_mult(self) -> float:
+        """Returns weekend sizing multiplier (1.0 on weekdays)."""
+        if self.is_weekend():
+            if self._weekend_halt:
+                return 0.0
+            return self._weekend_sizing_mult
+        return 1.0
+
+    # ── ARMS-V2.1: Margin mode (§10.1) ──────────────────────────────────
+    def set_margin_mode(self, symbol: str, mode: str) -> None:
+        """Set margin mode for symbol: 'isolated' or 'cross'."""
+        self._margin_modes[symbol] = mode
+
+    def get_margin_mode(self, symbol: str) -> str:
+        """Returns margin mode for symbol (default: 'isolated')."""
+        return self._margin_modes.get(symbol, "isolated")
+
+    # ── ARMS-V2.1: Periodic liquidation monitoring (§10.1) ──────────────
+    def run_periodic_liq_check(self) -> list[dict[str, Any]]:
+        """60-second interval liquidation check across all positions."""
+        now = time.time()
+        if now - self._last_liq_check < self._liq_monitor_interval:
+            return []
+        self._last_liq_check = now
+        actions: list[dict[str, Any]] = []
+        for key, pos in self._positions.items():
+            action = self.check_liquidation_distance(pos)
+            if action:
+                actions.append({
+                    "key": key,
+                    "symbol": pos.symbol,
+                    "exchange": pos.exchange,
+                    "action": action,
+                    "margin_mode": self.get_margin_mode(pos.symbol),
+                })
+        return actions
 
     # ── Pre-trade gate checks ─────────────────────────────────────────────
     def _check_session_window(self) -> tuple[bool, str]:
@@ -261,7 +780,12 @@ class RiskManager:
         """Volatility filter: ATR(14)/price < max_atr_pct."""
         if signal.price <= 0:
             return True, ""
-        atr_pct = signal.atr / signal.price
+        atr_val = signal.atr if signal.atr and signal.atr > 0 else 0.0
+        if atr_val != atr_val:  # NaN guard
+            atr_val = 0.0
+        if atr_val <= 0:
+            return True, ""
+        atr_pct = atr_val / signal.price
         if atr_pct > self._max_atr_pct:
             return False, f"volatility_too_high (atr_pct={atr_pct:.4f} > {self._max_atr_pct:.4f})"
         return True, ""
@@ -323,6 +847,11 @@ class RiskManager:
         if self._killed:
             return False, "kill_switch_active", 0.0
 
+        # ── Safe mode gate — never open new trades while blind ────────────
+        if self.safe_mode.is_active:
+            reasons = ", ".join(r.value for r in self.safe_mode.active_reasons)
+            return False, f"safe_mode_active ({reasons})", 0.0
+
         # File-based kill switch — manual override (cached to avoid hot-path I/O)
         now = time.time()
         if now - self._kill_switch_last_check >= self._kill_switch_check_interval:
@@ -357,6 +886,21 @@ class RiskManager:
         if not ok:
             return False, reason, 0.0
 
+        # ARMS-V2.1: Weekend rules (§12)
+        weekend_mult = self.get_weekend_sizing_mult()
+        if weekend_mult <= 0:
+            return False, "weekend_halt", 0.0
+
+        # ARMS-V2.1: Event blackout (§12)
+        blackout, reason = self.is_event_blackout()
+        if blackout:
+            return False, reason, 0.0
+
+        # ARMS-V2.1: Weekly/monthly loss caps (§10)
+        ok, reason = self.check_weekly_monthly_limits()
+        if not ok:
+            return False, reason, 0.0
+
         ok, reason = self._check_cooldown(signal.symbol)
         if not ok:
             return False, reason, 0.0
@@ -386,11 +930,24 @@ class RiskManager:
         if size <= 0:
             return False, "position_size_zero", 0.0
 
+        # ARMS-V2.1: Per-tier risk adjustment (§8)
+        tier = int(signal.metadata.get("pair_tier", 0)) if signal.metadata else 0
+        if tier > 0:
+            tier_risk = self.get_tier_risk_pct(tier)
+            if tier_risk > 0 and self._risk_per_trade > 0:
+                tier_mult = tier_risk / self._risk_per_trade
+                size *= tier_mult
+
         ok, reason = self._check_symbol_exposure(signal, size)
         if not ok:
             return False, reason, 0.0
 
         ok, reason = self._check_max_order_size(size)
+        if not ok:
+            return False, reason, 0.0
+
+        # ARMS-V2.1: Correlation group check (§8)
+        ok, reason = self.check_group_exposure(signal.symbol)
         if not ok:
             return False, reason, 0.0
 
@@ -409,6 +966,47 @@ class RiskManager:
             size = min(size, self._equity * self._max_position_pct * self._leverage * 0.5)
             if size <= 0:
                 return False, "position_size_zero (VaR cold start)", 0.0
+
+        # ── ARMS-V2.1: Drawdown recovery phase gate ──────────────────────
+        dd_phase = self.update_drawdown_phase()
+        dd_max_pos = self.get_drawdown_max_positions()
+        if len(self._positions) >= dd_max_pos:
+            return False, f"drawdown_phase_{dd_phase}_max_positions ({dd_max_pos})", 0.0
+        dd_mult = self.get_drawdown_size_multiplier()
+        if dd_mult <= 0:
+            return False, f"drawdown_phase_{dd_phase}_blocks_trading", 0.0
+        size *= dd_mult
+
+        # ── ARMS-V2.1: ATR percentile volatility scaling ─────────────────
+        atr_pctile = float(signal.metadata.get("atr_percentile", 50)) if signal.metadata else 50.0
+        vol_mult = self.get_atr_volatility_multiplier(atr_pctile)
+        size *= vol_mult
+
+        # ── ARMS-V2.1: Funding rate directional bias ─────────────────────
+        funding_mult = self.get_funding_size_multiplier(signal.symbol, signal.direction)
+        if funding_mult <= 0:
+            return False, f"funding_rate_blocks_{signal.direction}", 0.0
+        size *= funding_mult
+
+        # ── ARMS-V2.1: Weekend sizing reduction (§12) ────────────────────
+        if weekend_mult < 1.0:
+            size *= weekend_mult
+
+        # ── ARMS-V2.1: Dynamic leverage cap from ADX/ATR (§10) ───────────
+        adx_val = float(signal.metadata.get("adx", 25)) if signal.metadata else 25.0
+        atr_pctile_val = float(signal.metadata.get("atr_percentile", 50)) if signal.metadata else 50.0
+        dyn_lev = self.get_dynamic_leverage(adx_val, atr_pctile_val)
+        if dyn_lev < self._leverage and self._leverage > 0:
+            lev_adjustment = dyn_lev / self._leverage
+            size *= lev_adjustment
+
+        # ── ARMS-V2.1: Correlation check ─────────────────────────────────
+        ok, reason = self.check_correlation_exposure(signal.symbol, signal.direction)
+        if not ok:
+            return False, reason, 0.0
+
+        if size <= 0:
+            return False, "position_size_zero (after ARMS adjustments)", 0.0
 
         return True, "approved", size
 
@@ -458,9 +1056,17 @@ class RiskManager:
     def compute_atr_stops(
         self, signal: TradingSignal
     ) -> tuple[float, float]:
-        """Compute ATR-based SL and RR-based TP."""
-        atr = signal.atr if signal.atr > 0 else signal.price * 0.01
-        sl_distance = atr * self._atr_sl_multiplier
+        """Compute ATR-based SL (with adaptive multiplier) and tiered TP."""
+        raw_atr = signal.atr if signal.atr and signal.atr > 0 else 0.0
+        # Guard against NaN
+        if raw_atr != raw_atr:  # NaN check
+            raw_atr = 0.0
+        atr = raw_atr if raw_atr > 0 else signal.price * 0.01
+
+        # ARMS-V2.1: Adaptive SL multiplier based on ATR percentile
+        atr_pctile = float(signal.metadata.get("atr_percentile", 50)) if signal.metadata else 50.0
+        sl_mult = self.get_adaptive_sl_multiplier(atr_pctile)
+        sl_distance = atr * sl_mult
 
         if signal.is_long:
             sl = signal.price - sl_distance
@@ -524,6 +1130,8 @@ class RiskManager:
                 self._equity = 0.0
                 self._killed = True
             self.record_return(pos.pnl_pct)
+            self._record_loss_for_period(pos.pnl_pct)
+            self.record_trade_result(pos.pnl_pct > 0)
             self._circuit_breaker.record_pnl(pos.pnl_pct, self._equity)
             self._last_trade_time[symbol] = time.time()
             logger.info(
@@ -585,6 +1193,8 @@ class RiskManager:
                 if self._equity < 0:
                     self._equity = 0.0
                 self.record_return(pos.pnl_pct)
+                self._record_loss_for_period(pos.pnl_pct)
+                self.record_trade_result(pos.pnl_pct > 0)
                 self._circuit_breaker.record_pnl(pos.pnl_pct, self._equity)
                 self._last_trade_time[pos.symbol] = time.time()
                 self._positions.pop(key, None)
@@ -598,6 +1208,7 @@ class RiskManager:
 
     def deactivate_kill_switch(self) -> None:
         self._killed = False
+        self._equity_unreconciled = False
         logger.info("Kill switch deactivated")
 
     @property
@@ -689,6 +1300,12 @@ class RiskManager:
             "circuit_breaker_reason": self._circuit_breaker.trip_reason,
             "kill_switch_active": self._killed,
             "current_drawdown_pct": self.current_drawdown_pct(),
+            "drawdown_phase": self._current_dd_phase,
+            "consecutive_profitable": self._consecutive_profitable,
+            "weekly_loss_pct": self._weekly_loss,
+            "monthly_loss_pct": self._monthly_loss,
+            "is_weekend": self.is_weekend(),
+            "active_sessions": self.get_active_sessions(),
         }
 
     async def update_prices(self, exchange: str, symbol: str, price: float) -> None:
@@ -698,6 +1315,53 @@ class RiskManager:
             if pos is None:
                 return
             pos.update_price(price)
+
+            # ARMS-V2.1: Liquidation safety layer
+            liq_action = self.check_liquidation_distance(pos)
+            if liq_action == "emergency_close":
+                logger.critical("LIQUIDATION EMERGENCY for {}/{} — closing position", exchange, symbol)
+                self.event_bus.publish_nowait("STOP_LOSS", {
+                    "exchange": exchange, "symbol": symbol, "price": price,
+                    "reason": "liquidation_emergency",
+                })
+                return
+            elif liq_action == "partial_close":
+                logger.warning("Liquidation danger for {}/{} — partial close triggered", exchange, symbol)
+                self.event_bus.publish_nowait("PARTIAL_CLOSE", {
+                    "exchange": exchange, "symbol": symbol, "price": price,
+                    "reason": "liquidation_partial", "close_pct": 0.5,
+                })
+            elif liq_action == "warning":
+                logger.warning("Liquidation warning for {}/{} — distance shrinking", exchange, symbol)
+
+            # ARMS-V2.1: Tiered take-profit check
+            tp_tiers = self.compute_tiered_tp(
+                pos.entry_price,
+                abs(pos.entry_price - pos.stop_loss),
+                pos.is_long,
+            )
+            for i, tp_tier in enumerate(tp_tiers):
+                if tp_tier.get("trail"):
+                    continue  # Trail handled by trailing stop logic
+                tp_price = tp_tier["price"]
+                if pos.is_long and price >= tp_price:
+                    close_pct = tp_tier["close_pct"]
+                    logger.info("TP{} hit for {}/{} at {:.2f} — close {:.0%}",
+                                i + 1, exchange, symbol, price, close_pct)
+                    self.event_bus.publish_nowait("PARTIAL_CLOSE", {
+                        "exchange": exchange, "symbol": symbol, "price": price,
+                        "reason": f"tp{i+1}", "close_pct": close_pct,
+                    })
+                    break
+                elif not pos.is_long and price <= tp_price:
+                    close_pct = tp_tier["close_pct"]
+                    logger.info("TP{} hit for {}/{} at {:.2f} — close {:.0%}",
+                                i + 1, exchange, symbol, price, close_pct)
+                    self.event_bus.publish_nowait("PARTIAL_CLOSE", {
+                        "exchange": exchange, "symbol": symbol, "price": price,
+                        "reason": f"tp{i+1}", "close_pct": close_pct,
+                    })
+                    break
 
             # Run position management (trailing stop, breakeven, time exit)
             exit_reason = self.manage_position(pos)
