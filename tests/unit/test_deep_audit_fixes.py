@@ -328,7 +328,9 @@ class TestDashboardApiTimingSafe:
         from interface.dashboard_api import build_app
         source = inspect.getsource(build_app)
         assert "hmac.compare_digest" in source
-        assert "import hmac" in open("/workspaces/nueral-trader-5/interface/dashboard_api.py").read()
+        import pathlib
+        _repo = pathlib.Path(__file__).resolve().parent.parent.parent
+        assert "import hmac" in (_repo / "interface" / "dashboard_api.py").read_text()
 
     def test_hmac_compare_digest_equality(self):
         """Sanity check that hmac.compare_digest correctly validates."""

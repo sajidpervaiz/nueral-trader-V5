@@ -305,4 +305,5 @@ def test_index_fetch_targets_are_implemented(ui_client: TestClient) -> None:
         assert resp.status_code == 200, f"missing/broken endpoint for UI fetch target: {probe}"
 
     # Ensure static file still exists where the browser serves it from.
-    assert Path("/workspaces/nueral-trader-5/interface/static/index.html").exists()
+    _repo = Path(__file__).resolve().parent.parent.parent
+    assert (_repo / "interface" / "static" / "index.html").exists()

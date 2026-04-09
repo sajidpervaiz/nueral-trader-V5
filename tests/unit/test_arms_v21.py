@@ -341,8 +341,8 @@ class TestARMSTechnicalIndicators:
         upper, mid, lower = _keltner_channels(df["close"], df["high"], df["low"])
         assert len(upper) == len(df)
         # Upper > mid > lower for non-nan values
-        valid = upper.dropna() > mid.dropna()
-        assert valid.all() or len(valid) == 0
+        mask = upper.notna() & mid.notna() & lower.notna()
+        assert (upper[mask] > mid[mask]).all() or mask.sum() == 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
