@@ -45,24 +45,29 @@ class CircuitBreaker:
 
     async def call(self, func: Callable, *args, **kwargs):
         """Execute function with circuit breaker protection."""
-        if self.state == CircuitState.OPEN:
-            if time.time() - self.last_failure_time >= self.recovery_timeout:
-                await self._transition_to_half_open()
-            else:
-                raise Exception("Circuit breaker is OPEN - rejecting call")
+        async with self._lock:
+            if self.state == CircuitState.OPEN:
+                if time.time() - self.last_failure_time >= self.recovery_timeout:
+                    self.state = CircuitState.HALF_OPEN
+                    self.success_count = 0
+                    logger.info("Circuit breaker transitioned to HALF_OPEN for recovery testing")
+                else:
+                    raise Exception("Circuit breaker is OPEN - rejecting call")
 
         try:
             result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
-            self.record_success()
-            self._call_stats["total"] += 1
-            self._call_stats["success"] += 1
+            async with self._lock:
+                self.record_success()
+                self._call_stats["total"] += 1
+                self._call_stats["success"] += 1
             return result
 
         except Exception as e:
-            if isinstance(e, self.expected_exception):
-                self.record_failure()
-            self._call_stats["total"] += 1
-            self._call_stats["failure"] += 1
+            async with self._lock:
+                if isinstance(e, self.expected_exception):
+                    self.record_failure()
+                self._call_stats["total"] += 1
+                self._call_stats["failure"] += 1
             raise
 
     def record_success(self) -> None:
@@ -70,7 +75,9 @@ class CircuitBreaker:
         if self.state == CircuitState.HALF_OPEN:
             self.success_count += 1
             if self.success_count >= self.half_open_success_threshold:
-                asyncio.create_task(self._transition_to_closed())
+                self.state = CircuitState.CLOSED
+                self.failure_count = 0
+                logger.info("Circuit breaker CLOSED after successful recovery")
         elif self.state == CircuitState.CLOSED:
             self.failure_count = 0
 

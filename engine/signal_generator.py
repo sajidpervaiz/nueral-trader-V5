@@ -13,6 +13,7 @@ from core.config import Config
 from core.event_bus import EventBus
 from analysis.data_manager import DataManager
 from analysis.regime import MarketRegime, RegimeState
+from engine.strategy_modules import StrategySelector, StrategySignal
 
 
 @dataclass
@@ -307,6 +308,7 @@ class SignalGenerator:
         self._ml_scorer = MLScorer()
         self._news_scorer = NewsScorer()
         self._orderbook_scorer = OrderbookScorer()
+        self._strategy_selector = StrategySelector()
         self._running = False
         self._sentiment_score: float = 0.0
         self._macro_score: float = 0.0
@@ -357,10 +359,13 @@ class SignalGenerator:
         if not self._confirmation_tfs:
             return True, ""
 
+        checked_any = False
         for tf in self._confirmation_tfs:
             htf_df = self.data_manager.get_dataframe(exchange, symbol, tf)
             if htf_df is None or len(htf_df) < 20:
                 continue  # no data — skip this TF rather than block
+
+            checked_any = True
 
             last = htf_df.iloc[-1]
             ema_fast = last.get("ema_12", last.get("close", 0))
@@ -376,6 +381,12 @@ class SignalGenerator:
                 return False, f"{tf}_trend_bearish (EMA12={ema_fast:.2f} < EMA26={ema_slow:.2f})"
             if direction == "short" and htf_bullish:
                 return False, f"{tf}_trend_bullish (EMA12={ema_fast:.2f} > EMA26={ema_slow:.2f})"
+
+        if not checked_any:
+            logger.warning(
+                "HTF confirmation bypassed for {}:{} — no data for any of {}",
+                exchange, symbol, self._confirmation_tfs,
+            )
 
         return True, ""
 
@@ -395,6 +406,11 @@ class SignalGenerator:
 
         regime_state = self.data_manager.get_regime(candle.exchange, candle.symbol)
 
+        # ── ARMS-V2.1: Regime-gated strategy module evaluation ────────────
+        strategy_signal: StrategySignal | None = None
+        if regime_state and regime_state.regime != MarketRegime.UNKNOWN:
+            strategy_signal = self._strategy_selector.select_and_evaluate(df, regime_state)
+
         # ── 6-factor composite scoring ────────────────────────────────────
         tech_score, tech_reasons = self._technical_scorer.score(df)
         ml_score = self._ml_scorer.score(df)
@@ -409,6 +425,20 @@ class SignalGenerator:
             + self._news_weight * news_score
             + self._orderbook_weight * ob_score
         )
+
+        # If strategy module fired, blend its direction and boost score
+        if strategy_signal is not None:
+            strat_direction = 1.0 if strategy_signal.is_long else -1.0
+            composite_direction = 1.0 if composite > 0 else -1.0
+            # Strategy agreement boosts composite; disagreement attenuates
+            if strat_direction == composite_direction:
+                composite = composite * 1.0 + strat_direction * strategy_signal.score * 0.3
+            else:
+                # Strategy module overrides if its score is high enough
+                if strategy_signal.score > 0.6:
+                    composite = strat_direction * strategy_signal.score * 0.8
+                else:
+                    composite *= 0.5  # attenuate conflicting signal
 
         abs_score = abs(composite)
         if abs_score < self._min_score:
@@ -490,6 +520,9 @@ class SignalGenerator:
 
         # ── Build reasons list ─────────────────────────────────────────────
         reasons: list[str] = list(tech_reasons)
+        if strategy_signal is not None:
+            reasons.extend(strategy_signal.reasons)
+            reasons.append(f"strategy:{strategy_signal.strategy}")
         if abs(ml_score) > 0.3:
             reasons.append(f"ML_{'bullish' if ml_score > 0 else 'bearish'}")
         if abs(self._sentiment_score) > 0.3:
@@ -523,6 +556,8 @@ class SignalGenerator:
             metadata={
                 "timeframe": self._primary_tf,
                 "factors_active": active_factors,
+                "strategy": strategy_signal.strategy if strategy_signal else "composite",
+                "strategy_score": strategy_signal.score if strategy_signal else 0.0,
                 "weights": {
                     "technical": self._tech_weight,
                     "ml": self._ml_weight,

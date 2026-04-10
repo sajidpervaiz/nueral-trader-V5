@@ -16,6 +16,8 @@ from core.event_bus import EventBus
 from core.circuit_breaker import CircuitBreaker
 from core.persistent_idempotency import PersistentIdempotencyManager
 from core.retry import RetryPolicy
+from execution.order_splitter import TWAPExecutor, IcebergExecutor
+from execution.shadow_sl import ShadowStopManager
 
 
 class OrderStatus(Enum):
@@ -162,12 +164,85 @@ class OrderManager:
         self.audit_log: List[Dict] = []
         self.max_audit_log_size = 100000
         self.smart_router: Any = None
+
+        # ── ARMS-V2.1: Order splitting (§13) ────────────────────────────────
+        arms_cfg = config.get_value("arms") or {}
+        splitting_cfg = arms_cfg.get("order_splitting", {})
+        self.twap_executor = TWAPExecutor(
+            num_slices=int(splitting_cfg.get("twap_slices", 5)),
+            duration_seconds=float(splitting_cfg.get("twap_duration_seconds", 300)),
+            size_threshold_usd=float(splitting_cfg.get("twap_threshold_usd", 50_000)),
+        )
+        self.iceberg_executor = IcebergExecutor(
+            visible_pct=float(splitting_cfg.get("iceberg_visible_pct", 0.20)),
+            size_threshold_usd=float(splitting_cfg.get("iceberg_threshold_usd", 100_000)),
+        )
+
+        # ── ARMS-V2.1: Shadow stop-loss (§13) ────────────────────────────────
+        shadow_cfg = arms_cfg.get("shadow_sl", {})
+        self.shadow_sl = ShadowStopManager(
+            primary_timeout_seconds=float(shadow_cfg.get("primary_timeout", 5.0)),
+            max_retries=int(shadow_cfg.get("max_retries", 3)),
+            shadow_check_interval=float(shadow_cfg.get("check_interval", 1.0)),
+            fallback_grace_seconds=float(shadow_cfg.get("fallback_grace", 10.0)),
+        )
+
         self._lock = asyncio.Lock()
         self._running = False
         self._audit_log_path = audit_log_path
         self._order_state_path = order_state_path
         self._load_audit_log()
         self._load_order_state()
+
+    def get_split_strategy(self, notional_usd: float) -> Optional[str]:
+        """Return 'iceberg', 'twap', or None based on order notional size."""
+        if self.iceberg_executor.should_split(notional_usd):
+            return "iceberg"
+        if self.twap_executor.should_split(notional_usd):
+            return "twap"
+        return None
+
+    def get_twap_snapshot(self) -> Dict:
+        """Active TWAP orders snapshot."""
+        active = self.twap_executor.get_active_orders()
+        return {
+            "active_count": len(active),
+            "orders": {
+                oid: {
+                    "symbol": s.symbol,
+                    "direction": s.direction,
+                    "total_size": s.total_size,
+                    "filled_size": s.filled_size,
+                    "remaining_size": s.remaining_size,
+                    "children": len(s.children),
+                    "status": s.status,
+                }
+                for oid, s in active.items()
+            },
+        }
+
+    def get_iceberg_snapshot(self) -> Dict:
+        """Active Iceberg orders snapshot."""
+        active = self.iceberg_executor.get_active_orders()
+        return {
+            "active_count": len(active),
+            "orders": {
+                oid: {
+                    "symbol": s.symbol,
+                    "direction": s.direction,
+                    "total_size": s.total_size,
+                    "filled_size": s.filled_size,
+                    "remaining_size": s.remaining_size,
+                    "children": len(s.children),
+                    "status": s.status,
+                }
+                for oid, s in active.items()
+            },
+        }
+
+    def get_shadow_sl_snapshot(self) -> Dict:
+        """Shadow stop-loss status snapshot."""
+        return self.shadow_sl.get_snapshot()
 
     def _save_audit_log(self):
         import json
@@ -373,6 +448,16 @@ class OrderManager:
             if self_trade_reason:
                 logger.warning(f"Self-trade prevented for {symbol}: {self_trade_reason}")
                 return False, None, self_trade_reason
+
+            # ARMS-V2.1: Annotate split strategy recommendation
+            notional_usd = quantity * price if price else 0.0
+            split_strategy = self.get_split_strategy(notional_usd)
+            if split_strategy:
+                metadata["split_strategy"] = split_strategy
+                logger.info(
+                    "Large order detected: {} {} notional=${:.0f} — recommending {}",
+                    symbol, side.value, notional_usd, split_strategy,
+                )
 
             # Create order
             order_id = f"ord_{uuid.uuid4().hex[:12]}_{int(time.time() * 1000)}"

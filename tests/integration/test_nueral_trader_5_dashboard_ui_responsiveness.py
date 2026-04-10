@@ -148,7 +148,7 @@ def test_dashboard_root_serves_ui_html(ui_client: TestClient) -> None:
     resp = ui_client.get("/")
     assert resp.status_code == 200
     body = resp.text
-    assert "toggleTradingMode()" in body
+    assert "toggleAuto()" in body
     assert "executeTrade('BUY')" in body
     assert "/api/realtime/stream" in body
 
@@ -305,4 +305,5 @@ def test_index_fetch_targets_are_implemented(ui_client: TestClient) -> None:
         assert resp.status_code == 200, f"missing/broken endpoint for UI fetch target: {probe}"
 
     # Ensure static file still exists where the browser serves it from.
-    assert Path("/workspaces/nueral-trader-5/interface/static/index.html").exists()
+    _repo = Path(__file__).resolve().parent.parent.parent
+    assert (_repo / "interface" / "static" / "index.html").exists()

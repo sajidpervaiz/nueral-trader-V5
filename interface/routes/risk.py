@@ -287,3 +287,176 @@ async def run_stress_test(
     except Exception as e:
         logger.error(f"Error running stress test: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ARMS-V2.1 endpoints
+# ══════════════════════════════════════════════════════════════════════════
+
+@router.get("/arms/snapshot")
+async def arms_snapshot():
+    """Full ARMS-V2.1 risk snapshot — tier risk, drawdown, blackout, leverage, etc."""
+    try:
+        manager = _require_risk_manager()
+        base = manager.get_risk_snapshot()
+
+        # Tier risk percentages
+        tier_risk = {}
+        for tier in range(1, 4):
+            tier_risk[tier] = manager.get_tier_risk_pct(tier)
+
+        # Drawdown phase details
+        dd_phase = manager.update_drawdown_phase()
+        dd_mult = manager.get_drawdown_size_multiplier()
+        dd_max_pos = manager.get_drawdown_max_positions()
+
+        # Event blackout
+        blackout_active, blackout_reason = manager.is_event_blackout()
+
+        # Weekend
+        weekend_mult = manager.get_weekend_sizing_mult()
+
+        # Weekly/monthly limits
+        wm_ok, wm_reason = manager.check_weekly_monthly_limits()
+
+        # Group exposure summary
+        groups: dict[str, dict] = {}
+        for group_name, symbols in getattr(manager, "_correlation_groups", {}).items():
+            notional = 0.0
+            for pos in manager.positions.values():
+                if pos.symbol in symbols:
+                    notional += abs(pos.size * pos.current_price)
+            max_notional = manager.equity * getattr(manager, "_max_group_exposure_pct", 1.0)
+            groups[group_name] = {
+                "symbols": list(symbols),
+                "notional": notional,
+                "max_notional": max_notional,
+                "utilization_pct": (notional / max_notional * 100) if max_notional > 0 else 0,
+            }
+
+        return {
+            **base,
+            "tier_risk": tier_risk,
+            "drawdown_phase": dd_phase,
+            "drawdown_size_multiplier": dd_mult,
+            "drawdown_max_positions": dd_max_pos,
+            "blackout_active": blackout_active,
+            "blackout_reason": blackout_reason,
+            "weekend_sizing_mult": weekend_mult,
+            "weekly_monthly_ok": wm_ok,
+            "weekly_monthly_reason": wm_reason,
+            "correlation_groups": groups,
+        }
+
+    except Exception as e:
+        logger.error(f"ARMS snapshot error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/arms/tier-risk")
+async def get_tier_risk():
+    """Per-tier risk-per-trade percentages."""
+    try:
+        manager = _require_risk_manager()
+        return {
+            "tiers": {tier: manager.get_tier_risk_pct(tier) for tier in range(1, 4)},
+            "default_risk_per_trade": float(getattr(manager, "_risk_per_trade", 0.01)),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/arms/group-exposure")
+async def get_group_exposure():
+    """Correlation group exposure breakdown."""
+    try:
+        manager = _require_risk_manager()
+        groups: dict[str, dict] = {}
+        for group_name, symbols in getattr(manager, "_correlation_groups", {}).items():
+            notional = 0.0
+            for pos in manager.positions.values():
+                if pos.symbol in symbols:
+                    notional += abs(pos.size * pos.current_price)
+            max_notional = manager.equity * getattr(manager, "_max_group_exposure_pct", 1.0)
+            groups[group_name] = {
+                "symbols": list(symbols),
+                "notional": notional,
+                "max_notional": max_notional,
+                "utilization_pct": (notional / max_notional * 100) if max_notional > 0 else 0,
+            }
+        return {"groups": groups}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/arms/blackout")
+async def get_blackout_status():
+    """Event blackout status."""
+    try:
+        manager = _require_risk_manager()
+        active, reason = manager.is_event_blackout()
+        events = getattr(manager, "_upcoming_events", [])
+        return {
+            "blackout_active": active,
+            "reason": reason,
+            "upcoming_events": events,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/arms/dynamic-leverage")
+async def get_dynamic_leverage(
+    adx: float = Query(25.0, description="ADX value"),
+    atr_percentile: float = Query(50.0, description="ATR percentile"),
+):
+    """ADX/ATR-linked dynamic leverage calculation."""
+    try:
+        manager = _require_risk_manager()
+        lev = manager.get_dynamic_leverage(adx, atr_percentile)
+        return {
+            "adx": adx,
+            "atr_percentile": atr_percentile,
+            "dynamic_leverage": lev,
+            "max_leverage": float(getattr(manager, "_leverage", 1.0)),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/arms/margin-modes")
+async def get_margin_modes():
+    """Margin mode for each open position."""
+    try:
+        manager = _require_risk_manager()
+        modes = {}
+        for key, pos in manager.positions.items():
+            modes[key] = {
+                "symbol": pos.symbol,
+                "margin_mode": manager.get_margin_mode(pos.symbol),
+            }
+        return {"positions": modes}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/arms/liq-check")
+async def trigger_liq_check():
+    """Manually trigger liquidation distance check."""
+    try:
+        manager = _require_risk_manager()
+        actions = manager.run_periodic_liq_check()
+        return {"actions": actions, "checked_positions": len(manager.positions)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/arms/funding-recheck")
+async def trigger_funding_recheck():
+    """Manually trigger funding recheck for existing positions."""
+    try:
+        manager = _require_risk_manager()
+        actions = manager.check_funding_existing_positions()
+        return {"actions": actions, "checked_positions": len(manager.positions)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

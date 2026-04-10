@@ -98,6 +98,49 @@ def _vwap(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series) 
     return cum_tp_vol / cum_vol.replace(0, np.nan)
 
 
+def _keltner_channels(
+    close: pd.Series, high: pd.Series, low: pd.Series,
+    period: int = 20, multiplier: float = 1.5,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Keltner Channels: EMA ± multiplier * ATR."""
+    ema = _ema(close, period)
+    atr_s = _atr(high, low, close, period)
+    upper = ema + multiplier * atr_s
+    lower = ema - multiplier * atr_s
+    return upper, ema, lower
+
+
+def _adx_di(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Compute ADX, +DI, -DI as full Series."""
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_close = close.shift(1)
+
+    dm_plus = (high - prev_high).clip(lower=0)
+    dm_minus = (prev_low - low).clip(lower=0)
+    mask = dm_plus <= dm_minus
+    dm_plus = dm_plus.copy()
+    dm_plus[mask] = 0
+    dm_minus = dm_minus.copy()
+    mask2 = dm_minus <= dm_plus
+    dm_minus[mask2] = 0
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    atr_s = tr.ewm(com=period - 1, adjust=False).mean()
+    di_plus = 100 * dm_plus.ewm(com=period - 1, adjust=False).mean() / atr_s.replace(0, np.nan)
+    di_minus = 100 * dm_minus.ewm(com=period - 1, adjust=False).mean() / atr_s.replace(0, np.nan)
+    dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan)
+    adx = dx.ewm(com=period - 1, adjust=False).mean()
+    return adx, di_plus, di_minus
+
+
 class TechnicalIndicators:
     def __init__(self) -> None:
         self._cache: dict[str, Any] = {}
@@ -115,6 +158,7 @@ class TechnicalIndicators:
         df["ema_9"] = _ema(close, 9)
         df["ema_21"] = _ema(close, 21)
         df["ema_50"] = _ema(close, 50)
+        df["ema_55"] = _ema(close, 55)
         df["ema_200"] = _ema(close, 200)
         df["sma_20"] = _sma(close, 20)
         df["sma_50"] = _sma(close, 50)
@@ -131,14 +175,46 @@ class TechnicalIndicators:
         df["bb_width"] = (bb_upper - bb_lower) / bb_mid.replace(0, np.nan)
         df["bb_pct"] = (close - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
 
+        # ARMS-V2.1: BB width percentile (200-candle rolling rank)
+        df["bb_width_percentile"] = df["bb_width"].rolling(200, min_periods=20).apply(
+            lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100, raw=False,
+        )
+
         df["atr_14"] = _atr(high, low, close, 14)
         df["atr_pct"] = df["atr_14"] / close.replace(0, np.nan)
+
+        # ARMS-V2.1: ATR percentile (200-candle rolling rank)
+        df["atr_percentile"] = df["atr_14"].rolling(200, min_periods=20).apply(
+            lambda x: pd.Series(x).rank(pct=True).iloc[-1] * 100, raw=False,
+        )
 
         stoch_k, stoch_d = _stochastic(high, low, close)
         df["stoch_k"] = stoch_k
         df["stoch_d"] = stoch_d
 
         df["vwap"] = _vwap(high, low, close, volume)
+
+        # ARMS-V2.1: ADX, +DI, -DI as columns
+        adx_s, di_plus_s, di_minus_s = _adx_di(high, low, close)
+        df["adx"] = adx_s
+        df["plus_di"] = di_plus_s
+        df["minus_di"] = di_minus_s
+
+        # ARMS-V2.1: Keltner Channels
+        kc_upper, kc_mid, kc_lower = _keltner_channels(close, high, low)
+        df["kc_upper"] = kc_upper
+        df["kc_mid"] = kc_mid
+        df["kc_lower"] = kc_lower
+
+        # ARMS-V2.1: Keltner squeeze (BB inside KC)
+        df["keltner_squeeze"] = (df["bb_upper"] < kc_upper) & (df["bb_lower"] > kc_lower)
+
+        # ARMS-V2.1: EMA200 slope (10-bar percentage change)
+        df["ema200_slope"] = df["ema_200"].pct_change(10)
+
+        # ARMS-V2.1: Volume SMA(20)
+        df["volume_sma_20"] = _sma(volume, 20)
+        df["volume_ratio"] = volume / df["volume_sma_20"].replace(0, np.nan)
 
         df["returns_1"] = close.pct_change(1)
         df["returns_5"] = close.pct_change(5)
@@ -148,5 +224,9 @@ class TechnicalIndicators:
 
         df["trend_ema"] = np.where(df["ema_21"] > df["ema_50"], 1.0, -1.0)
         df["momentum_rsi"] = np.where(df["rsi_14"] > 50, 1.0, -1.0)
+
+        # ARMS-V2.1: 50-candle high/low for breakout detection
+        df["high_50"] = high.rolling(50, min_periods=10).max()
+        df["low_50"] = low.rolling(50, min_periods=10).min()
 
         return df.dropna(subset=["rsi_14", "ema_21", "macd"])

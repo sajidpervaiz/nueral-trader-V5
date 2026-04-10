@@ -98,12 +98,48 @@ class Metrics:
                 "Health of external services (1=up, 0=down)",
                 ["service"],
             )
+            self.alerts_total = Counter(
+                "neuraltrader_alerts_total",
+                "Total alerts fired by type and severity",
+                ["alert_type", "severity"],
+            )
+            self.alerts_suppressed_total = Counter(
+                "neuraltrader_alerts_suppressed_total",
+                "Total alerts suppressed by throttling",
+            )
+            self.circuit_breaker_trips_total = Counter(
+                "neuraltrader_circuit_breaker_trips_total",
+                "Total circuit breaker trips",
+                ["reason"],
+            )
+            self.safe_mode_active = Gauge(
+                "neuraltrader_safe_mode_active",
+                "Whether safe mode is currently active (1=yes, 0=no)",
+            )
+            self.kill_switch_active = Gauge(
+                "neuraltrader_kill_switch_active",
+                "Whether kill switch is active (1=yes, 0=no)",
+            )
+            self.stop_loss_hits_total = Counter(
+                "neuraltrader_stop_loss_hits_total",
+                "Total stop loss events",
+                ["exchange", "symbol"],
+            )
+            self.take_profit_hits_total = Counter(
+                "neuraltrader_take_profit_hits_total",
+                "Total take profit events",
+                ["exchange", "symbol"],
+            )
         else:
             for name in [
                 "ticks_total", "signals_total", "orders_total",
                 "open_positions", "equity", "daily_pnl",
                 "funding_rate", "open_interest_usd", "vix_proxy",
                 "rust_tick_latency", "dex_quote_latency", "service_health",
+                "alerts_total", "alerts_suppressed_total",
+                "circuit_breaker_trips_total", "safe_mode_active",
+                "kill_switch_active", "stop_loss_hits_total",
+                "take_profit_hits_total",
             ]:
                 setattr(self, name, _noop())
 
@@ -145,6 +181,21 @@ class Metrics:
             for v in payload:
                 self.vix_proxy.labels(symbol=v.symbol, lookback_days=v.lookback_days).set(v.annualized)
 
+    async def _handle_stop_loss(self, payload: Any) -> None:
+        data = payload if isinstance(payload, dict) else {}
+        exchange = data.get("exchange", "unknown")
+        symbol = data.get("symbol", "unknown")
+        self.stop_loss_hits_total.labels(exchange=exchange, symbol=symbol).inc()
+
+    async def _handle_take_profit(self, payload: Any) -> None:
+        data = payload if isinstance(payload, dict) else {}
+        exchange = data.get("exchange", "unknown")
+        symbol = data.get("symbol", "unknown")
+        self.take_profit_hits_total.labels(exchange=exchange, symbol=symbol).inc()
+
+    async def _handle_kill_switch(self, payload: Any) -> None:
+        self.kill_switch_active.set(1)
+
     async def run(self) -> None:
         self._running = True
         mon_cfg = self.config.get_value("monitoring", "prometheus") or {}
@@ -162,6 +213,9 @@ class Metrics:
         self.event_bus.subscribe("FUNDING_RATE", self._handle_funding)
         self.event_bus.subscribe("OPEN_INTEREST", self._handle_oi)
         self.event_bus.subscribe("VOLATILITY_INDEX", self._handle_vix)
+        self.event_bus.subscribe("STOP_LOSS", self._handle_stop_loss)
+        self.event_bus.subscribe("TAKE_PROFIT", self._handle_take_profit)
+        self.event_bus.subscribe("KILL_SWITCH", self._handle_kill_switch)
 
         while self._running:
             await asyncio.sleep(15)
@@ -174,3 +228,6 @@ class Metrics:
         self.event_bus.unsubscribe("FUNDING_RATE", self._handle_funding)
         self.event_bus.unsubscribe("OPEN_INTEREST", self._handle_oi)
         self.event_bus.unsubscribe("VOLATILITY_INDEX", self._handle_vix)
+        self.event_bus.unsubscribe("STOP_LOSS", self._handle_stop_loss)
+        self.event_bus.unsubscribe("TAKE_PROFIT", self._handle_take_profit)
+        self.event_bus.unsubscribe("KILL_SWITCH", self._handle_kill_switch)

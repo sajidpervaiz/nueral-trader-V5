@@ -116,19 +116,144 @@ TRADING_DDL = [
     CREATE_DAILY_PNL,
 ]
 
+# ── Audit-trail tables (Prompt 5) ────────────────────────────────────────
+
+CREATE_SIGNAL_EVENTS = """
+CREATE TABLE IF NOT EXISTS signal_events (
+    id              BIGSERIAL PRIMARY KEY,
+    time            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    correlation_id  TEXT,
+    exchange        TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    score           DOUBLE PRECISION NOT NULL,
+    technical_score DOUBLE PRECISION DEFAULT 0,
+    ml_score        DOUBLE PRECISION DEFAULT 0,
+    sentiment_score DOUBLE PRECISION DEFAULT 0,
+    macro_score     DOUBLE PRECISION DEFAULT 0,
+    news_score      DOUBLE PRECISION DEFAULT 0,
+    orderbook_score DOUBLE PRECISION DEFAULT 0,
+    regime          TEXT,
+    regime_confidence DOUBLE PRECISION DEFAULT 0,
+    price           DOUBLE PRECISION NOT NULL,
+    atr             DOUBLE PRECISION,
+    stop_loss       DOUBLE PRECISION,
+    take_profit     DOUBLE PRECISION,
+    factors_active  INTEGER DEFAULT 0,
+    acted_on        BOOLEAN DEFAULT FALSE,
+    metadata        JSONB DEFAULT '{}'
+);
+"""
+
+CREATE_RISK_DECISIONS = """
+CREATE TABLE IF NOT EXISTS risk_decisions (
+    id              BIGSERIAL PRIMARY KEY,
+    time            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    correlation_id  TEXT,
+    exchange        TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    decision        TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    signal_score    DOUBLE PRECISION DEFAULT 0,
+    signal_direction TEXT,
+    portfolio_heat  DOUBLE PRECISION DEFAULT 0,
+    drawdown_pct    DOUBLE PRECISION DEFAULT 0,
+    metadata        JSONB DEFAULT '{}'
+);
+"""
+
+CREATE_USER_STREAM_EVENTS = """
+CREATE TABLE IF NOT EXISTS user_stream_events (
+    id              BIGSERIAL PRIMARY KEY,
+    time            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    event_type      TEXT NOT NULL,
+    exchange        TEXT NOT NULL DEFAULT 'binance',
+    correlation_id  TEXT,
+    raw_payload     JSONB NOT NULL,
+    processed       BOOLEAN DEFAULT FALSE
+);
+"""
+
+CREATE_RECONCILIATION_EVENTS = """
+CREATE TABLE IF NOT EXISTS reconciliation_events (
+    id                  BIGSERIAL PRIMARY KEY,
+    reconciliation_id   TEXT NOT NULL UNIQUE,
+    time                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    success             BOOLEAN NOT NULL,
+    safe_mode           BOOLEAN DEFAULT FALSE,
+    exchange_positions  INTEGER DEFAULT 0,
+    db_positions        INTEGER DEFAULT 0,
+    open_orders         INTEGER DEFAULT 0,
+    mismatches          JSONB DEFAULT '[]',
+    positions_without_sl JSONB DEFAULT '[]',
+    actions_taken       JSONB DEFAULT '[]',
+    balance             DOUBLE PRECISION DEFAULT 0,
+    leverage_settings   JSONB DEFAULT '{}'
+);
+"""
+
+CREATE_PNL_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS pnl_snapshots (
+    id              BIGSERIAL PRIMARY KEY,
+    time            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    exchange        TEXT NOT NULL,
+    symbol          TEXT,
+    realized_pnl    DOUBLE PRECISION DEFAULT 0,
+    unrealized_pnl  DOUBLE PRECISION DEFAULT 0,
+    cumulative_pnl  DOUBLE PRECISION DEFAULT 0,
+    equity          DOUBLE PRECISION DEFAULT 0,
+    drawdown_pct    DOUBLE PRECISION DEFAULT 0,
+    metadata        JSONB DEFAULT '{}'
+);
+"""
+
+AUDIT_DDL = [
+    CREATE_SIGNAL_EVENTS,
+    CREATE_RISK_DECISIONS,
+    CREATE_USER_STREAM_EVENTS,
+    CREATE_RECONCILIATION_EVENTS,
+    CREATE_PNL_SNAPSHOTS,
+]
+
+# Add correlation_id columns to existing tables
+AUDIT_ALTER_COLUMNS = [
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS correlation_id TEXT;",
+    "ALTER TABLE fills ADD COLUMN IF NOT EXISTS correlation_id TEXT;",
+    "ALTER TABLE positions ADD COLUMN IF NOT EXISTS correlation_id TEXT;",
+    "ALTER TABLE risk_blocks ADD COLUMN IF NOT EXISTS correlation_id TEXT;",
+    "ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS correlation_id TEXT;",
+    "ALTER TABLE errors ADD COLUMN IF NOT EXISTS correlation_id TEXT;",
+    "ALTER TABLE errors ADD COLUMN IF NOT EXISTS stack_trace TEXT;",
+]
+
 # Indexes for query performance
 TRADING_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);",
     "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);",
     "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_orders_corr ON orders(correlation_id);",
     "CREATE INDEX IF NOT EXISTS idx_fills_order ON fills(order_id);",
     "CREATE INDEX IF NOT EXISTS idx_fills_symbol ON fills(symbol);",
     "CREATE INDEX IF NOT EXISTS idx_fills_time ON fills(trade_time);",
+    "CREATE INDEX IF NOT EXISTS idx_fills_corr ON fills(correlation_id);",
     "CREATE INDEX IF NOT EXISTS idx_positions_symbol ON positions(symbol);",
     "CREATE INDEX IF NOT EXISTS idx_positions_open ON positions(close_time) WHERE close_time IS NULL;",
     "CREATE INDEX IF NOT EXISTS idx_equity_time ON equity_snapshots(time);",
     "CREATE INDEX IF NOT EXISTS idx_risk_blocks_time ON risk_blocks(time);",
     "CREATE INDEX IF NOT EXISTS idx_errors_time ON errors(time);",
+    "CREATE INDEX IF NOT EXISTS idx_errors_corr ON errors(correlation_id);",
+    "CREATE INDEX IF NOT EXISTS idx_signal_events_time ON signal_events(time);",
+    "CREATE INDEX IF NOT EXISTS idx_signal_events_symbol ON signal_events(exchange, symbol);",
+    "CREATE INDEX IF NOT EXISTS idx_signal_events_corr ON signal_events(correlation_id);",
+    "CREATE INDEX IF NOT EXISTS idx_risk_decisions_time ON risk_decisions(time);",
+    "CREATE INDEX IF NOT EXISTS idx_risk_decisions_symbol ON risk_decisions(exchange, symbol);",
+    "CREATE INDEX IF NOT EXISTS idx_risk_decisions_corr ON risk_decisions(correlation_id);",
+    "CREATE INDEX IF NOT EXISTS idx_user_stream_time ON user_stream_events(time);",
+    "CREATE INDEX IF NOT EXISTS idx_user_stream_type ON user_stream_events(event_type);",
+    "CREATE INDEX IF NOT EXISTS idx_user_stream_corr ON user_stream_events(correlation_id);",
+    "CREATE INDEX IF NOT EXISTS idx_recon_time ON reconciliation_events(time);",
+    "CREATE INDEX IF NOT EXISTS idx_pnl_snapshots_time ON pnl_snapshots(time);",
+    "CREATE INDEX IF NOT EXISTS idx_pnl_snapshots_symbol ON pnl_snapshots(exchange, symbol);",
 ]
 
 # TimescaleDB hypertables for time-series tables
@@ -190,7 +315,8 @@ class TradePersistence:
                 else:
                     logger.warning("WAL: unknown method {}", method_name)
                     remaining.append(line)
-            except Exception:
+            except Exception as exc:
+                logger.warning("WAL: replay failed for entry: {} — {}", line[:120], exc)
                 remaining.append(line)
 
         # Rewrite WAL with only failed entries
@@ -210,6 +336,15 @@ class TradePersistence:
         async with self._pool.acquire() as conn:
             for ddl in TRADING_DDL:
                 await conn.execute(ddl)
+            # Audit-trail tables (Prompt 5)
+            for ddl in AUDIT_DDL:
+                await conn.execute(ddl)
+            # Add correlation_id columns to existing tables
+            for stmt in AUDIT_ALTER_COLUMNS:
+                try:
+                    await conn.execute(stmt)
+                except Exception:
+                    pass
             for idx in TRADING_INDEXES:
                 try:
                     await conn.execute(idx)
@@ -220,7 +355,7 @@ class TradePersistence:
                     await conn.execute(stmt)
                 except Exception:
                     pass
-        logger.info("Trade persistence schema migrated")
+        logger.info("Trade persistence schema migrated (incl. audit tables)")
 
     def subscribe_events(self) -> None:
         """Wire up EventBus subscriptions for automatic persistence."""

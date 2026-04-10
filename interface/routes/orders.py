@@ -264,6 +264,41 @@ async def cancel_all_open_orders(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  ARMS-V2.1: Order splitting & shadow SL status
+#  (Must be above /{order_id} catch-all)
+# ══════════════════════════════════════════════════════════════════════════
+
+@router.get("/twap-status")
+async def twap_status():
+    """Active TWAP split orders."""
+    try:
+        manager = _require_order_manager()
+        return manager.get_twap_snapshot()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/iceberg-status")
+async def iceberg_status():
+    """Active Iceberg split orders."""
+    try:
+        manager = _require_order_manager()
+        return manager.get_iceberg_snapshot()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/shadow-sl")
+async def shadow_sl_status():
+    """Shadow stop-loss 4-layer redundancy status."""
+    try:
+        manager = _require_order_manager()
+        return manager.get_shadow_sl_snapshot()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/{order_id}", response_model=OrderResponse)
 async def get_order(order_id: str):
     """

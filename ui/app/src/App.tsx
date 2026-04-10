@@ -85,6 +85,48 @@ type AutoState = {
   uptime_seconds: number;
 };
 
+type ArmsSnapshot = {
+  kill_switch_active: boolean;
+  drawdown_phase: string;
+  drawdown_size_multiplier: number;
+  drawdown_max_positions: number;
+  blackout_active: boolean;
+  blackout_reason: string;
+  weekend_sizing_mult: number;
+  weekly_loss_pct: number;
+  monthly_loss_pct: number;
+  weekly_monthly_ok: boolean;
+  tier_risk: Record<number, number>;
+  correlation_groups: Record<string, { symbols: string[]; notional: number; max_notional: number; utilization_pct: number }>;
+  circuit_breaker_tripped: boolean;
+  circuit_breaker_reason: string;
+  equity: number;
+  var_95: number;
+  var_99: number;
+  is_weekend: boolean;
+};
+
+type SafeModeInfo = {
+  active: boolean;
+  reasons: string[];
+};
+
+type TradeHistory = {
+  order_id: string;
+  symbol: string;
+  side: string;
+  quantity: number;
+  average_fill_price: number;
+  total_fee: number;
+  filled_at: number;
+};
+
+type ShadowSLSnapshot = {
+  total_stops: number;
+  shadow_active: number;
+  stops: Record<string, { symbol: string; stop_price: number; primary_placed: boolean; shadow_active: boolean; fallback_triggered: boolean }>;
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
 
 async function getJSON<T>(path: string): Promise<T> {
@@ -118,6 +160,10 @@ export default function App() {
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [autoState, setAutoState] = useState<AutoState | null>(null);
   const [fearGreed, setFearGreed] = useState<{ value: number; classification: string } | null>(null);
+  const [armsData, setArmsData] = useState<ArmsSnapshot | null>(null);
+  const [safeMode, setSafeMode] = useState<SafeModeInfo | null>(null);
+  const [tradeHistory, setTradeHistory] = useState<TradeHistory[]>([]);
+  const [shadowSL, setShadowSL] = useState<ShadowSLSnapshot | null>(null);
   const [symbol, setSymbol] = useState("BTC");
   const [timeframe, setTimeframe] = useState("1m");
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
@@ -133,7 +179,7 @@ export default function App() {
 
     const load = async () => {
       try {
-        const [statusData, marketData, candleData, indicatorData, fgData, obData, poolsData, newsData, logsData, autoData] = await Promise.all([
+        const [statusData, marketData, candleData, indicatorData, fgData, obData, poolsData, newsData, logsData, autoData, armsSnap, tradesData, shadowData] = await Promise.all([
           getJSON<Status>("/status"),
           getJSON<{ coins: Coin[] }>("/market?per_page=12"),
           getJSON<{ candles: Candle[] }>(`/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=160`),
@@ -144,6 +190,9 @@ export default function App() {
           getJSON<{ items: NewsItem[] }>("/news"),
           getJSON<{ logs: LogItem[] }>("/logs/recent"),
           getJSON<AutoState>("/auto/status"),
+          getJSON<ArmsSnapshot>("/risk/arms/snapshot").catch(() => null),
+          getJSON<{ trades: TradeHistory[] }>("/trades/history?limit=20").catch(() => ({ trades: [] })),
+          getJSON<ShadowSLSnapshot>("/orders/shadow-sl").catch(() => null),
         ]);
 
         if (!active) return;
@@ -157,6 +206,12 @@ export default function App() {
         setNewsItems(newsData.items ?? []);
         setLogs(logsData.logs ?? []);
         setAutoState(autoData);
+        if (armsSnap) {
+          setArmsData(armsSnap);
+          setSafeMode(null);
+        }
+        setTradeHistory(tradesData.trades ?? []);
+        if (shadowData) setShadowSL(shadowData);
       } catch (error: any) {
         if (!active) return;
         setMessage(`Data refresh failed: ${error?.message ?? "unknown"}`);
@@ -232,6 +287,29 @@ export default function App() {
     }
   };
 
+  const activateKillSwitch = async () => {
+    if (!window.confirm("ACTIVATE KILL SWITCH? This will close ALL positions immediately.")) return;
+    try {
+      const res = await fetch(`${API_BASE.replace("/api", "")}/v1/kill`, { method: "POST" });
+      const body = await res.json();
+      if (!res.ok || !body?.success) throw new Error(body?.error ?? `HTTP ${res.status}`);
+      setMessage(`Kill switch ACTIVATED — ${body.closed_positions ?? 0} positions closed`);
+    } catch (error: any) {
+      setMessage(`Kill switch failed: ${error?.message ?? "unknown"}`);
+    }
+  };
+
+  const deactivateKillSwitch = async () => {
+    try {
+      const res = await fetch(`${API_BASE.replace("/api", "")}/v1/kill/deactivate`, { method: "POST" });
+      const body = await res.json();
+      if (!res.ok || !body?.success) throw new Error(body?.error ?? `HTTP ${res.status}`);
+      setMessage("Kill switch deactivated");
+    } catch (error: any) {
+      setMessage(`Kill switch deactivate failed: ${error?.message ?? "unknown"}`);
+    }
+  };
+
   return (
     <div className="nt-shell">
       <header className="ticker-strip">
@@ -254,8 +332,23 @@ export default function App() {
           <span>DRAWDOWN {status?.drawdown_pct?.toFixed(2) ?? "0.00"}%</span>
           <span className="mode">PAPER</span>
           <span>AUTO {autoState?.enabled ? "ON" : "OFF"}</span>
+          {armsData?.kill_switch_active && <span className="kill-badge">⚠ KILL SWITCH</span>}
         </div>
       </header>
+
+      {/* Safe mode / Kill switch banner */}
+      {(armsData?.kill_switch_active || armsData?.circuit_breaker_tripped || armsData?.blackout_active) && (
+        <div className="safe-mode-banner">
+          {armsData?.kill_switch_active && <span>🔴 KILL SWITCH ACTIVE — All trading halted</span>}
+          {armsData?.circuit_breaker_tripped && <span>🟠 Circuit Breaker: {armsData.circuit_breaker_reason}</span>}
+          {armsData?.blackout_active && <span>🟡 Event Blackout: {armsData.blackout_reason}</span>}
+          {armsData?.kill_switch_active ? (
+            <button className="kill-btn deactivate" onClick={deactivateKillSwitch}>Deactivate Kill Switch</button>
+          ) : (
+            <button className="kill-btn" onClick={activateKillSwitch}>Activate Kill Switch</button>
+          )}
+        </div>
+      )}
 
       <nav className="menu-row">
         <button className="tab active">Chart</button>
@@ -485,6 +578,89 @@ export default function App() {
               ))}
             </div>
           </section>
+
+          {/* ARMS-V2.1 Risk Dashboard */}
+          {armsData && (
+            <section className="panel-block">
+              <div className="panel-title">ARMS Risk</div>
+              <div className="arms-grid">
+                <div className="arms-item">
+                  <span>DD Phase</span>
+                  <span className={armsData.drawdown_phase === "normal" ? "pos" : "neg"}>{armsData.drawdown_phase}</span>
+                </div>
+                <div className="arms-item">
+                  <span>DD Multiplier</span>
+                  <span>{armsData.drawdown_size_multiplier.toFixed(2)}x</span>
+                </div>
+                <div className="arms-item">
+                  <span>Max Positions</span>
+                  <span>{armsData.drawdown_max_positions}</span>
+                </div>
+                <div className="arms-item">
+                  <span>VaR (95%)</span>
+                  <span>{(armsData.var_95 * 100).toFixed(2)}%</span>
+                </div>
+                <div className="arms-item">
+                  <span>Weekly Loss</span>
+                  <span className={armsData.weekly_loss_pct < -0.02 ? "neg" : ""}>{(armsData.weekly_loss_pct * 100).toFixed(2)}%</span>
+                </div>
+                <div className="arms-item">
+                  <span>Monthly Loss</span>
+                  <span className={armsData.monthly_loss_pct < -0.05 ? "neg" : ""}>{(armsData.monthly_loss_pct * 100).toFixed(2)}%</span>
+                </div>
+                <div className="arms-item">
+                  <span>Weekend</span>
+                  <span>{armsData.is_weekend ? `${armsData.weekend_sizing_mult.toFixed(1)}x` : "No"}</span>
+                </div>
+                <div className="arms-item">
+                  <span>Blackout</span>
+                  <span className={armsData.blackout_active ? "neg" : ""}>{armsData.blackout_active ? "YES" : "No"}</span>
+                </div>
+              </div>
+              {Object.keys(armsData.correlation_groups).length > 0 && (
+                <div className="arms-groups">
+                  <span className="ta-head">Correlation Groups</span>
+                  {Object.entries(armsData.correlation_groups).map(([name, info]) => (
+                    <div className="mini-row" key={name}>
+                      <span>{name}</span>
+                      <span>{info.utilization_pct.toFixed(0)}%</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {!armsData.kill_switch_active && (
+                <button className="kill-btn" onClick={activateKillSwitch}>⚡ Kill Switch</button>
+              )}
+            </section>
+          )}
+
+          {/* Shadow Stop-Loss Status */}
+          {shadowSL && shadowSL.total_stops > 0 && (
+            <section className="panel-block">
+              <div className="panel-title">Shadow SL</div>
+              <div className="arms-item"><span>Active Stops</span><span>{shadowSL.total_stops}</span></div>
+              <div className="arms-item"><span>Shadow Monitoring</span><span className={shadowSL.shadow_active > 0 ? "neg" : ""}>{shadowSL.shadow_active}</span></div>
+              {Object.entries(shadowSL.stops).slice(0, 4).map(([key, s]) => (
+                <div className="mini-row" key={key}>
+                  <span>{s.symbol}</span>
+                  <span>{s.primary_placed ? "✓" : s.shadow_active ? "⚠" : "..."} @ {s.stop_price.toFixed(2)}</span>
+                </div>
+              ))}
+            </section>
+          )}
+
+          {/* Trade History (Recent) */}
+          {tradeHistory.length > 0 && (
+            <section className="panel-block">
+              <div className="panel-title">Recent Trades</div>
+              {tradeHistory.slice(0, 5).map((t) => (
+                <div className="mini-row" key={t.order_id}>
+                  <span>{t.symbol} {t.side.toUpperCase()}</span>
+                  <span>{t.quantity.toFixed(4)} @ {t.average_fill_price.toFixed(2)}</span>
+                </div>
+              ))}
+            </section>
+          )}
 
           <section className="panel-block">
             <div className="panel-title">Auto + Logs</div>
