@@ -39,6 +39,21 @@ def create_executor(
 
     if exchange_id == "binance":
         executor = CEXExecutor(config, event_bus, risk_manager, exchange_id="binance")
+    elif exchange_id == "bybit":
+        executor = BybitExecutor(
+            api_key=cfg.get("api_key", ""),
+            api_secret=cfg.get("api_secret", ""),
+            testnet=cfg.get("testnet", True),
+            enable_paper_trading=cfg.get("paper_trading", True),
+        )
+    elif exchange_id == "okx":
+        executor = OKXExecutor(
+            api_key=cfg.get("api_key", ""),
+            api_secret=cfg.get("api_secret", ""),
+            passphrase=cfg.get("passphrase", ""),
+            testnet=cfg.get("testnet", True),
+            enable_paper_trading=cfg.get("paper_trading", True),
+        )
     else:
         executor = cls(config, event_bus, risk_manager)
 

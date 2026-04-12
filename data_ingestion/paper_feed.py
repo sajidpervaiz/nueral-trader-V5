@@ -43,6 +43,7 @@ class PaperFeed:
         self.timeframes = timeframes or ["1m", "15m", "1h", "4h"]
         self.poll_interval = poll_interval
         self._running = False
+        self._seeding_complete = False
         self._client: httpx.AsyncClient | None = None
         self._last_candle_time: dict[str, int] = {}
 
@@ -131,6 +132,7 @@ class PaperFeed:
                     self._last_candle_time[key] = candles[-1].timestamp
         logger.info("PaperFeed: seeded {} candles across {} symbols × {} timeframes",
                      total, len(self.symbols), len(self.timeframes))
+        self._seeding_complete = True
 
     async def run(self) -> None:
         """Main loop: seed history, then poll for new candles."""

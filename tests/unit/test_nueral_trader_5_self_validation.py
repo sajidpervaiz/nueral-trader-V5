@@ -487,12 +487,14 @@ class TestMultiTimeframeConfirmation:
             "close": np.linspace(100, 90, 30),  # Downtrend
             "ema_12": np.linspace(95, 89, 30),
             "ema_26": np.linspace(96, 92, 30),  # EMA26 > EMA12 = bearish
+            "supertrend_dir": [-1] * 30,  # bearish SuperTrend
+            "rsi_14": [35.0] * 30,  # below 50 = bearish
         }, index=dates)
         
         # Mock data_manager to return bearish 1h data
         dm.get_dataframe = MagicMock(return_value=bearish_df)
         
-        ok, reason = sg._check_higher_timeframe_trend("binance", "BTC/USDT:USDT", "long")
+        ok, reason, _, _ = sg._check_higher_timeframe_trend("binance", "BTC/USDT:USDT", "long")
         assert not ok
         assert "bearish" in reason.lower()
 
@@ -512,11 +514,13 @@ class TestMultiTimeframeConfirmation:
             "close": np.linspace(90, 100, 30),  # Uptrend
             "ema_12": np.linspace(92, 101, 30),
             "ema_26": np.linspace(88, 97, 30),  # EMA12 > EMA26 = bullish
+            "supertrend_dir": [1] * 30,  # bullish SuperTrend
+            "rsi_14": [60.0] * 30,  # above 50 = bullish
         }, index=dates)
         
         dm.get_dataframe = MagicMock(return_value=bullish_df)
         
-        ok, reason = sg._check_higher_timeframe_trend("binance", "BTC/USDT:USDT", "long")
+        ok, reason, _, _ = sg._check_higher_timeframe_trend("binance", "BTC/USDT:USDT", "long")
         assert ok
 
 

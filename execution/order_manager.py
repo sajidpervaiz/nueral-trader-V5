@@ -122,7 +122,7 @@ class Order:
             timestamp=time.time(),
             metadata=metadata or {},
         ))
-        self.updated_at = time.time()
+        self.updated_at = int(time.time() * 1000)
 
     # NOTE: Fill tracking is handled exclusively by OrderManager.record_fill()
     # which manages deduplication, audit logging, and lifecycle stages.
@@ -275,10 +275,15 @@ class OrderManager:
     def _save_order_state(self):
         import json
         try:
+            # Map exchange order keys to their order_id for proper restoration
+            exchange_map_save = {
+                f"{k[0]}|{k[1]}": v.order_id
+                for k, v in self.exchange_order_map.items()
+            }
             state = {
                 "orders": {k: self._order_to_dict(v) for k, v in self.orders.items()},
                 "client_order_map": list(self.client_order_map.keys()),
-                "exchange_order_map": [list(k) for k in self.exchange_order_map.keys()],
+                "exchange_order_map": exchange_map_save,
             }
             with open(self._order_state_path, "w") as f:
                 json.dump(state, f)
@@ -292,10 +297,18 @@ class OrderManager:
             try:
                 with open(self._order_state_path, "r") as f:
                     state = json.load(f)
-                # Only restore orders, not full object graph
                 self.orders = {k: self._dict_to_order(v) for k, v in state.get("orders", {}).items()}
                 self.client_order_map = {k: self.orders[k] for k in state.get("client_order_map", []) if k in self.orders}
-                self.exchange_order_map = {tuple(k): self.orders[k[0]] for k in state.get("exchange_order_map", []) if k[0] in self.orders}
+                # Restore exchange_order_map with proper (venue, exchange_id) → Order mapping
+                exchange_map_raw = state.get("exchange_order_map", {})
+                if isinstance(exchange_map_raw, dict):
+                    for composite_key, order_id in exchange_map_raw.items():
+                        if order_id in self.orders and "|" in composite_key:
+                            venue, exch_id = composite_key.split("|", 1)
+                            self.exchange_order_map[(venue, exch_id)] = self.orders[order_id]
+                else:
+                    # Legacy format: list of [venue, exchange_order_id] — best-effort skip
+                    logger.warning("Legacy exchange_order_map format detected, skipping restore")
             except Exception as e:
                 logger.error(f"Failed to load order state: {e}")
 

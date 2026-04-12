@@ -148,6 +148,10 @@ class FedCalendar:
                 if response.status == 200:
                     data = await response.json()
 
+                    if not isinstance(data, list):
+                        logger.debug("Fed speeches response is not a list, skipping")
+                        return
+
                     for speech in data[:10]:
                         event = FedEvent(
                             event_id=f"speech_{speech.get('id', '')}",

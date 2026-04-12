@@ -779,14 +779,14 @@ class TestARMSRiskManager:
     def test_tiered_tp_long(self, rm):
         tps = rm.compute_tiered_tp(entry_price=50000, sl_distance=1000, is_long=True)
         assert len(tps) == 3
-        assert tps[0]["price"] == pytest.approx(51500)  # 1.5R
+        assert tps[0]["price"] == pytest.approx(51000)  # 1.0R — V1.0 Spec
         assert tps[1]["price"] == pytest.approx(52500)  # 2.5R
-        assert tps[0]["close_pct"] == pytest.approx(0.33)
+        assert tps[0]["close_pct"] == pytest.approx(0.50)
         assert tps[2].get("trail") is True
 
     def test_tiered_tp_short(self, rm):
         tps = rm.compute_tiered_tp(entry_price=50000, sl_distance=1000, is_long=False)
-        assert tps[0]["price"] == pytest.approx(48500)
+        assert tps[0]["price"] == pytest.approx(49000)  # 1.0R — V1.0 Spec
         assert tps[1]["price"] == pytest.approx(47500)
 
     def test_tiered_tp_percentages_sum_to_1(self, rm):

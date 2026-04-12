@@ -32,7 +32,7 @@ class DataManager:
         self.config = config
         self.event_bus = event_bus
         self._indicators = TechnicalIndicators()
-        self._regime_detector = RegimeDetector()
+        self._regime_detectors: dict[str, RegimeDetector] = {}
         self._aggregators: dict[str, dict[str, CandleAggregator]] = defaultdict(dict)
         self._candle_history: dict[str, dict[str, deque[Candle]]] = defaultdict(dict)
         self._dataframes: dict[str, dict[str, pd.DataFrame]] = defaultdict(dict)
@@ -81,10 +81,12 @@ class DataManager:
         self._update_regime(key, timeframe, df)
 
     def _update_regime(self, key: str, timeframe: str, df: pd.DataFrame) -> None:
-        if timeframe not in ("1h", "4h"):
+        if timeframe != "4h":
             return
+        if key not in self._regime_detectors:
+            self._regime_detectors[key] = RegimeDetector()
         try:
-            state = self._regime_detector.detect(df)
+            state = self._regime_detectors[key].detect(df)
             self._regimes[key] = state
         except Exception as exc:
             logger.debug("Regime detection error for {}/{}: {}", key, timeframe, exc)

@@ -235,7 +235,9 @@ class OKXExecutor:
             return None
 
         if abs(funding.funding_rate) > funding_threshold:
-            direction = "long" if funding.funding_rate > 0 else "short"
+            # positive funding_rate → longs pay → go short to receive funding
+            # negative funding_rate → shorts pay → go long to receive funding
+            direction = "short" if funding.funding_rate > 0 else "long"
 
             return {
                 "symbol": symbol,

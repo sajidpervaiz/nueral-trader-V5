@@ -551,8 +551,8 @@ class TestCircuitBreakerIntegration:
     def test_risk_circuit_breaker_drawdown_trip(self):
         rm, bus = _make_risk_manager()
         rm._circuit_breaker._peak_equity = 100_000.0
-        # Simulate 11% drawdown (exceeds default 10%)
-        rm._circuit_breaker.record_pnl(-0.001, 89_000.0)
+        # Simulate 13% drawdown (exceeds default 12% — V1.0 Spec)
+        rm._circuit_breaker.record_pnl(-0.001, 87_000.0)
         assert rm._circuit_breaker.tripped
 
 

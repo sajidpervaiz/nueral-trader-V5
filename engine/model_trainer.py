@@ -140,14 +140,15 @@ class ModelTrainer:
             df["target_direction"] = (df["target_returns"] > 0).astype(int)
             target = df["target_direction"]
         else:
-            target = df[target_col].shift(-lookahead)
+            df["_shifted_target"] = df[target_col].shift(-lookahead)
+            target = df["_shifted_target"]
 
         df = df.dropna()
 
         if feature_cols is None:
             feature_cols = [
                 c for c in df.columns
-                if c not in ["open", "high", "low", "close", "volume", "target_returns", "target_direction", "timestamp"]
+                if c not in ["open", "high", "low", "close", "volume", "target_returns", "target_direction", "_shifted_target", "timestamp"]
             ]
 
         X = df[feature_cols].values
@@ -227,6 +228,7 @@ class ModelTrainer:
         feature_names: List[str],
         n_splits: int = 5,
         test_size: int = 100,
+        hyperparameters: Optional[Dict] = None,
     ) -> Dict[str, List[float]]:
         _ = feature_names
         n = len(X)
@@ -242,7 +244,10 @@ class ModelTrainer:
             X_train, y_train = X[:train_end], y[:train_end]
             X_val, y_val = X[val_start:val_end], y[val_start:val_end]
 
-            model = self.train_lightgbm(X_train, y_train) if self.model_type == "lightgbm" else self.train_xgboost(X_train, y_train)
+            if self.model_type == "lightgbm":
+                model = self.train_lightgbm(X_train, y_train, hyperparameters=hyperparameters)
+            else:
+                model = self.train_xgboost(X_train, y_train, hyperparameters=hyperparameters)
             y_pred = model.predict(X_val)
 
             metrics["accuracy"].append(_accuracy(y_val, y_pred))
@@ -286,6 +291,7 @@ class ModelTrainer:
                 feature_names=[],
                 n_splits=max(2, cv_folds),
                 test_size=max(20, min(100, len(X) // (cv_folds + 2))) if len(X) > 0 else 20,
+                hyperparameters=candidate,
             )
             fold_f1 = scores.get("f1", [])
             mean_f1 = float(np.mean(fold_f1)) if fold_f1 else float("-inf")

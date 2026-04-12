@@ -103,7 +103,7 @@ class OpenInterestFeed:
         total_oi = 0.0
         breakdown: dict[str, float] = {}
         for key, oi in self._cache.items():
-            if oi.symbol == symbol or symbol in oi.symbol:
+            if oi.symbol == symbol:
                 total_oi += oi.oi_usd
                 breakdown[oi.exchange] = oi.oi_usd
         return {"total_usd": total_oi, "by_exchange": breakdown}
