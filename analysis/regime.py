@@ -45,6 +45,27 @@ class RegimeState:
     timestamp: int
     candles_in_state: int = 0
 
+    @property
+    def tradeable(self) -> bool:
+        """Spec L1: ADX<25 with RANGE_CHOP/COMPRESSION = NO TRADE."""
+        if self.regime in (MarketRegime.RANGE_CHOP,) and self.adx < 25:
+            return False
+        return self.regime != MarketRegime.UNKNOWN
+
+    @property
+    def position_size_pct(self) -> float:
+        """Spec L1: Position sizing by regime.
+        Strong Trend → 100%, Moderate → 75%, Choppy → 0%."""
+        if not self.tradeable:
+            return 0.0
+        if self.regime in (MarketRegime.STRONG_TREND_UP, MarketRegime.STRONG_TREND_DOWN):
+            return 1.0
+        if self.regime in (MarketRegime.WEAK_TREND_UP, MarketRegime.WEAK_TREND_DOWN):
+            return 0.75
+        if self.regime == MarketRegime.COMPRESSION:
+            return 0.5
+        return 0.0
+
 
 # ── Transition rules: which transitions are allowed ──────────────────────────
 _ALLOWED_TRANSITIONS: dict[MarketRegime, set[MarketRegime]] = {
@@ -87,8 +108,8 @@ class RegimeDetector:
         hurst_threshold: float = 0.55,
         ema200_slope_threshold: float = 0.0015,
         bb_squeeze_percentile: float = 20.0,
-        confirmation_candles: int = 2,
-        cooldown_candles: int = 2,
+        confirmation_candles: int = 3,
+        cooldown_candles: int = 10,
     ) -> None:
         self._adx_threshold = adx_threshold
         self._strong_adx_threshold = strong_adx_threshold

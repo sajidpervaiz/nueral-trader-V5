@@ -261,7 +261,7 @@ class TestHTFConfirmationWarning:
         sg = SignalGenerator(config, bus, dm)
 
         with patch("engine.signal_generator.logger") as mock_logger:
-            ok, reason = sg._check_higher_timeframe_trend("binance", "BTC/USDT", "long")
+            ok, reason, weighted_score, agreement_count = sg._check_higher_timeframe_trend("binance", "BTC/USDT", "long")
             assert ok  # Still passes (by design)
             # But should have logged a warning
             mock_logger.warning.assert_called_once()
@@ -288,6 +288,8 @@ class TestHTFConfirmationWarning:
             "close": np.linspace(100, 200, n),
             "ema_12": np.linspace(110, 200, n),  # fast above slow = bullish
             "ema_26": np.linspace(100, 190, n),
+            "supertrend_dir": [1] * n,  # bullish supertrend
+            "rsi_14": [60.0] * n,  # above 50 = bullish
         })
 
         dm = MagicMock()
@@ -295,7 +297,7 @@ class TestHTFConfirmationWarning:
         sg = SignalGenerator(config, bus, dm)
 
         with patch("engine.signal_generator.logger") as mock_logger:
-            ok, reason = sg._check_higher_timeframe_trend("binance", "BTC/USDT", "long")
+            ok, reason, weighted_score, agreement_count = sg._check_higher_timeframe_trend("binance", "BTC/USDT", "long")
             assert ok
             mock_logger.warning.assert_not_called()
 

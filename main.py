@@ -139,6 +139,7 @@ async def main() -> None:
     # Auto-trading defaults to off — requires explicit UI toggle
     signal_gen.set_auto_trading(False)
     risk_mgr = RiskManager(config, event_bus)
+    signal_gen._risk_manager = risk_mgr  # wire for accurate position counting
     order_mgr = OrderManager(config, event_bus, risk_mgr._circuit_breaker)
 
     executors = create_all_executors(config, event_bus, risk_mgr)

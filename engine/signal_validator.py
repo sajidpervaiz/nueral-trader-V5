@@ -18,6 +18,30 @@ class SignalQuality(Enum):
     POOR = "POOR"
     INVALID = "INVALID"
 
+    @staticmethod
+    def _rank(member: "SignalQuality") -> int:
+        return {"EXCELLENT": 4, "GOOD": 3, "FAIR": 2, "POOR": 1, "INVALID": 0}[member.value]
+
+    def __lt__(self, other):
+        if not isinstance(other, SignalQuality):
+            return NotImplemented
+        return self._rank(self) < self._rank(other)
+
+    def __le__(self, other):
+        if not isinstance(other, SignalQuality):
+            return NotImplemented
+        return self._rank(self) <= self._rank(other)
+
+    def __gt__(self, other):
+        if not isinstance(other, SignalQuality):
+            return NotImplemented
+        return self._rank(self) > self._rank(other)
+
+    def __ge__(self, other):
+        if not isinstance(other, SignalQuality):
+            return NotImplemented
+        return self._rank(self) >= self._rank(other)
+
 
 @dataclass
 class Signal:
@@ -64,7 +88,7 @@ class SignalValidator:
         self.min_quality = min_quality
         self.max_position_age_hours = max_position_age_hours
 
-        self.signals: List[Signal] = []
+        self.signals: deque = deque(maxlen=5000)
         self.paper_trades: Dict[str, PnLTracking] = {}
 
         self.performance_history: deque = deque(maxlen=1000)
@@ -96,7 +120,7 @@ class SignalValidator:
 
         quality = self._assess_quality(signal, market_conditions)
 
-        if quality.value < self.min_quality.value:
+        if quality < self.min_quality:
             signal.validated = False
             validation_checks.append(f"Quality below threshold: {quality.value}")
 
@@ -195,7 +219,7 @@ class SignalValidator:
         quantity: float,
     ) -> bool:
         """Start paper trade for validated signal."""
-        if not signal.validated or signal.quality.value < self.min_quality.value:
+        if not signal.validated or signal.quality < self.min_quality:
             logger.warning(f"Signal {signal.signal_id} not valid for paper trading")
             return False
 
@@ -336,18 +360,29 @@ class SignalValidator:
         self,
         risk_free_rate: float = 0.02,
     ) -> Optional[float]:
-        """Calculate Sharpe ratio from paper trading performance."""
+        """Calculate Sharpe ratio from paper trading performance (return-based)."""
         if len(self.performance_history) < 30:
             return None
 
-        returns = np.array(list(self.performance_history))
+        # Convert dollar PnL to pct returns using entry cost
+        pct_returns = []
+        for trade in self.paper_trades.values():
+            if trade.status == "CLOSED" and trade.realized_pnl is not None:
+                entry_cost = trade.entry_price * trade.quantity
+                if entry_cost > 0:
+                    pct_returns.append(trade.realized_pnl / entry_cost)
+        if len(pct_returns) < 30:
+            return None
+
+        returns = np.array(pct_returns)
         mean_return = np.mean(returns)
         std_return = np.std(returns)
 
         if std_return == 0:
             return None
 
-        sharpe = (mean_return - risk_free_rate) / std_return
+        # Annualize: assume ~252 trades/year approximation
+        sharpe = (mean_return - risk_free_rate / 252) / std_return
 
         return sharpe
 

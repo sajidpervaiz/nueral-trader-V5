@@ -147,7 +147,7 @@ class RiskManager:
         # ── Pre-trade filters ─────────────────────────────────────────────
         self._max_spread_bps = float(risk_cfg.get("max_spread_bps", 10.0))
         self._max_atr_pct = float(risk_cfg.get("max_atr_pct", 0.05))
-        self._max_exposure_per_symbol = float(risk_cfg.get("max_exposure_per_symbol_pct", 0.10))
+        self._max_exposure_per_symbol = float(risk_cfg.get("max_exposure_per_symbol_pct", 0.06))  # §9: 6% global max exposure
         self._cooldown_seconds = float(risk_cfg.get("cooldown_seconds", 300.0))
         self._session_start_utc = str(risk_cfg.get("session_start_utc", "00:00"))
         self._session_end_utc = str(risk_cfg.get("session_end_utc", "23:59"))
@@ -185,8 +185,8 @@ class RiskManager:
         self._kill_switch_check_interval: float = 5.0  # seconds
         self._circuit_breaker = CircuitBreaker(
             max_daily_loss_pct=float(risk_cfg.get("max_daily_loss_pct", 0.03)),
-            max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 0.10)),
-            pause_seconds=float(risk_cfg.get("circuit_breaker_pause_seconds", 3600)),
+            max_drawdown_pct=float(risk_cfg.get("max_drawdown_pct", 0.12)),
+            pause_seconds=float(risk_cfg.get("circuit_breaker_pause_seconds", 86400)),  # §9: 24h halt on daily loss
         )
         self._running = False
         self._lock = asyncio.Lock()
@@ -222,11 +222,11 @@ class RiskManager:
             (100, 2.5),   # very volatile → very wide
         ]
 
-        # ── ARMS-V2.1: Tiered take-profit ────────────────────────────────
+        # ── V1.0 Spec: Tiered take-profit (TP1: 1:1 50%, TP2: zone 30%, TP3: trail 20%) ──
         self._tp_tiers = [
-            {"r_multiple": 1.5, "close_pct": 0.33},  # TP1: 1.5R, close 33%
-            {"r_multiple": 2.5, "close_pct": 0.33},  # TP2: 2.5R, close 33%
-            # TP3: remaining 34% — trail
+            {"r_multiple": 1.0, "close_pct": 0.50},  # TP1: 1:1 R:R, close 50%
+            {"r_multiple": 2.5, "close_pct": 0.30},  # TP2: next liquidity zone / 2.5R fallback, close 30%
+            # TP3: remaining 20% — SuperTrend trailing
         ]
 
         # ── ARMS-V2.1: Session time filters ──────────────────────────────
@@ -268,7 +268,7 @@ class RiskManager:
         # ── ARMS-V2.1: Weekly/monthly loss caps (§10) ────────────────────
         self._weekly_loss: float = 0.0
         self._monthly_loss: float = 0.0
-        self._weekly_loss_limit = float(arms_cfg.get("weekly_loss_limit_pct", 0.06))  # 6%
+        self._weekly_loss_limit = float(arms_cfg.get("weekly_loss_limit_pct", 0.08))  # §9: 8% weekly DD limit
         self._monthly_loss_limit = float(arms_cfg.get("monthly_loss_limit_pct", 0.10))  # 10%
         self._last_weekly_reset: float = time.time()
         self._last_monthly_reset: float = time.time()
@@ -308,6 +308,23 @@ class RiskManager:
             "ECB Rate", "BOJ Rate", "GDP",
         ]
         self._event_blackout_minutes_before = int(arms_cfg.get("event_blackout_before_min", 30))
+
+        # ── §13 Guardrails: Consecutive loss circuit breaker ──────────────
+        self._consecutive_losses: int = 0
+        self._max_consecutive_losses: int = int(risk_cfg.get("max_consecutive_losses", 3))
+
+        # ── §13 Guardrails: Flash crash detection ─────────────────────────
+        self._flash_crash_threshold_pct = float(risk_cfg.get("flash_crash_threshold_pct", 0.05))  # 5% in 5min
+        self._flash_crash_window_seconds = float(risk_cfg.get("flash_crash_window_seconds", 300.0))
+        self._flash_crash_tripped = False
+        self._price_snapshots: list[tuple[float, float]] = []  # (timestamp, price)
+
+        # ── §9 Risk: Kelly Criterion activation ──────────────────────────
+        self._kelly_enabled = bool(risk_cfg.get("kelly_enabled", True))
+        self._kelly_win_rate: float = 0.5
+        self._kelly_avg_win: float = 0.02
+        self._kelly_avg_loss: float = 0.01
+        self._trade_results: list[float] = []  # PnL history for rolling Kelly
         self._event_blackout_minutes_after = int(arms_cfg.get("event_blackout_after_min", 15))
         self._upcoming_events: list[dict[str, Any]] = []  # [{name, timestamp}]
 
@@ -411,8 +428,16 @@ class RiskManager:
     # ── ARMS-V2.1: Tiered take-profit levels ─────────────────────────────
     def compute_tiered_tp(
         self, entry_price: float, sl_distance: float, is_long: bool,
+        liquidity_zone: float | None = None,
+        supertrend_level: float | None = None,
     ) -> list[dict[str, float]]:
-        """Compute TP1, TP2, TP3 (trail) levels from risk distance."""
+        """Compute TP1, TP2, TP3 (trail) levels from risk distance.
+
+        V1.0 Spec:
+        - TP1: 1:1 Risk/Reward (50% position closed)
+        - TP2: Next FVG/Liquidity zone (30% closed), fallback 2.5R
+        - TP3: SuperTrend trailing stop (20% remaining)
+        """
         tps: list[dict[str, float]] = []
         for tier in self._tp_tiers:
             r_dist = sl_distance * tier["r_multiple"]
@@ -421,9 +446,22 @@ class RiskManager:
             else:
                 tp_price = entry_price - r_dist
             tps.append({"price": tp_price, "close_pct": tier["close_pct"]})
-        # TP3 = trailing (remaining position)
+
+        # TP2: override with liquidity zone if available and better than default
+        if liquidity_zone is not None and len(tps) >= 2:
+            if is_long and liquidity_zone > tps[0]["price"]:
+                tps[1]["price"] = liquidity_zone
+            elif not is_long and liquidity_zone < tps[0]["price"]:
+                tps[1]["price"] = liquidity_zone
+
+        # TP3: SuperTrend trailing (remaining 20%)
         remaining = 1.0 - sum(t["close_pct"] for t in tps)
-        tps.append({"price": 0.0, "close_pct": remaining, "trail": True})
+        trail_entry: dict[str, Any] = {
+            "price": supertrend_level if supertrend_level else 0.0,
+            "close_pct": remaining,
+            "trail": True,
+        }
+        tps.append(trail_entry)
         return tps
 
     # ── ARMS-V2.1: Session filter ────────────────────────────────────────
@@ -1383,6 +1421,81 @@ class RiskManager:
                 self.event_bus.publish_nowait("TAKE_PROFIT", {
                     "exchange": exchange, "symbol": symbol, "price": price, "reason": "take_profit",
                 })
+
+    # ── §13 Guardrails: Flash crash detection ──────────────────────────
+    def check_flash_crash(self, symbol: str, price: float) -> bool:
+        """Detect flash crash: >=5% drop within 5-minute window. Returns True if tripped."""
+        now = time.time()
+        self._price_snapshots.append((now, price))
+        # Prune snapshots older than window
+        cutoff = now - self._flash_crash_window_seconds
+        self._price_snapshots = [(t, p) for t, p in self._price_snapshots if t >= cutoff]
+        if len(self._price_snapshots) < 2:
+            return self._flash_crash_tripped
+        oldest_price = self._price_snapshots[0][1]
+        if oldest_price > 0:
+            drop_pct = (oldest_price - price) / oldest_price
+            if drop_pct >= self._flash_crash_threshold_pct:
+                if not self._flash_crash_tripped:
+                    self._flash_crash_tripped = True
+                    self._circuit_breaker.trip("flash_crash", pause_seconds=600)
+                    logger.warning(
+                        "Flash crash detected for {} — {:.2f}% drop in {:.0f}s, halting 10min",
+                        symbol, drop_pct * 100, self._flash_crash_window_seconds,
+                    )
+            else:
+                self._flash_crash_tripped = False
+        return self._flash_crash_tripped
+
+    # ── §13 Guardrails: Consecutive loss tracking ────────────────────────
+    def record_trade_pnl(self, pnl: float) -> None:
+        """Track consecutive losses and trip breaker after N consecutive."""
+        # Update Kelly stats
+        self._trade_results.append(pnl)
+        if len(self._trade_results) > 100:
+            self._trade_results = self._trade_results[-100:]
+        wins = [r for r in self._trade_results if r > 0]
+        losses = [r for r in self._trade_results if r <= 0]
+        if self._trade_results:
+            self._kelly_win_rate = len(wins) / len(self._trade_results)
+        if wins:
+            self._kelly_avg_win = sum(wins) / len(wins)
+        if losses:
+            self._kelly_avg_loss = abs(sum(losses) / len(losses))
+
+        # Consecutive loss tracking
+        if pnl < 0:
+            self._consecutive_losses += 1
+            if self._consecutive_losses >= self._max_consecutive_losses:
+                self._circuit_breaker.trip("consecutive_losses", pause_seconds=3600)
+                logger.warning(
+                    "Consecutive loss breaker tripped — {} losses in a row, halting 1h",
+                    self._consecutive_losses,
+                )
+        else:
+            self._consecutive_losses = 0
+
+    # ── §9 Risk: Kelly Criterion position sizing ─────────────────────────
+    def compute_kelly_size(self, base_risk_pct: float) -> float:
+        """Apply Kelly Criterion to adjust risk percentage. f* = W - (1-W)/R, half-Kelly used."""
+        if not self._kelly_enabled or len(self._trade_results) < 20:
+            return base_risk_pct
+        w = self._kelly_win_rate
+        if self._kelly_avg_loss <= 0:
+            return base_risk_pct
+        r = self._kelly_avg_win / self._kelly_avg_loss
+        if r <= 0:
+            return base_risk_pct
+        kelly_f = w - (1.0 - w) / r
+        # Half-Kelly for safety
+        kelly_f = max(0.0, kelly_f) * 0.5
+        # Cap at 2x base risk, floor at 25% base risk
+        adjusted = base_risk_pct * max(0.25, min(2.0, kelly_f / base_risk_pct)) if base_risk_pct > 0 else 0.0
+        # Simpler approach: scale base_risk by Kelly fraction
+        adjusted = base_risk_pct * min(2.0, max(0.25, kelly_f * 50.0))  # kelly_f ~0.02 → scale factor ~1x
+        logger.debug("Kelly: W={:.2f} R={:.2f} f*={:.4f} half={:.4f} adjusted_risk={:.4f}",
+                      w, r, kelly_f * 2, kelly_f, adjusted)
+        return adjusted
 
     @property
     def positions(self) -> dict[str, Position]:

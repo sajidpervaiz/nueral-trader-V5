@@ -103,7 +103,13 @@ class FundingRateFeed:
         results = []
         try:
             async with session.get(FUNDING_URLS["binance"]) as resp:
+                if resp.status != 200:
+                    logger.debug("Binance funding HTTP {}", resp.status)
+                    return results
                 data = await resp.json()
+                if not isinstance(data, list):
+                    logger.debug("Binance funding unexpected response type: {}", type(data).__name__)
+                    return results
                 for item in data:
                     symbol = item.get("symbol", "")
                     if not symbol:

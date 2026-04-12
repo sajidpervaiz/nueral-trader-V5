@@ -4,6 +4,7 @@ Macro Aggregator with unified macro publisher and regime classification.
 
 import asyncio
 from typing import Dict, List, Optional
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -57,7 +58,7 @@ class MacroAggregator:
         self.fed_calendar = FedCalendar(enable_paper_mode=enable_paper_mode)
         self.economic_releases = EconomicReleases(enable_paper_mode=enable_paper_mode)
 
-        self.signals: List[MacroSignal] = []
+        self.signals: deque = deque(maxlen=1000)
         self.current_regime: Optional[RegimeClassification] = None
 
         self._subscribers: List[callable] = []

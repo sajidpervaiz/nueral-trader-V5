@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import deque
 from typing import Any, Callable, Coroutine
 
 import websockets
@@ -45,7 +46,7 @@ class CEXWebSocketManager:
         self._running = False
         # Tick dedup: track last N trade IDs per exchange:symbol
         self._seen_trade_ids: dict[str, set[str]] = {}
-        self._seen_trade_id_order: dict[str, list[str]] = {}
+        self._seen_trade_id_order: dict[str, deque] = {}
         self._dedup_max = 10_000
         # Sequence tracking per exchange
         self._last_sequence: dict[str, int] = {}
@@ -95,47 +96,46 @@ class CEXWebSocketManager:
         except json.JSONDecodeError:
             return
 
-        tick = self.normalizer.normalize_tick(exchange, data)
-        if tick is None:
-            return
-        if not self.validator.validate(tick):
-            return
+        ticks = self.normalizer.normalize_tick_batch(exchange, data)
+        for tick in ticks:
+            if not self.validator.validate(tick):
+                continue
 
-        # ── Tick dedup by trade_id ────────────────────────────────────────
-        trade_id = str(getattr(tick, "trade_id", "") or data.get("t", "") or data.get("T", "") or "")
-        if trade_id:
-            dedup_key = f"{exchange}:{tick.symbol}"
-            seen = self._seen_trade_ids.setdefault(dedup_key, set())
-            order = self._seen_trade_id_order.setdefault(dedup_key, [])
-            if trade_id in seen:
-                self._total_deduped += 1
-                return
-            seen.add(trade_id)
-            order.append(trade_id)
-            # Evict oldest entries when exceeding max
-            while len(order) > self._dedup_max:
-                old_id = order.pop(0)
-                seen.discard(old_id)
+            # ── Tick dedup by trade_id ────────────────────────────────────────
+            trade_id = str(getattr(tick, "trade_id", "") or data.get("t", "") or data.get("T", "") or "")
+            if trade_id:
+                dedup_key = f"{exchange}:{tick.symbol}"
+                seen = self._seen_trade_ids.setdefault(dedup_key, set())
+                order = self._seen_trade_id_order.setdefault(dedup_key, deque())
+                if trade_id in seen:
+                    self._total_deduped += 1
+                    continue
+                seen.add(trade_id)
+                order.append(trade_id)
+                # Evict oldest entries when exceeding max
+                while len(order) > self._dedup_max:
+                    old_id = order.popleft()
+                    seen.discard(old_id)
 
-        # ── Sequence gap detection ────────────────────────────────────────
-        # Only use Binance 'u' (update ID) field for sequence tracking,
-        # not 'E' (event timestamp) which is non-sequential across symbols.
-        seq = 0
-        if isinstance(data, dict):
-            seq = int(data.get("u", 0) or 0)
-        if seq > 0:
-            seq_key = f"{exchange}:{tick.symbol}"
-            prev = self._last_sequence.get(seq_key, 0)
-            if prev > 0 and seq > prev + 1:
-                gap = seq - prev - 1
-                self._gap_count[exchange] = self._gap_count.get(exchange, 0) + gap
-                logger.warning(
-                    "{} {} sequence gap: expected {} got {} (gap={})",
-                    exchange, tick.symbol, prev + 1, seq, gap,
-                )
-            self._last_sequence[seq_key] = seq
+            # ── Sequence gap detection ────────────────────────────────────────
+            # Only use Binance 'u' (update ID) field for sequence tracking,
+            # not 'E' (event timestamp) which is non-sequential across symbols.
+            seq = 0
+            if isinstance(data, dict):
+                seq = int(data.get("u", 0) or 0)
+            if seq > 0:
+                seq_key = f"{exchange}:{tick.symbol}"
+                prev = self._last_sequence.get(seq_key, 0)
+                if prev > 0 and seq > prev + 1:
+                    gap = seq - prev - 1
+                    self._gap_count[exchange] = self._gap_count.get(exchange, 0) + gap
+                    logger.warning(
+                        "{} {} sequence gap: expected {} got {} (gap={})",
+                        exchange, tick.symbol, prev + 1, seq, gap,
+                    )
+                self._last_sequence[seq_key] = seq
 
-        await self.event_bus.publish("TICK", tick)
+            await self.event_bus.publish("TICK", tick)
 
     async def _connect_exchange(self, exchange: str, cfg: dict[str, Any]) -> None:
         testnet = cfg.get("testnet", True)

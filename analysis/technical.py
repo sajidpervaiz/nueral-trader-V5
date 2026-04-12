@@ -110,6 +110,180 @@ def _keltner_channels(
     return upper, ema, lower
 
 
+def _supertrend(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    period: int = 10, multiplier: float = 3.0,
+) -> tuple[pd.Series, pd.Series]:
+    """SuperTrend indicator. Returns (supertrend_line, direction) where
+    direction = 1 (bullish / price above) or -1 (bearish / price below)."""
+    atr_s = _atr(high, low, close, period)
+    hl2 = (high + low) / 2
+    upper_band = hl2 + multiplier * atr_s
+    lower_band = hl2 - multiplier * atr_s
+
+    st = pd.Series(np.nan, index=close.index, dtype=float)
+    direction = pd.Series(1, index=close.index, dtype=int)
+
+    for i in range(1, len(close)):
+        if np.isnan(upper_band.iloc[i]) or np.isnan(lower_band.iloc[i]):
+            st.iloc[i] = st.iloc[i - 1] if not np.isnan(st.iloc[i - 1]) else close.iloc[i]
+            direction.iloc[i] = direction.iloc[i - 1]
+            continue
+
+        if close.iloc[i] > upper_band.iloc[i - 1] if not np.isnan(upper_band.iloc[i - 1]) else False:
+            direction.iloc[i] = 1
+        elif close.iloc[i] < lower_band.iloc[i - 1] if not np.isnan(lower_band.iloc[i - 1]) else False:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = direction.iloc[i - 1]
+            if direction.iloc[i] == 1 and lower_band.iloc[i] < lower_band.iloc[i - 1]:
+                lower_band.iloc[i] = lower_band.iloc[i - 1]
+            if direction.iloc[i] == -1 and upper_band.iloc[i] > upper_band.iloc[i - 1]:
+                upper_band.iloc[i] = upper_band.iloc[i - 1]
+
+        st.iloc[i] = lower_band.iloc[i] if direction.iloc[i] == 1 else upper_band.iloc[i]
+
+    return st, direction.astype(float)
+
+
+def _ichimoku(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    tenkan: int = 9, kijun: int = 26, senkou_b: int = 52,
+) -> dict[str, pd.Series]:
+    """Ichimoku Cloud components."""
+    tenkan_sen = (high.rolling(tenkan).max() + low.rolling(tenkan).min()) / 2
+    kijun_sen = (high.rolling(kijun).max() + low.rolling(kijun).min()) / 2
+    senkou_a = ((tenkan_sen + kijun_sen) / 2).shift(kijun)
+    senkou_b_line = ((high.rolling(senkou_b).max() + low.rolling(senkou_b).min()) / 2).shift(kijun)
+    chikou = close.shift(-kijun)
+    return {
+        "tenkan_sen": tenkan_sen,
+        "kijun_sen": kijun_sen,
+        "senkou_a": senkou_a,
+        "senkou_b": senkou_b_line,
+        "chikou_span": chikou,
+    }
+
+
+def _parabolic_sar(
+    high: pd.Series, low: pd.Series,
+    af_start: float = 0.02, af_step: float = 0.02, af_max: float = 0.20,
+) -> pd.Series:
+    """Parabolic SAR."""
+    length = len(high)
+    sar = pd.Series(np.nan, index=high.index, dtype=float)
+    if length < 2:
+        return sar
+    bull = True
+    af = af_start
+    ep = high.iloc[0]
+    sar.iloc[0] = low.iloc[0]
+    for i in range(1, length):
+        prev_sar = sar.iloc[i - 1] if not np.isnan(sar.iloc[i - 1]) else low.iloc[i]
+        sar.iloc[i] = prev_sar + af * (ep - prev_sar)
+        if bull:
+            if low.iloc[i] < sar.iloc[i]:
+                bull = False
+                sar.iloc[i] = ep
+                ep = low.iloc[i]
+                af = af_start
+            else:
+                if high.iloc[i] > ep:
+                    ep = high.iloc[i]
+                    af = min(af + af_step, af_max)
+        else:
+            if high.iloc[i] > sar.iloc[i]:
+                bull = True
+                sar.iloc[i] = ep
+                ep = high.iloc[i]
+                af = af_start
+            else:
+                if low.iloc[i] < ep:
+                    ep = low.iloc[i]
+                    af = min(af + af_step, af_max)
+    return sar
+
+
+def _aroon(high: pd.Series, low: pd.Series, period: int = 25) -> tuple[pd.Series, pd.Series]:
+    """Aroon Up and Aroon Down."""
+    aroon_up = high.rolling(period + 1).apply(lambda x: x.argmax() / period * 100, raw=True)
+    aroon_down = low.rolling(period + 1).apply(lambda x: x.argmin() / period * 100, raw=True)
+    return aroon_up, aroon_down
+
+
+def _mfi(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    volume: pd.Series, period: int = 14,
+) -> pd.Series:
+    """Money Flow Index."""
+    typical_price = (high + low + close) / 3
+    raw_mf = typical_price * volume
+    direction = typical_price.diff()
+    pos_mf = pd.Series(np.where(direction > 0, raw_mf, 0.0), index=close.index)
+    neg_mf = pd.Series(np.where(direction < 0, raw_mf, 0.0), index=close.index)
+    pos_sum = pos_mf.rolling(period).sum()
+    neg_sum = neg_mf.rolling(period).sum()
+    mfr = pos_sum / neg_sum.replace(0, np.nan)
+    return 100 - (100 / (1 + mfr))
+
+
+def _cci(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20) -> pd.Series:
+    """Commodity Channel Index."""
+    tp = (high + low + close) / 3
+    sma_tp = tp.rolling(period).mean()
+    mad = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+    return (tp - sma_tp) / (0.015 * mad.replace(0, np.nan))
+
+
+def _williams_r(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Williams %R."""
+    highest = high.rolling(period).max()
+    lowest = low.rolling(period).min()
+    return -100 * (highest - close) / (highest - lowest).replace(0, np.nan)
+
+
+def _ultimate_oscillator(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    p1: int = 7, p2: int = 14, p3: int = 28,
+) -> pd.Series:
+    """Ultimate Oscillator (multi-period weighted)."""
+    prev_close = close.shift(1)
+    bp = close - pd.concat([low, prev_close], axis=1).min(axis=1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    avg1 = bp.rolling(p1).sum() / tr.rolling(p1).sum().replace(0, np.nan)
+    avg2 = bp.rolling(p2).sum() / tr.rolling(p2).sum().replace(0, np.nan)
+    avg3 = bp.rolling(p3).sum() / tr.rolling(p3).sum().replace(0, np.nan)
+    return 100 * (4 * avg1 + 2 * avg2 + avg3) / 7
+
+
+def _trix(close: pd.Series, period: int = 15) -> pd.Series:
+    """TRIX: triple EMA rate of change."""
+    ema1 = _ema(close, period)
+    ema2 = _ema(ema1, period)
+    ema3 = _ema(ema2, period)
+    return ema3.pct_change() * 100
+
+
+def _cmf(
+    high: pd.Series, low: pd.Series, close: pd.Series,
+    volume: pd.Series, period: int = 20,
+) -> pd.Series:
+    """Chaikin Money Flow."""
+    mfm = ((close - low) - (high - close)) / (high - low).replace(0, np.nan)
+    mfv = mfm * volume
+    return mfv.rolling(period).sum() / volume.rolling(period).sum().replace(0, np.nan)
+
+
+def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume."""
+    direction = np.sign(close.diff()).fillna(0.0)
+    return (direction * volume).cumsum()
+
+
 def _adx_di(
     high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14,
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -228,5 +402,98 @@ class TechnicalIndicators:
         # ARMS-V2.1: 50-candle high/low for breakout detection
         df["high_50"] = high.rolling(50, min_periods=10).max()
         df["low_50"] = low.rolling(50, min_periods=10).min()
+
+        # ── V1.0 Spec: 15 additional indicators ──────────────────────────
+
+        # SuperTrend (ATR 10, Multiplier 3)
+        st_line, st_dir = _supertrend(high, low, close, period=10, multiplier=3.0)
+        df["supertrend"] = st_line
+        df["supertrend_dir"] = st_dir  # 1 = bullish, -1 = bearish
+
+        # Ichimoku Cloud
+        ichimoku = _ichimoku(high, low, close)
+        df["tenkan_sen"] = ichimoku["tenkan_sen"]
+        df["kijun_sen"] = ichimoku["kijun_sen"]
+        df["senkou_a"] = ichimoku["senkou_a"]
+        df["senkou_b"] = ichimoku["senkou_b"]
+        df["chikou_span"] = ichimoku["chikou_span"]
+        # Ichimoku cloud status: price above cloud = bullish
+        cloud_top = pd.concat([df["senkou_a"], df["senkou_b"]], axis=1).max(axis=1)
+        cloud_bot = pd.concat([df["senkou_a"], df["senkou_b"]], axis=1).min(axis=1)
+        df["ichimoku_above_cloud"] = (close > cloud_top).astype(float)
+        df["ichimoku_below_cloud"] = (close < cloud_bot).astype(float)
+
+        # Parabolic SAR
+        df["psar"] = _parabolic_sar(high, low)
+        df["psar_bullish"] = (close > df["psar"]).astype(float)
+
+        # Aroon Up/Down (25-period)
+        aroon_up, aroon_down = _aroon(high, low, period=25)
+        df["aroon_up"] = aroon_up
+        df["aroon_down"] = aroon_down
+        df["aroon_osc"] = aroon_up - aroon_down
+
+        # Money Flow Index (14)
+        df["mfi_14"] = _mfi(high, low, close, volume, period=14)
+
+        # Commodity Channel Index (20)
+        df["cci_20"] = _cci(high, low, close, period=20)
+
+        # Williams %R (14)
+        df["williams_r"] = _williams_r(high, low, close, period=14)
+
+        # Ultimate Oscillator (7, 14, 28)
+        df["ult_osc"] = _ultimate_oscillator(high, low, close)
+
+        # TRIX (15)
+        df["trix"] = _trix(close, period=15)
+
+        # Chaikin Money Flow (20)
+        df["cmf"] = _cmf(high, low, close, volume, period=20)
+
+        # On-Balance Volume
+        df["obv"] = _obv(close, volume)
+        df["obv_sma_20"] = _sma(df["obv"], 20)
+
+        # EMA 12 / 26 (explicit columns for cross detection)
+        df["ema_12"] = _ema(close, 12)
+        df["ema_26"] = _ema(close, 26)
+
+        # ── Swing structure for BOS/CHoCH ─────────────────────────────────
+        # 5-bar swing pivot detection
+        pivot_len = 5
+        df["swing_high"] = high.rolling(2 * pivot_len + 1, center=True).apply(
+            lambda x: x.iloc[pivot_len] if x.iloc[pivot_len] == x.max() else np.nan, raw=False,
+        )
+        df["swing_low"] = low.rolling(2 * pivot_len + 1, center=True).apply(
+            lambda x: x.iloc[pivot_len] if x.iloc[pivot_len] == x.min() else np.nan, raw=False,
+        )
+
+        # ── §3 Spec: Donchian Channels (20-period) ───────────────────────
+        donchian_period = 20
+        df["donchian_upper"] = high.rolling(donchian_period, min_periods=1).max()
+        df["donchian_lower"] = low.rolling(donchian_period, min_periods=1).min()
+        df["donchian_mid"] = (df["donchian_upper"] + df["donchian_lower"]) / 2.0
+        df["donchian_width"] = (df["donchian_upper"] - df["donchian_lower"]) / df["donchian_mid"].replace(0, np.nan)
+
+        # ── §3 Spec: Vortex Indicator (14-period) ────────────────────────
+        vortex_period = 14
+        vm_plus = (high - low.shift(1)).abs()
+        vm_minus = (low - high.shift(1)).abs()
+        tr_vi = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        vm_plus_sum = vm_plus.rolling(vortex_period, min_periods=1).sum()
+        vm_minus_sum = vm_minus.rolling(vortex_period, min_periods=1).sum()
+        tr_sum = tr_vi.rolling(vortex_period, min_periods=1).sum()
+        df["vortex_plus"] = vm_plus_sum / tr_sum.replace(0, np.nan)
+        df["vortex_minus"] = vm_minus_sum / tr_sum.replace(0, np.nan)
+        df["vortex_diff"] = df["vortex_plus"] - df["vortex_minus"]
+
+        # ── §3 Spec: Awesome Oscillator ──────────────────────────────────
+        midpoint = (high + low) / 2.0
+        df["awesome_osc"] = _sma(midpoint, 5) - _sma(midpoint, 34)
 
         return df.dropna(subset=["rsi_14", "ema_21", "macd"])

@@ -95,9 +95,14 @@ class Normalizer:
     }
 
     def normalize_tick(self, exchange: str, raw: dict[str, Any]) -> Tick | None:
+        ticks = self.normalize_tick_batch(exchange, raw)
+        return ticks[0] if ticks else None
+
+    def normalize_tick_batch(self, exchange: str, raw: dict[str, Any]) -> list[Tick]:
+        """Return all ticks from a single websocket message (Kraken sends batches)."""
         try:
             if exchange == "binance":
-                return Tick(
+                return [Tick(
                     exchange=exchange,
                     symbol=self._unify_symbol(exchange, raw.get("s", "")),
                     timestamp_us=int(raw.get("T", time.time_ns() // 1_000_000)) * 1000,
@@ -105,12 +110,12 @@ class Normalizer:
                     volume=float(raw.get("q", 0)),
                     side="buy" if raw.get("m") is False else "sell",
                     trade_id=str(raw.get("t", "")),
-                )
+                )]
             if exchange == "bybit":
                 data = raw.get("data", [{}])
                 if isinstance(data, list):
                     data = data[0] if data else {}
-                return Tick(
+                return [Tick(
                     exchange=exchange,
                     symbol=self._unify_symbol(exchange, data.get("s", "")),
                     timestamp_us=int(data.get("T", time.time_ns() // 1_000_000)) * 1000,
@@ -118,12 +123,12 @@ class Normalizer:
                     volume=float(data.get("v", 0)),
                     side=data.get("S", "").lower(),
                     trade_id=str(data.get("i", "")),
-                )
+                )]
             if exchange == "okx":
                 data = raw.get("data", [{}])
                 if isinstance(data, list):
                     data = data[0] if data else {}
-                return Tick(
+                return [Tick(
                     exchange=exchange,
                     symbol=self._unify_symbol(exchange, data.get("instId", "")),
                     timestamp_us=int(data.get("ts", time.time_ns() // 1_000_000)) * 1000,
@@ -131,23 +136,21 @@ class Normalizer:
                     volume=float(data.get("sz", 0)),
                     side=data.get("side", "").lower(),
                     trade_id=str(data.get("tradeId", "")),
-                )
+                )]
             if exchange == "kraken":
                 # Canonical Kraken trade payload shape:
                 # [channel_id, [[price, volume, time, side, order_type, misc], ...], "trade", "XBT/USD"]
                 if isinstance(raw, list) and len(raw) >= 2:
                     symbol_raw = str(raw[-1]) if len(raw) >= 4 else ""
                     trades = raw[1] if isinstance(raw[1], list) else []
+                    results: list[Tick] = []
 
-                    if trades:
-                        first_trade = trades[0]
-                        if isinstance(first_trade, list):
-                            t = first_trade
+                    for entry in trades:
+                        if isinstance(entry, list):
+                            t = entry
                         else:
-                            # Backward compatibility for any flattened list-like shape.
                             t = raw
-
-                        return Tick(
+                        results.append(Tick(
                             exchange=exchange,
                             symbol=self._unify_symbol(exchange, symbol_raw),
                             timestamp_us=int(float(t[2]) * 1_000_000) if len(t) > 2 else int(time.time_ns() // 1000),
@@ -155,10 +158,11 @@ class Normalizer:
                             volume=float(t[1]) if len(t) > 1 else 0.0,
                             side="buy" if len(t) > 3 and t[3] == "b" else "sell",
                             trade_id=str(t[5]) if len(t) > 5 else "",
-                        )
+                        ))
+                    return results
         except (KeyError, ValueError, IndexError) as exc:
             logger.debug("normalize_tick failed for exchange {}: {}", exchange, exc)
-        return None
+        return []
 
     def _unify_symbol(self, exchange: str, symbol: str) -> str:
         mapping = self.EXCHANGE_SYMBOL_MAP.get(exchange, {})

@@ -1178,6 +1178,276 @@ def build_app(
                     count += 1
         return {"success": True, "updated_positions": count}
 
+    # ── Paper feed helpers (use the main event bus) ───────────────────────
+    _main_paper_feed_task: asyncio.Task | None = None
+    _main_paper_sltp_task: asyncio.Task | None = None
+    _main_paper_exec_registered = False
+    _paper_trades_main: list[dict] = []
+
+    async def _start_paper_feed_main(bus: EventBus) -> None:
+        nonlocal _main_paper_feed_task, _main_paper_exec_registered, _paper_trades_main, _main_paper_sltp_task
+        if _main_paper_feed_task is not None:
+            return  # already running
+        try:
+            from data_ingestion.paper_feed import PaperFeed
+            symbols_cfg = config.get_value("exchanges", "binance", "symbols") or ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+            feed = PaperFeed(
+                event_bus=bus,
+                symbols=symbols_cfg,
+                timeframes=["1m", "15m", "1h", "4h"],
+                poll_interval=30.0,
+            )
+            _main_paper_feed_task = asyncio.create_task(feed.run())
+            logger.info("Paper feed started on main event bus for auto-trading")
+        except Exception as exc:
+            logger.error("Failed to start paper feed: {}", exc)
+        # Register paper executor on main bus (once)
+        if not _main_paper_exec_registered:
+            async def _handle_signal_main(signal):
+                import time as _time
+                trade_id = f"paper_{int(_time.time()*1000)}"
+                direction = getattr(signal, 'direction', 'unknown')
+                sym = getattr(signal, 'symbol', '??')
+                price = getattr(signal, 'price', 0)
+                score = getattr(signal, 'score', 0)
+                sl = getattr(signal, 'stop_loss', 0)
+                tp = getattr(signal, 'take_profit', 0)
+                meta = getattr(signal, 'metadata', {}) or {}
+
+                # Reject signals with stale timestamps (from historical seeding)
+                sig_ts = getattr(signal, 'timestamp', 0)
+                if sig_ts > 0 and abs(_time.time() - sig_ts) > 120:
+                    logger.debug("Paper executor: skipping stale signal (age={}s) for {}",
+                                 int(abs(_time.time() - sig_ts)), sym)
+                    return
+                equity = 100000.0
+                risk_pct = 0.02
+                size_usd = equity * risk_pct
+                qty = size_usd / price if price > 0 else 0
+                paper_trade = {
+                    "id": trade_id, "symbol": sym, "direction": direction,
+                    "price": price, "quantity": round(qty, 6),
+                    "notional": round(size_usd, 2), "score": round(score, 3),
+                    "stop_loss": round(sl, 2), "take_profit": round(tp, 2),
+                    "status": "OPEN", "timestamp": int(_time.time()),
+                    "reasons": getattr(signal, 'reasons', []),
+                    # Tiered TP tracking
+                    "remaining_qty": round(qty, 6),
+                    "tp_tiers": [
+                        {"level": round(meta.get("tp1_price", tp), 2),
+                         "close_pct": meta.get("tp1_close_pct", 0.50), "hit": False},
+                        {"level": round(meta.get("tp2_price", 0), 2),
+                         "close_pct": meta.get("tp2_close_pct", 0.30), "hit": False},
+                    ],
+                    "supertrend_trail": meta.get("supertrend_trail", 0),
+                    "tp3_close_pct": meta.get("tp3_close_pct", 0.20),
+                    "realized_pnl": 0.0,
+                    "partial_fills": [],
+                }
+                _paper_trades_main.append(paper_trade)
+                logger.info(
+                    "PAPER TRADE: {} {} {:.6f} @ ${:.2f} (score={:.2f}) SL={:.2f} TP1={:.2f} TP2={:.2f} [{}]",
+                    direction.upper(), sym, qty, price, score, sl,
+                    paper_trade["tp_tiers"][0]["level"],
+                    paper_trade["tp_tiers"][1]["level"],
+                    trade_id,
+                )
+            bus.subscribe("SIGNAL", _handle_signal_main)
+            _main_paper_exec_registered = True
+            logger.info("Paper executor subscribed to SIGNAL events on main bus")
+        # Start SL/TP monitor
+        if _main_paper_sltp_task is None:
+            _main_paper_sltp_task = asyncio.create_task(_paper_sltp_monitor())
+            logger.info("Paper SL/TP monitor started")
+
+    async def _stop_paper_feed_main() -> None:
+        nonlocal _main_paper_feed_task, _main_paper_sltp_task
+        if _main_paper_feed_task is not None:
+            _main_paper_feed_task.cancel()
+            _main_paper_feed_task = None
+            logger.info("Paper feed stopped")
+        if _main_paper_sltp_task is not None:
+            _main_paper_sltp_task.cancel()
+            _main_paper_sltp_task = None
+            logger.info("Paper SL/TP monitor stopped")
+
+    async def _fetch_ticker_prices(symbols: list[str]) -> dict[str, float]:
+        """Fetch current mark prices from Binance public API."""
+        import httpx as _httpx
+        prices: dict[str, float] = {}
+        try:
+            async with _httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get("https://fapi.binance.com/fapi/v1/ticker/price")
+                resp.raise_for_status()
+                for item in resp.json():
+                    prices[item["symbol"]] = float(item["price"])
+        except Exception as exc:
+            logger.debug("Paper SL/TP price fetch error: {}", exc)
+        return prices
+
+    def _symbol_to_binance(sym: str) -> str:
+        """Convert BTC/USDT:USDT → BTCUSDT for Binance API lookup."""
+        return sym.replace("/", "").replace(":USDT", "").upper()
+
+    async def _paper_sltp_monitor() -> None:
+        """Background task: check open paper trades against current prices for SL/TP."""
+        import time as _time
+
+        logger.info("Paper SL/TP monitor running — checking every 5s")
+        try:
+            while True:
+                await asyncio.sleep(5)
+                open_trades = [t for t in _paper_trades_main if t.get("status") == "OPEN"]
+                if not open_trades:
+                    continue
+
+                # Fetch current prices
+                needed_symbols = list({t["symbol"] for t in open_trades})
+                prices = await _fetch_ticker_prices(needed_symbols)
+                if not prices:
+                    continue
+
+                now = int(_time.time())
+                for trade in open_trades:
+                    bsym = _symbol_to_binance(trade["symbol"])
+                    current_price = prices.get(bsym)
+                    if current_price is None:
+                        continue
+
+                    direction = trade["direction"]
+                    entry = trade["price"]
+                    sl = trade["stop_loss"]
+                    remaining = trade.get("remaining_qty", trade["quantity"])
+
+                    # ── Check Stop Loss ──
+                    sl_hit = False
+                    if direction == "long" and current_price <= sl:
+                        sl_hit = True
+                    elif direction == "short" and current_price >= sl:
+                        sl_hit = True
+
+                    if sl_hit:
+                        pnl_per_unit = (current_price - entry) if direction == "long" else (entry - current_price)
+                        sl_pnl = pnl_per_unit * remaining
+                        trade["realized_pnl"] = round(trade.get("realized_pnl", 0) + sl_pnl, 2)
+                        trade["partial_fills"].append({
+                            "type": "SL", "price": round(current_price, 2),
+                            "qty": round(remaining, 6), "pnl": round(sl_pnl, 2),
+                            "timestamp": now,
+                        })
+                        trade["remaining_qty"] = 0
+                        trade["status"] = "CLOSED"
+                        trade["close_price"] = round(current_price, 2)
+                        trade["close_reason"] = "stop_loss"
+                        trade["close_time"] = now
+                        logger.info(
+                            "PAPER SL HIT: {} {} @ ${:.2f} → ${:.2f} PnL=${:.2f} [{}]",
+                            direction.upper(), trade["symbol"], entry,
+                            current_price, trade["realized_pnl"], trade["id"],
+                        )
+                        if signal_generator is not None:
+                            signal_generator.record_trade_result(
+                                trade["symbol"], is_win=(trade["realized_pnl"] > 0),
+                            )
+                        continue
+
+                    # ── Check Tiered Take Profits ──
+                    tp_tiers = trade.get("tp_tiers", [])
+                    original_qty = trade["quantity"]
+                    for i, tier in enumerate(tp_tiers):
+                        if tier.get("hit"):
+                            continue
+                        level = tier["level"]
+                        if level <= 0:
+                            continue
+
+                        tp_hit = False
+                        if direction == "long" and current_price >= level:
+                            tp_hit = True
+                        elif direction == "short" and current_price <= level:
+                            tp_hit = True
+
+                        if tp_hit:
+                            close_qty = round(original_qty * tier["close_pct"], 6)
+                            close_qty = min(close_qty, remaining)
+                            if close_qty <= 0:
+                                continue
+                            pnl_per_unit = (current_price - entry) if direction == "long" else (entry - current_price)
+                            tier_pnl = pnl_per_unit * close_qty
+                            trade["realized_pnl"] = round(trade.get("realized_pnl", 0) + tier_pnl, 2)
+                            remaining -= close_qty
+                            trade["remaining_qty"] = round(remaining, 6)
+                            tier["hit"] = True
+                            tier_name = f"TP{i + 1}"
+                            trade["partial_fills"].append({
+                                "type": tier_name, "price": round(current_price, 2),
+                                "qty": round(close_qty, 6), "pnl": round(tier_pnl, 2),
+                                "timestamp": now,
+                            })
+                            logger.info(
+                                "PAPER {} HIT: {} {} close {:.6f} @ ${:.2f} PnL=${:.2f} (remaining={:.6f}) [{}]",
+                                tier_name, direction.upper(), trade["symbol"],
+                                close_qty, current_price, tier_pnl, remaining, trade["id"],
+                            )
+
+                            # Move SL to breakeven after TP1
+                            if i == 0:
+                                trade["stop_loss"] = round(entry, 2)
+                                logger.info(
+                                    "PAPER SL→BE: {} {} SL moved to ${:.2f} [{}]",
+                                    direction.upper(), trade["symbol"], entry, trade["id"],
+                                )
+
+                    # ── Check TP3 SuperTrend trailing stop for remaining qty ──
+                    all_tiers_hit = all(t.get("hit") for t in tp_tiers)
+                    trail_level = trade.get("supertrend_trail", 0)
+                    if all_tiers_hit and remaining > 0 and trail_level > 0:
+                        trail_hit = False
+                        if direction == "long" and current_price <= trail_level:
+                            trail_hit = True
+                        elif direction == "short" and current_price >= trail_level:
+                            trail_hit = True
+
+                        if trail_hit:
+                            pnl_per_unit = (current_price - entry) if direction == "long" else (entry - current_price)
+                            trail_pnl = pnl_per_unit * remaining
+                            trade["realized_pnl"] = round(trade.get("realized_pnl", 0) + trail_pnl, 2)
+                            trade["partial_fills"].append({
+                                "type": "TP3_trail", "price": round(current_price, 2),
+                                "qty": round(remaining, 6), "pnl": round(trail_pnl, 2),
+                                "timestamp": now,
+                            })
+                            trade["remaining_qty"] = 0
+                            trade["status"] = "CLOSED"
+                            trade["close_price"] = round(current_price, 2)
+                            trade["close_reason"] = "tp3_trail"
+                            trade["close_time"] = now
+                            logger.info(
+                                "PAPER TP3 TRAIL: {} {} @ ${:.2f} PnL=${:.2f} [{}]",
+                                direction.upper(), trade["symbol"],
+                                current_price, trade["realized_pnl"], trade["id"],
+                            )
+                            if signal_generator is not None:
+                                signal_generator.record_trade_result(
+                                    trade["symbol"], is_win=(trade["realized_pnl"] > 0),
+                                )
+
+                    # Close trade if no remaining qty
+                    if trade.get("remaining_qty", 0) <= 0 and trade["status"] == "OPEN":
+                        trade["status"] = "CLOSED"
+                        trade["close_price"] = round(current_price, 2)
+                        trade["close_reason"] = "fully_filled"
+                        trade["close_time"] = now
+                        if signal_generator is not None:
+                            signal_generator.record_trade_result(
+                                trade["symbol"], is_win=(trade.get("realized_pnl", 0) > 0),
+                            )
+
+        except asyncio.CancelledError:
+            logger.info("Paper SL/TP monitor cancelled")
+        except Exception as exc:
+            logger.error("Paper SL/TP monitor error: {}", exc)
+
     # ── /api/auto/toggle — auto-trading toggle ────────────────────────────
     @app.post("/api/auto/toggle")
     async def api_auto_toggle(request: Request) -> dict[str, Any]:
@@ -1185,6 +1455,19 @@ def build_app(
         enabled = bool(body.get("enabled", False))
         if signal_generator is not None and hasattr(signal_generator, "set_auto_trading"):
             signal_generator.set_auto_trading(enabled)
+            # Apply paper-mode-friendly settings when enabling auto trading
+            if enabled and config.paper_mode:
+                signal_generator._min_factors = 2
+                signal_generator._min_score = 0.15
+                signal_generator._min_factor_magnitude = 0.05
+                signal_generator._tech_weight = 0.50
+                signal_generator._ml_weight = 0.40
+                signal_generator._sentiment_weight = 0.00
+                signal_generator._macro_weight = 0.02
+                signal_generator._news_weight = 0.04
+                signal_generator._orderbook_weight = 0.02
+                signal_generator._confirmation_tfs = []
+                signal_generator._min_signal_interval = 30
         # Store bot config on signal_generator for reference
         if signal_generator is not None:
             signal_generator._bot_config = {
@@ -1198,13 +1481,13 @@ def build_app(
                 "trailing_mode": body.get("trailing_mode", "none"),
                 "auto_sl_tp": bool(body.get("auto_sl_tp", False)),
             }
-        # Start/stop paper feed when auto trading is toggled in paper mode
+        # Start/stop paper feed — use the main event_bus so candles reach the main signal generator
         if config.paper_mode:
             try:
                 if enabled:
-                    await start_paper_feed()
+                    await _start_paper_feed_main(event_bus)
                 else:
-                    await stop_paper_feed()
+                    await _stop_paper_feed_main()
             except Exception as exc:
                 logger.warning("Paper feed toggle error: {}", exc)
         return {"success": True, "auto_trading_enabled": enabled, "mode": "paper" if config.paper_mode else "live"}
@@ -1279,9 +1562,25 @@ def build_app(
     # ── /api/paper/trades — paper trade log ───────────────────────────────
     @app.get("/api/paper/trades")
     async def api_paper_trades() -> dict[str, Any]:
-        if _FASTAPI and '_paper_trades' in globals():
-            return {"trades": list(_paper_trades[-100:]), "count": len(_paper_trades)}
-        return {"trades": [], "count": 0}
+        all_trades = list(_paper_trades_main[-100:])
+        if '_paper_trades' in globals():
+            all_trades.extend(_paper_trades[-100:])
+        all_trades.sort(key=lambda t: t.get("timestamp", 0), reverse=True)
+        open_trades = [t for t in _paper_trades_main if t.get("status") == "OPEN"]
+        closed_trades = [t for t in _paper_trades_main if t.get("status") == "CLOSED"]
+        total_pnl = sum(t.get("realized_pnl", 0) for t in _paper_trades_main)
+        wins = sum(1 for t in closed_trades if t.get("realized_pnl", 0) > 0)
+        losses = sum(1 for t in closed_trades if t.get("realized_pnl", 0) <= 0)
+        return {
+            "trades": all_trades[:100],
+            "count": len(all_trades),
+            "open_count": len(open_trades),
+            "closed_count": len(closed_trades),
+            "total_pnl": round(total_pnl, 2),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / max(wins + losses, 1) * 100, 1),
+        }
 
     # ── /api/config — GET config for settings modal ───────────────────────
     @app.get("/api/config")
@@ -1474,6 +1773,137 @@ def build_app(
 
             return StreamingResponse(_sse_fallback(), media_type="text/event-stream")
 
+    # ── §3 Spec: 9-layer confirmation status ──────────────────────────────
+    @app.get("/api/layers")
+    async def api_layers() -> dict[str, Any]:
+        """Return current state of the 9-layer confirmation pipeline."""
+        layers = [
+            {"id": 1, "name": "Session Filter", "description": "Trading session & killzone enforcement"},
+            {"id": 2, "name": "HTF Trend", "description": "Higher-timeframe weighted agreement"},
+            {"id": 3, "name": "Technical Confluence", "description": "RSI, MACD, BB, EMA alignment"},
+            {"id": 4, "name": "Smart Money Concepts", "description": "BOS/CHoCH + OB/FVG zones"},
+            {"id": 5, "name": "Volume Flow", "description": "Delta, CVD, VWAP deviation"},
+            {"id": 6, "name": "Regime Detection", "description": "Market regime (trending/ranging/breakout)"},
+            {"id": 7, "name": "ML Ensemble", "description": "Model prediction confidence"},
+            {"id": 8, "name": "Signal Quality", "description": "0-100 quality score gate (min 65)"},
+            {"id": 9, "name": "Risk Gate", "description": "Position sizing, DD phase, circuit breaker"},
+        ]
+        # Populate layer status from signal_generator if available
+        if signal_generator is not None:
+            last = getattr(signal_generator, '_last_layer_status', {})
+            for layer in layers:
+                key = layer["name"].lower().replace(" ", "_")
+                layer["status"] = last.get(key, "unknown")
+                layer["detail"] = last.get(f"{key}_detail", "")
+        return {"layers": layers, "total": 9}
+
+    # ── §5 Spec: Session & killzone status ────────────────────────────────
+    @app.get("/api/session")
+    async def api_session() -> dict[str, Any]:
+        """Return current trading session, killzone status, and session clock."""
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+        hour = now.hour
+        # Session rules (mirror signal_generator._SESSION_RULES)
+        sessions = [
+            {"name": "asia", "start": 0, "end": 8, "types": ["B"], "size_mult": 0.5},
+            {"name": "london_open", "start": 8, "end": 12, "types": ["A", "C", "D"], "size_mult": 1.0},
+            {"name": "london_dead", "start": 12, "end": 13, "types": [], "size_mult": 0.0, "no_trade": True},
+            {"name": "london_ny_overlap", "start": 13, "end": 17, "types": ["A", "B", "C", "D"], "size_mult": 1.5},
+            {"name": "ny_only", "start": 17, "end": 22, "types": ["B", "D"], "size_mult": 0.75},
+            {"name": "low_liquidity", "start": 22, "end": 24, "types": [], "size_mult": 0.0, "no_trade": True},
+        ]
+        active_session = None
+        for s in sessions:
+            if s["start"] <= hour < s["end"]:
+                active_session = s
+                break
+        # ICT killzones
+        ict_killzones = [{"start": 13, "end": 14}, {"start": 15, "end": 16}]
+        in_killzone = any(kz["start"] <= hour < kz["end"] for kz in ict_killzones)
+        is_weekend = now.weekday() >= 5
+        return {
+            "utc_hour": hour,
+            "utc_time": now.strftime("%H:%M:%S"),
+            "active_session": active_session,
+            "in_killzone": in_killzone,
+            "is_weekend": is_weekend,
+            "sessions": sessions,
+            "ict_killzones": ict_killzones,
+        }
+
+    # ── §6 Spec: Quality score breakdown ──────────────────────────────────
+    @app.get("/api/quality")
+    async def api_quality() -> dict[str, Any]:
+        """Return last signal quality score breakdown."""
+        if signal_generator is not None:
+            last_q = getattr(signal_generator, '_last_quality_breakdown', None)
+            if last_q:
+                return last_q
+        return {
+            "total": 0,
+            "components": {
+                "htf_alignment": 0,
+                "signal_type_purity": 0,
+                "volume_confirmation": 0,
+                "liquidity_proximity": 0,
+                "fvg_ob_overlap": 0,
+                "session_alignment": 0,
+                "sentiment_alignment": 0,
+                "onchain_health": 0,
+            },
+            "min_threshold": 65,
+            "boost_threshold": 80,
+        }
+
+    # ── §7 Spec: Regime state & transition info ───────────────────────────
+    @app.get("/api/regime")
+    async def api_regime() -> dict[str, Any]:
+        """Return current regime state and transition info per symbol."""
+        regimes: dict[str, Any] = {}
+        if signal_generator is not None:
+            detectors = getattr(signal_generator, '_regime_detectors', {})
+            for sym, det in detectors.items():
+                state = det.current_state()
+                regimes[sym] = {
+                    "regime": state.regime,
+                    "confidence": state.confidence,
+                    "candles_in_state": state.candles_in_state,
+                    "trend_strength": state.trend_strength,
+                    "in_transition": state.candles_in_state <= 2,
+                    "risk_pct": {"trending": 0.02, "ranging": 0.015, "breakout": 0.025}.get(state.regime, 0.02),
+                }
+        return {"regimes": regimes}
+
+    # ── §9 Spec: Risk guardrails status ───────────────────────────────────
+    @app.get("/api/guardrails")
+    async def api_guardrails() -> dict[str, Any]:
+        """Return risk guardrail status: circuit breaker, consecutive losses, flash crash, Kelly."""
+        result: dict[str, Any] = {
+            "circuit_breaker_tripped": False,
+            "circuit_breaker_reason": "",
+            "consecutive_losses": 0,
+            "max_consecutive_losses": 3,
+            "flash_crash_tripped": False,
+            "kelly_enabled": False,
+            "kelly_win_rate": 0.5,
+            "kelly_avg_win": 0.0,
+            "kelly_avg_loss": 0.0,
+        }
+        if risk_manager is not None:
+            cb = getattr(risk_manager, '_circuit_breaker', None)
+            if cb:
+                result["circuit_breaker_tripped"] = cb.tripped
+                result["circuit_breaker_reason"] = cb.trip_reason
+            result["consecutive_losses"] = getattr(risk_manager, '_consecutive_losses', 0)
+            result["max_consecutive_losses"] = getattr(risk_manager, '_max_consecutive_losses', 3)
+            result["flash_crash_tripped"] = getattr(risk_manager, '_flash_crash_tripped', False)
+            result["kelly_enabled"] = getattr(risk_manager, '_kelly_enabled', False)
+            result["kelly_win_rate"] = getattr(risk_manager, '_kelly_win_rate', 0.5)
+            result["kelly_avg_win"] = getattr(risk_manager, '_kelly_avg_win', 0.0)
+            result["kelly_avg_loss"] = getattr(risk_manager, '_kelly_avg_loss', 0.0)
+        return result
+
 
     return app
 
@@ -1502,12 +1932,13 @@ def _build_standalone_managers():
         sg.set_auto_trading(False)
         # Paper mode: lower thresholds so signals can fire with limited data feeds
         if cfg.paper_mode:
-            sg._min_factors = 1
-            sg._min_score = 0.03  # Low threshold — only tech+ML active, allow weak signals
+            sg._min_factors = 2
+            sg._min_score = 0.15
+            sg._min_factor_magnitude = 0.05
             # Redistribute weights: boost tech+ML since sentiment/macro/news/orderbook are 0
             sg._tech_weight = 0.50
             sg._ml_weight = 0.40
-            sg._sentiment_weight = 0.02
+            sg._sentiment_weight = 0.00
             sg._macro_weight = 0.02
             sg._news_weight = 0.04
             sg._orderbook_weight = 0.02

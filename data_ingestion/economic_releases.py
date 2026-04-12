@@ -118,8 +118,10 @@ class EconomicReleases:
             for item in series.get('data', []):
                 try:
                     year = int(item.get('year'))
-                    period = item.get('period')
+                    period = item.get('period', '')
 
+                    if not period:
+                        continue
                     if period.startswith('M'):
                         month = int(period[1:])
                     elif period.startswith('Q'):
