@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NeuralTrader Pro</title>
-<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="/static/js/lightweight-charts.standalone.production.js"></script>
+<script>if(typeof LightweightCharts==='undefined'){document.write('<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"><\/script>')}</script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -71,11 +72,13 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
 /* ── Right sidebar ── */
 .sidebar{display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;background:var(--bg1);scrollbar-gutter:stable}
-.sidebar-section{border-bottom:1px solid var(--border)}
+.sidebar-section{border-bottom:1px solid var(--border);flex-shrink:0}
+.sidebar-section.panel{overflow:visible}
 .sidebar-section .panel-hdr{cursor:pointer;user-select:none}
 .sidebar-section .panel-hdr:hover{background:var(--bg3)}
 .sidebar-section .panel-hdr .chevron{transition:transform .2s;font-size:8px;color:var(--text3)}
-.sidebar-section.collapsed .panel-body,.sidebar-section.collapsed .trade-form,.sidebar-section.collapsed>[id]{display:none!important}
+.sidebar-section .panel-body{flex:none}
+.sidebar-section.collapsed>*:not(.panel-hdr){display:none!important}
 .sidebar-section.collapsed .chevron{transform:rotate(-90deg)}
 
 /* ── Watchlist ── */
@@ -197,12 +200,80 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .modal-btns{display:flex;gap:8px;margin-top:14px}
 
 /* ── Responsive ── */
-@media(max-width:1200px){.body{grid-template-columns:1fr 280px}}
-@media(max-width:900px){.body{grid-template-columns:1fr}.sidebar{position:fixed;right:-300px;top:0;bottom:0;width:300px;z-index:50;transition:right .3s;border-left:1px solid var(--border);box-shadow:-4px 0 20px rgba(0,0,0,.5)}.sidebar.open{right:0}.sidebar-toggle{display:flex!important}}
+
+/* Large desktop (default) — sidebar 320px */
+
+/* Medium screens — narrower sidebar */
+@media(max-width:1200px){
+  .body{grid-template-columns:1fr 280px}
+  .h-stats{gap:10px}
+  .h-stat-val{font-size:11px}
+}
+
+/* Tablet / narrow — sidebar slides out, header wraps */
+@media(max-width:900px){
+  html,body{overflow-y:auto;overflow-x:hidden}
+  .app{height:auto;min-height:100vh}
+  .header{flex-wrap:wrap;padding:8px 12px;gap:8px}
+  .h-stats{margin-left:0;width:100%;justify-content:space-between;order:10;border-top:1px solid var(--border);padding-top:6px}
+  .sep{display:none}
+  .body{grid-template-columns:1fr}
+  .sidebar{position:fixed;right:-310px;top:0;bottom:0;width:300px;z-index:50;transition:right .3s ease;border-left:1px solid var(--border);box-shadow:-4px 0 20px rgba(0,0,0,.5)}
+  .sidebar.open{right:0}
+  .sidebar-toggle{display:flex!important}
+  .tabs{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .tab{white-space:nowrap;flex-shrink:0}
+  .tf-group{margin-left:8px;flex-shrink:0}
+  .btm-tabs{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .btm-tab{flex-shrink:0}
+  .ex-table{min-width:600px}
+  .arms-grid{grid-template-columns:1fr 1fr}
+  .modal{width:92vw;max-width:520px;margin:16px}
+}
+
+/* Phone / small screens */
+@media(max-width:600px){
+  html{font-size:11px}
+  .header{padding:6px 10px;gap:6px}
+  .logo{font-size:13px}
+  .sym-box{padding:4px 8px}
+  .sym-name{font-size:11px}
+  .sym-px{font-size:11px}
+  .h-stats{gap:6px}
+  .h-stat-lbl{font-size:8px}
+  .h-stat-val{font-size:10px}
+  .mode-badge{font-size:8px;padding:2px 6px}
+  .hdr-btn{padding:4px 7px;font-size:9px}
+  .clock{font-size:9px;padding:2px 6px}
+  .tabs{padding:4px 8px;gap:2px}
+  .tab{padding:5px 8px;font-size:10px}
+  .tf-btn{padding:3px 6px;font-size:8px}
+  .chart-wrap{min-height:250px}
+  .trade-form{padding:8px}
+  .trade-row{grid-template-columns:1fr}
+  .trade-btns{grid-template-columns:1fr 1fr}
+  .port-stats{grid-template-columns:1fr}
+  .arms-grid{grid-template-columns:1fr}
+  .metrics{grid-template-columns:1fr}
+  .modal-row{grid-template-columns:1fr}
+  .btm-tab{padding:5px 10px;font-size:10px}
+  .toast-box{left:12px;right:12px;bottom:12px}
+  .toast{font-size:10px}
+  .sidebar{width:85vw;right:-85vw}
+  .sidebar-toggle{width:44px;height:44px;right:10px;bottom:10px;font-size:18px}
+}
+
+/* Sidebar toggle button */
+.sidebar-toggle{position:fixed;right:12px;bottom:12px;z-index:51;width:40px;height:40px;border-radius:50%;background:var(--blue);border:none;color:#fff;font-size:16px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.4);align-items:center;justify-content:center}
 @media(min-width:901px){.sidebar-toggle{display:none!important}}
-.sidebar-toggle{position:fixed;right:12px;bottom:12px;z-index:51;width:40px;height:40px;border-radius:50%;background:var(--blue);border:none;color:#fff;font-size:16px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.4)}
 .sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:49}
 .sidebar-overlay.show{display:block}
+
+/* Safe touch area on mobile */
+@media(hover:none)and(pointer:coarse){
+  .hdr-btn,.tab,.tf-btn,.btm-tab,.btn,.close-btn,.panel-hdr{min-height:36px}
+  .wl-item{min-height:40px}
+}
 </style>
 </head>
 <body>
@@ -442,7 +513,7 @@ function fmt$(n) { return '$' + Number(n||0).toLocaleString(undefined,{minimumFr
 
 /* ── Init ── */
 document.addEventListener('DOMContentLoaded', () => {
-  initChart();
+  try { initChart(); } catch(e) { console.error('Chart init failed:', e); $('chart').innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text3);font-size:13px;flex-direction:column;gap:8px"><span>📊 Chart library unavailable</span><span style="font-size:10px">Open in external browser for full chart support</span></div>'; }
   bindTabs();
   bindTf();
   bindBtmTabs();
@@ -492,9 +563,11 @@ function bindBtmTabs() {
 /* ── Chart ── */
 function resizeChart() {
   if (!chart) return;
-  const el = $('chart');
-  const w = el.clientWidth, h = el.clientHeight;
-  if (w > 0 && h > 0) chart.applyOptions({width:w, height:h});
+  try {
+    const el = $('chart');
+    const w = el.clientWidth, h = el.clientHeight;
+    if (w > 0 && h > 0) chart.applyOptions({width:w, height:h});
+  } catch(e) {}
 }
 function initChart() {
   const el = $('chart');
@@ -718,8 +791,11 @@ async function loadCandles() {
   try { const d=await(await fetch('/api/candles?symbol='+symbol+'/USDT&timeframe='+tf)).json(); if(d.candles&&d.candles.length) setCandles(d.candles); } catch(_){}
 }
 function setCandles(c) {
-  candleSeries.setData(c.map(x=>({time:Math.floor(new Date(x.time)/1000),open:x.open,high:x.high,low:x.low,close:x.close})));
-  volumeSeries.setData(c.map(x=>({time:Math.floor(new Date(x.time)/1000),value:x.volume,color:x.close>=x.open?'#00d26a30':'#ff386030'})));
+  if (!candleSeries || !volumeSeries) return;
+  try {
+    candleSeries.setData(c.map(x=>({time:Math.floor(new Date(x.time)/1000),open:x.open,high:x.high,low:x.low,close:x.close})));
+    volumeSeries.setData(c.map(x=>({time:Math.floor(new Date(x.time)/1000),value:x.volume,color:x.close>=x.open?'#00d26a30':'#ff386030'})));
+  } catch(e) { console.warn('Chart data error:', e); }
 }
 
 async function loadAutoStatus() {
@@ -1123,6 +1199,7 @@ function toggleSection(id) {
 function toggleSidebar() {
   $('sidebar').classList.toggle('open');
   $('sidebarOverlay').classList.toggle('show');
+  setTimeout(resizeChart, 350);
 }
 </script>
 </body>

@@ -7,6 +7,7 @@ import os
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
@@ -48,6 +49,7 @@ from storage.trade_persistence import TradePersistence
 from storage.audit_repository import AuditRepository
 from storage.audit_event_persistence import AuditEventPersistence
 from storage.state_recovery import StateRecovery
+from storage.sqlite_store import SQLiteStore
 
 from monitoring.metrics import Metrics
 
@@ -96,8 +98,26 @@ async def main() -> None:
     event_bus = EventBus()
     db = DBHandler(config)
     cache = Cache(config)
+    sqlite_store = SQLiteStore()
     metrics = Metrics(config, event_bus)
 
+    # ── Persist candles to SQLite on each CANDLE event ────────────────────
+    async def _persist_candle(candle: Any) -> None:
+        try:
+            sqlite_store.insert_candle(
+                exchange=getattr(candle, "exchange", "binance"),
+                symbol=getattr(candle, "symbol", ""),
+                timeframe=getattr(candle, "timeframe", ""),
+                o=getattr(candle, "open", 0),
+                h=getattr(candle, "high", 0),
+                l=getattr(candle, "low", 0),
+                c=getattr(candle, "close", 0),
+                v=getattr(candle, "volume", 0),
+                ts_ns=int(getattr(candle, "timestamp", 0) * 1e9),
+            )
+        except Exception:
+            pass  # non-critical
+    event_bus.subscribe("CANDLE", _persist_candle)
     # ── Database ──────────────────────────────────────────────────────────
     await db.connect()
 
@@ -210,6 +230,7 @@ async def main() -> None:
         executors=executors,
         user_stream=user_stream,
         reconciliation_result=recon_result,
+        sqlite_store=sqlite_store,
     )
 
     # Re-add the dashboard log sink (logger.remove() in _setup_logging wipes it)

@@ -92,6 +92,25 @@ CREATE TABLE IF NOT EXISTS risk_state (
     updated_ns  INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id              TEXT PRIMARY KEY,
+    exchange        TEXT NOT NULL DEFAULT 'binance',
+    symbol          TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    price           REAL NOT NULL,
+    quantity        REAL NOT NULL,
+    notional        REAL NOT NULL DEFAULT 0,
+    score           REAL NOT NULL DEFAULT 0,
+    stop_loss       REAL DEFAULT 0,
+    take_profit     REAL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'OPEN',
+    timestamp       INTEGER NOT NULL,
+    realized_pnl    REAL DEFAULT 0,
+    remaining_qty   REAL DEFAULT 0,
+    reasons         TEXT DEFAULT '[]',
+    metadata        TEXT DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS schema_version (
     version     INTEGER PRIMARY KEY,
     applied_ns  INTEGER NOT NULL
@@ -102,9 +121,10 @@ CREATE INDEX IF NOT EXISTS idx_candles_time ON candles(time_ns, exchange, symbol
 CREATE INDEX IF NOT EXISTS idx_signals_time ON signals(time_ns);
 CREATE INDEX IF NOT EXISTS idx_positions_open ON positions(close_time_ns);
 CREATE INDEX IF NOT EXISTS idx_equity_time ON equity_curve(time_ns);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_ts ON paper_trades(timestamp);
 """
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 class SQLiteStore:
@@ -256,6 +276,87 @@ class SQLiteStore:
                 ),
             )
             self._conn.commit()
+
+    # ── Paper trade persistence ─────────────────────────────────────────
+    def upsert_paper_trade(self, trade: dict[str, Any]) -> None:
+        with self._lock:
+            assert self._conn is not None
+            self._conn.execute(
+                "INSERT OR REPLACE INTO paper_trades(id, exchange, symbol, direction, price, "
+                "quantity, notional, score, stop_loss, take_profit, status, timestamp, "
+                "realized_pnl, remaining_qty, reasons, metadata) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    trade["id"], trade.get("exchange", "binance"), trade["symbol"],
+                    trade["direction"], trade["price"], trade["quantity"],
+                    trade.get("notional", 0), trade.get("score", 0),
+                    trade.get("stop_loss", 0), trade.get("take_profit", 0),
+                    trade.get("status", "OPEN"), trade.get("timestamp", int(time.time())),
+                    trade.get("realized_pnl", 0), trade.get("remaining_qty", trade["quantity"]),
+                    json.dumps(trade.get("reasons", [])),
+                    json.dumps({k: v for k, v in trade.items()
+                                if k in ("tp_tiers", "supertrend_trail", "tp3_close_pct", "partial_fills")}),
+                ),
+            )
+            self._conn.commit()
+
+    def get_paper_trades(self, limit: int = 500) -> list[dict[str, Any]]:
+        rows = self.query(
+            "SELECT * FROM paper_trades ORDER BY timestamp DESC LIMIT ?", (limit,),
+        )
+        for r in rows:
+            r["reasons"] = json.loads(r.get("reasons", "[]"))
+            meta = json.loads(r.get("metadata", "{}"))
+            r.update(meta)
+        return rows
+
+    def get_open_paper_trades(self) -> list[dict[str, Any]]:
+        rows = self.query("SELECT * FROM paper_trades WHERE status = 'OPEN'")
+        for r in rows:
+            r["reasons"] = json.loads(r.get("reasons", "[]"))
+            meta = json.loads(r.get("metadata", "{}"))
+            r.update(meta)
+        return rows
+
+    # ── Candle batch insert ───────────────────────────────────────────────
+    def insert_candles_batch(
+        self, exchange: str, symbol: str, timeframe: str,
+        candles: list[dict[str, Any]],
+    ) -> int:
+        """Batch insert candles. Each candle dict has: time, open, high, low, close, volume."""
+        if not candles:
+            return 0
+        with self._lock:
+            assert self._conn is not None
+            rows = []
+            for c in candles:
+                ts = c.get("time_ns", 0)
+                if not ts and "time" in c:
+                    # Convert ISO or epoch to nanoseconds
+                    t = c["time"]
+                    if isinstance(t, str):
+                        import datetime
+                        dt = datetime.datetime.fromisoformat(t.replace("Z", "+00:00"))
+                        ts = int(dt.timestamp() * 1e9)
+                    elif isinstance(t, (int, float)):
+                        ts = int(t * 1e9) if t < 1e12 else int(t * 1e6) if t < 1e15 else int(t)
+                rows.append((ts, exchange, symbol, timeframe,
+                             c["open"], c["high"], c["low"], c["close"], c.get("volume", 0)))
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO candles(time_ns, exchange, symbol, timeframe, open, high, low, close, volume) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)", rows,
+            )
+            self._conn.commit()
+            return len(rows)
+
+    def get_candles(
+        self, exchange: str, symbol: str, timeframe: str, limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        return self.query(
+            "SELECT time_ns, open, high, low, close, volume FROM candles "
+            "WHERE exchange=? AND symbol=? AND timeframe=? ORDER BY time_ns DESC LIMIT ?",
+            (exchange, symbol, timeframe, limit),
+        )
 
     # ── Queries ───────────────────────────────────────────────────────────
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:

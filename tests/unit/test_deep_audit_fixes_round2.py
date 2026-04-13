@@ -338,5 +338,5 @@ class TestRound2Regressions:
         rm._equity = 100_000.0
         signal = _make_signal()
         approved, reason, size, pos = await rm.approve_and_open(signal)
-        assert approved
+        assert approved, f"expected approved but got: {reason}"
         assert pos is not None

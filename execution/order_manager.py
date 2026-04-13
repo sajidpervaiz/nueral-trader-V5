@@ -689,12 +689,69 @@ class OrderManager:
     _ORDER_TTL_SEC = 3600  # keep terminal-state orders for 1 hour
 
     async def run(self) -> None:
-        """Start order manager with periodic cleanup of terminal-state orders."""
+        """Start order manager with periodic cleanup and V6.0 fill monitoring."""
         self._running = True
         logger.info("OrderManager started")
         while self._running:
-            await asyncio.sleep(60)
-            await self._cleanup_old_orders()
+            await asyncio.sleep(5)  # Check every 5s for time-sensitive monitors
+            await self._monitor_partial_fills()
+            await self._monitor_limit_expiry()
+            # Full cleanup less frequently
+            if int(time.time()) % 60 < 6:
+                await self._cleanup_old_orders()
+
+    # ── V6.0: Partial fill timeout (cancel if <70% filled after 30s) ─────
+    async def _monitor_partial_fills(self) -> None:
+        """Cancel orders that are <70% filled after 30 seconds."""
+        now_ms = int(time.time() * 1000)
+        threshold_ms = 30_000  # 30 seconds
+        fill_threshold = 0.70
+
+        orders_to_cancel = []
+        async with self._lock:
+            for oid, order in self.orders.items():
+                if order.status not in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED, OrderStatus.SUBMITTED):
+                    continue
+                age_ms = now_ms - order.created_at
+                if age_ms < threshold_ms:
+                    continue
+                fill_ratio = order.cumulative_quantity / order.quantity if order.quantity > 0 else 0
+                if fill_ratio < fill_threshold:
+                    orders_to_cancel.append(oid)
+
+        for oid in orders_to_cancel:
+            try:
+                await self.cancel_order(oid)
+                logger.info("V6.0 partial fill timeout: cancelled order {} (<70% filled after 30s)", oid)
+            except Exception as exc:
+                logger.debug("Failed to cancel order {}: {}", oid, exc)
+
+    # ── V6.0: Limit order expiry (cancel after 120s if unfilled) ─────────
+    async def _monitor_limit_expiry(self) -> None:
+        """Expire limit orders that haven't filled within 120 seconds."""
+        now_ms = int(time.time() * 1000)
+        expiry_ms = 120_000  # 120 seconds
+
+        orders_to_expire = []
+        async with self._lock:
+            for oid, order in self.orders.items():
+                if order.order_type != OrderType.LIMIT:
+                    continue
+                if order.status not in (OrderStatus.OPEN, OrderStatus.SUBMITTED):
+                    continue
+                age_ms = now_ms - order.created_at
+                if age_ms >= expiry_ms and order.cumulative_quantity == 0:
+                    orders_to_expire.append(oid)
+
+        for oid in orders_to_expire:
+            try:
+                await self.cancel_order(oid)
+                order = self.orders.get(oid)
+                if order:
+                    order.status = OrderStatus.EXPIRED
+                logger.info("V6.0 limit order expired: {} (unfilled after 120s)", oid)
+            except Exception as exc:
+                logger.debug("Failed to expire order {}: {}", oid, exc)
 
     async def _cleanup_old_orders(self) -> None:
         """Remove orders in terminal states older than _ORDER_TTL_SEC."""

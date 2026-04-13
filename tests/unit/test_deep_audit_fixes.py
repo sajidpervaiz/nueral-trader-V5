@@ -120,7 +120,7 @@ class TestEquityUnreconciledCleared:
         rm.deactivate_kill_switch()
 
         approved, reason, size = rm.approve_signal(_make_signal())
-        assert approved
+        assert approved, f"expected approved but got: {reason}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -381,7 +381,7 @@ class TestRegressionAfterFixes:
         signal = _make_signal()
 
         approved, reason, size, pos = await rm.approve_and_open(signal)
-        assert approved
+        assert approved, f"expected approved but got: {reason}"
         assert pos is not None
         assert pos.symbol == "BTC/USDT:USDT"
 
