@@ -1,11 +1,12 @@
-"""Volume Profile & Order Flow Analysis — V1.0 Spec.
+"""Volume Profile & Order Flow Analysis — V6.0 Spec.
 
 Implements:
-- Volume Profile Fixed Range (VPFR)
-- Point of Control (POC) & Value Area
+- Volume Profile Fixed Range (VPFR) with 24 bins
+- Point of Control (POC) & Value Area (70%)
+- Low Volume Nodes (LVN < 30th percentile) & High Volume Nodes (HVN > 70th percentile)
 - On-Balance Volume (OBV) divergence
 - Cumulative Volume Delta
-- VWAP slope confirmation
+- VWAP slope confirmation + Anchored VWAP
 - Chaikin Money Flow (CMF) scoring
 """
 from __future__ import annotations
@@ -23,6 +24,8 @@ class VolumeProfileLevel:
     volume: float
     is_poc: bool = False
     in_value_area: bool = False
+    is_hvn: bool = False   # V6.0: High Volume Node (>70th percentile)
+    is_lvn: bool = False   # V6.0: Low Volume Node (<30th percentile)
 
 
 @dataclass
@@ -38,14 +41,20 @@ class VolumeFlowState:
     delta_trend: str = "neutral"       # "accumulating", "distributing", "neutral"
     flow_score: float = 0.0            # [-1, 1] composite
     reasons: list[str] = field(default_factory=list)
+    # V6.0 additions
+    lvn_levels: list[float] = field(default_factory=list)
+    hvn_levels: list[float] = field(default_factory=list)
 
 
 class VolumeProfileAnalyzer:
     """Computes volume profile, order flow metrics, and delta from OHLCV data."""
 
-    def __init__(self, profile_bins: int = 50, value_area_pct: float = 0.70) -> None:
+    def __init__(self, profile_bins: int = 24, value_area_pct: float = 0.70,
+                 lvn_percentile: float = 30.0, hvn_percentile: float = 70.0) -> None:
         self._bins = profile_bins
         self._va_pct = value_area_pct
+        self._lvn_pct = lvn_percentile
+        self._hvn_pct = hvn_percentile
 
     # ── Volume Profile Fixed Range ────────────────────────────────────────
     def _compute_vpfr(
@@ -108,17 +117,32 @@ class VolumeProfileAnalyzer:
         vah = float(bin_edges[hi_idx + 1])
         val = float(bin_edges[lo_idx])
 
+        # V6.0: LVN / HVN thresholds
+        lvn_thresh = float(np.percentile(bin_vols[bin_vols > 0], self._lvn_pct)) if bin_vols[bin_vols > 0].size > 0 else 0
+        hvn_thresh = float(np.percentile(bin_vols[bin_vols > 0], self._hvn_pct)) if bin_vols[bin_vols > 0].size > 0 else float("inf")
+
         levels = []
+        lvn_prices: list[float] = []
+        hvn_prices: list[float] = []
         for j in range(self._bins):
             mid_price = float((bin_edges[j] + bin_edges[j + 1]) / 2)
+            vol_val = float(bin_vols[j])
+            is_lvn = vol_val > 0 and vol_val <= lvn_thresh
+            is_hvn = vol_val >= hvn_thresh
             levels.append(VolumeProfileLevel(
                 price=mid_price,
-                volume=float(bin_vols[j]),
+                volume=vol_val,
                 is_poc=(j == poc_idx),
                 in_value_area=(lo_idx <= j <= hi_idx),
+                is_hvn=is_hvn,
+                is_lvn=is_lvn,
             ))
+            if is_lvn:
+                lvn_prices.append(mid_price)
+            if is_hvn:
+                hvn_prices.append(mid_price)
 
-        return poc_price, vah, val, levels
+        return poc_price, vah, val, levels, lvn_prices, hvn_prices
 
     # ── OBV Divergence ────────────────────────────────────────────────────
     @staticmethod
@@ -189,11 +213,13 @@ class VolumeProfileAnalyzer:
         reasons: list[str] = []
         score = 0.0
 
-        # VPFR
-        poc, vah, val, levels = self._compute_vpfr(df)
+        # VPFR (V6.0: 24 bins, LVN/HVN)
+        poc, vah, val, levels, lvn_prices, hvn_prices = self._compute_vpfr(df)
         state.poc_price = poc
         state.value_area_high = vah
         state.value_area_low = val
+        state.lvn_levels = lvn_prices
+        state.hvn_levels = hvn_prices
 
         close = float(df["close"].iloc[-1])
 
@@ -211,6 +237,12 @@ class VolumeProfileAnalyzer:
         poc_dist = abs(close - poc) / poc if poc > 0 else 0
         if poc_dist < 0.005:
             reasons.append("near_POC")
+
+        # V6.0: LVN proximity — price near a low-volume node = potential fast move
+        for lvn in lvn_prices:
+            if abs(close - lvn) / close < 0.005:
+                reasons.append("near_LVN")
+                break
 
         # OBV divergence
         obv_div = self._detect_obv_divergence(df)

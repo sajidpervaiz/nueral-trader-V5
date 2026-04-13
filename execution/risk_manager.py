@@ -136,8 +136,8 @@ class RiskManager:
         self.safe_mode = safe_mode or SafeModeManager()
         risk_cfg = config.get_value("risk") or {}
 
-        # ── Position sizing ───────────────────────────────────────────────
-        self._max_position_pct = float(risk_cfg.get("max_position_size_pct", 0.02))
+        # ── Position sizing (V6.0: 1.5% hard cap) ─────────────────────
+        self._max_position_pct = float(risk_cfg.get("max_position_size_pct", 0.015))
         self._risk_per_trade = float(risk_cfg.get("risk_per_trade_pct", 0.01))
         self._sizing_method = str(risk_cfg.get("sizing_method", "risk_based"))  # risk_based | fixed_fraction
         self._kelly_fraction = float(risk_cfg.get("kelly_fraction", 0.25))
@@ -147,7 +147,9 @@ class RiskManager:
         # ── Pre-trade filters ─────────────────────────────────────────────
         self._max_spread_bps = float(risk_cfg.get("max_spread_bps", 10.0))
         self._max_atr_pct = float(risk_cfg.get("max_atr_pct", 0.05))
-        self._max_exposure_per_symbol = float(risk_cfg.get("max_exposure_per_symbol_pct", 0.06))  # §9: 6% global max exposure
+        self._max_exposure_per_symbol = float(risk_cfg.get("max_exposure_per_symbol_pct", 0.06))  # §9: 6% per-symbol
+        # V6.0: total portfolio exposure hard limit
+        self._max_total_exposure_pct = float(risk_cfg.get("max_total_exposure_pct", 0.06))
         self._cooldown_seconds = float(risk_cfg.get("cooldown_seconds", 300.0))
         self._session_start_utc = str(risk_cfg.get("session_start_utc", "00:00"))
         self._session_end_utc = str(risk_cfg.get("session_end_utc", "23:59"))
@@ -165,8 +167,8 @@ class RiskManager:
         self._returns_window = int(risk_cfg.get("returns_window", 250))
         self._var_min_history = int(risk_cfg.get("var_min_history", 30))
 
-        # ── New risk filters ──────────────────────────────────────────────
-        self._max_funding_rate_bps = float(risk_cfg.get("max_funding_rate_bps", 50.0))
+        # ── New risk filters (V6.0: funding rate 2bps) ─────────────────────
+        self._max_funding_rate_bps = float(risk_cfg.get("max_funding_rate_bps", 2.0))
         self._min_orderbook_depth_usd = float(risk_cfg.get("min_orderbook_depth_usd", 50_000.0))
         self._max_order_size_usd = float(risk_cfg.get("max_order_size_usd", 500_000.0))
         self._max_leverage_per_symbol: dict[str, float] = risk_cfg.get("max_leverage_per_symbol", {})
@@ -309,9 +311,14 @@ class RiskManager:
         ]
         self._event_blackout_minutes_before = int(arms_cfg.get("event_blackout_before_min", 30))
 
-        # ── §13 Guardrails: Consecutive loss circuit breaker ──────────────
+        # ── §13 Guardrails: Consecutive loss circuit breaker (V6.0: 5) ──
         self._consecutive_losses: int = 0
-        self._max_consecutive_losses: int = int(risk_cfg.get("max_consecutive_losses", 3))
+        self._max_consecutive_losses: int = int(risk_cfg.get("max_consecutive_losses", 5))
+
+        # ── §13 Guardrails: Win-rate circuit breaker (V6.0: <55% over 20) ─
+        self._win_rate_lookback = int(risk_cfg.get("win_rate_circuit_lookback", 20))
+        self._win_rate_min = float(risk_cfg.get("win_rate_circuit_min", 0.55))
+        self._win_rate_breaker_tripped = False
 
         # ── §13 Guardrails: Flash crash detection ─────────────────────────
         self._flash_crash_threshold_pct = float(risk_cfg.get("flash_crash_threshold_pct", 0.05))  # 5% in 5min
@@ -903,6 +910,17 @@ class RiskManager:
         if self._circuit_breaker.tripped:
             return False, f"circuit_breaker: {self._circuit_breaker.trip_reason}", 0.0
 
+        # V6.0: Win-rate circuit breaker — halt if <55% over last 20 trades
+        if len(self._trade_results) >= self._win_rate_lookback:
+            recent = self._trade_results[-self._win_rate_lookback:]
+            win_count = sum(1 for r in recent if r > 0)
+            win_rate = win_count / len(recent)
+            if win_rate < self._win_rate_min:
+                self._win_rate_breaker_tripped = True
+                return False, f"win_rate_breaker ({win_rate:.0%} < {self._win_rate_min:.0%} over {self._win_rate_lookback})", 0.0
+            else:
+                self._win_rate_breaker_tripped = False
+
         if self._equity_unreconciled:
             return False, "equity_unreconciled (post kill-switch, awaiting exchange sync)", 0.0
 
@@ -1045,6 +1063,19 @@ class RiskManager:
 
         if size <= 0:
             return False, "position_size_zero (after ARMS adjustments)", 0.0
+
+        # V6.0: Total portfolio exposure check (after all sizing adjustments)
+        if self._equity > 0:
+            total_exposure = sum(
+                abs(p.entry_price * p.size)
+                for p in self._positions.values()
+            ) + abs(size)  # size is already notional USD
+            total_exposure_pct = total_exposure / self._equity
+            if total_exposure_pct > self._max_total_exposure_pct:
+                return False, (
+                    f"total_exposure_breach ({total_exposure_pct:.2%} > "
+                    f"{self._max_total_exposure_pct:.2%})"
+                ), 0.0
 
         return True, "approved", size
 

@@ -123,6 +123,7 @@ def build_app(
     executors: list[Any] | None = None,
     user_stream: Any = None,
     reconciliation_result: Any = None,
+    sqlite_store: Any = None,
 ) -> Any:
     if not _FASTAPI:
         return None
@@ -138,6 +139,9 @@ def build_app(
 
     dashboard_cfg = config.get_value("monitoring", "dashboard_api", default={}) or {}
     cors_origins = dashboard_cfg.get("allow_origins") or ["http://localhost", "http://127.0.0.1"]
+    # In paper mode, allow all origins for dev convenience (Codespace proxies, etc.)
+    if config.paper_mode:
+        cors_origins = ["*"]
     # Block wildcard CORS in non-paper (live) mode
     if not config.paper_mode and "*" in cors_origins:
         logger.warning(
@@ -1184,6 +1188,16 @@ def build_app(
     _main_paper_exec_registered = False
     _paper_trades_main: list[dict] = []
 
+    # Load persisted paper trades from SQLite on startup
+    if sqlite_store:
+        try:
+            _saved = sqlite_store.get_paper_trades(limit=2000)
+            if _saved:
+                _paper_trades_main.extend(_saved)
+                logger.info("Loaded {} paper trades from SQLite", len(_saved))
+        except Exception as _le:
+            logger.debug("Failed to load paper trades: {}", _le)
+
     async def _start_paper_feed_main(bus: EventBus) -> None:
         nonlocal _main_paper_feed_task, _main_paper_exec_registered, _paper_trades_main, _main_paper_sltp_task
         if _main_paper_feed_task is not None:
@@ -1245,6 +1259,12 @@ def build_app(
                     "partial_fills": [],
                 }
                 _paper_trades_main.append(paper_trade)
+                # Persist to SQLite
+                if sqlite_store:
+                    try:
+                        sqlite_store.upsert_paper_trade(paper_trade)
+                    except Exception as _pe:
+                        logger.debug("Paper trade persist error: {}", _pe)
                 logger.info(
                     "PAPER TRADE: {} {} {:.6f} @ ${:.2f} (score={:.2f}) SL={:.2f} TP1={:.2f} TP2={:.2f} [{}]",
                     direction.upper(), sym, qty, price, score, sl,
@@ -1349,6 +1369,11 @@ def build_app(
                             signal_generator.record_trade_result(
                                 trade["symbol"], is_win=(trade["realized_pnl"] > 0),
                             )
+                        if sqlite_store:
+                            try:
+                                sqlite_store.upsert_paper_trade(trade)
+                            except Exception:
+                                pass
                         continue
 
                     # ── Check Tiered Take Profits ──
@@ -1397,6 +1422,11 @@ def build_app(
                                     "PAPER SL→BE: {} {} SL moved to ${:.2f} [{}]",
                                     direction.upper(), trade["symbol"], entry, trade["id"],
                                 )
+                            if sqlite_store:
+                                try:
+                                    sqlite_store.upsert_paper_trade(trade)
+                                except Exception:
+                                    pass
 
                     # ── Check TP3 SuperTrend trailing stop for remaining qty ──
                     all_tiers_hit = all(t.get("hit") for t in tp_tiers)
@@ -1431,6 +1461,11 @@ def build_app(
                                 signal_generator.record_trade_result(
                                     trade["symbol"], is_win=(trade["realized_pnl"] > 0),
                                 )
+                            if sqlite_store:
+                                try:
+                                    sqlite_store.upsert_paper_trade(trade)
+                                except Exception:
+                                    pass
 
                     # Close trade if no remaining qty
                     if trade.get("remaining_qty", 0) <= 0 and trade["status"] == "OPEN":
@@ -1442,6 +1477,11 @@ def build_app(
                             signal_generator.record_trade_result(
                                 trade["symbol"], is_win=(trade.get("realized_pnl", 0) > 0),
                             )
+                        if sqlite_store:
+                            try:
+                                sqlite_store.upsert_paper_trade(trade)
+                            except Exception:
+                                pass
 
         except asyncio.CancelledError:
             logger.info("Paper SL/TP monitor cancelled")
@@ -1457,9 +1497,9 @@ def build_app(
             signal_generator.set_auto_trading(enabled)
             # Apply paper-mode-friendly settings when enabling auto trading
             if enabled and config.paper_mode:
-                signal_generator._min_factors = 2
-                signal_generator._min_score = 0.15
-                signal_generator._min_factor_magnitude = 0.05
+                signal_generator._min_factors = 1
+                signal_generator._min_score = 0.10
+                signal_generator._min_factor_magnitude = 0.03
                 signal_generator._tech_weight = 0.50
                 signal_generator._ml_weight = 0.40
                 signal_generator._sentiment_weight = 0.00
