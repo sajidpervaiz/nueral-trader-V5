@@ -1208,7 +1208,7 @@ def build_app(
             feed = PaperFeed(
                 event_bus=bus,
                 symbols=symbols_cfg,
-                timeframes=["1m", "15m", "1h", "4h"],
+                timeframes=["1m", "15m", "1h", "4h", "1d"],
                 poll_interval=30.0,
             )
             _main_paper_feed_task = asyncio.create_task(feed.run())
@@ -1233,6 +1233,13 @@ def build_app(
                 if sig_ts > 0 and abs(_time.time() - sig_ts) > 120:
                     logger.debug("Paper executor: skipping stale signal (age={}s) for {}",
                                  int(abs(_time.time() - sig_ts)), sym)
+                    return
+                # Skip if already have an open trade on this symbol
+                open_same = [t for t in _paper_trades_main
+                             if t.get("symbol") == sym and t.get("status") == "OPEN"]
+                if open_same:
+                    logger.debug("Paper executor: skipping {} — already {} open trade(s)",
+                                 sym, len(open_same))
                     return
                 equity = 100000.0
                 risk_pct = 0.02
@@ -1883,17 +1890,16 @@ def build_app(
         return {
             "total": 0,
             "components": {
-                "htf_alignment": 0,
-                "signal_type_purity": 0,
-                "volume_confirmation": 0,
-                "liquidity_proximity": 0,
-                "fvg_ob_overlap": 0,
-                "session_alignment": 0,
-                "sentiment_alignment": 0,
-                "onchain_health": 0,
+                "htf_trend": 0,
+                "technical_confluence": 0,
+                "smc_confluence": 0,
+                "volume_flow": 0,
+                "regime": 0,
+                "ml_confidence": 0,
+                "liquidity_depth": 0,
             },
             "min_threshold": 65,
-            "boost_threshold": 80,
+            "boost_threshold": 90,
         }
 
     # ── §7 Spec: Regime state & transition info ───────────────────────────
@@ -2091,7 +2097,7 @@ if _FASTAPI:
             feed = PaperFeed(
                 event_bus=_sa_bus,
                 symbols=symbols_cfg,
-                timeframes=["1m", "15m", "1h", "4h"],
+                timeframes=["1m", "15m", "1h", "4h", "1d"],
                 poll_interval=30.0,
             )
             _paper_feed_task = asyncio.create_task(feed.run())

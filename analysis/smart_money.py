@@ -89,7 +89,7 @@ class SmartMoneyAnalyzer:
 
     def __init__(
         self,
-        fvg_min_pct: float = 0.0015,
+        fvg_min_pct: float = 0.005,
         ob_lookback: int = 50,
         liquidity_lookback: int = 20,
         pivot_bars: int = 3,
@@ -215,8 +215,9 @@ class SmartMoneyAnalyzer:
                     fvg.volume_pct = (mid_vol / vm * 100) if vm > 0 else 0
                     fvg.displacement = (
                         mid_range > 0 and
-                        mid_body / mid_range >= 0.50 and
-                        (mid_range >= 1.0 * atr_val or fvg.volume_pct >= 120)
+                        mid_body / mid_range >= 0.60 and
+                        mid_range >= 1.2 * atr_val and
+                        fvg.volume_pct >= 150
                     )
                     # Mitigation level + age + filled check
                     fvg.age = n - 1 - i
@@ -247,8 +248,9 @@ class SmartMoneyAnalyzer:
                     fvg.volume_pct = (mid_vol / vm * 100) if vm > 0 else 0
                     fvg.displacement = (
                         mid_range > 0 and
-                        mid_body / mid_range >= 0.50 and
-                        (mid_range >= 1.0 * atr_val or fvg.volume_pct >= 120)
+                        mid_body / mid_range >= 0.60 and
+                        mid_range >= 1.2 * atr_val and
+                        fvg.volume_pct >= 150
                     )
                     fvg.age = n - 1 - i
                     if i < n - 1:

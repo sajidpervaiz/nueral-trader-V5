@@ -25,6 +25,7 @@ TF_MAP = {
     "15m": ("15m", 900),
     "1h": ("1h", 3600),
     "4h": ("4h", 14400),
+    "1d": ("1d", 86400),
 }
 
 
@@ -120,6 +121,7 @@ class PaperFeed:
     async def seed_history(self) -> None:
         """Seed DataManager with historical candles on startup."""
         logger.info("PaperFeed: seeding historical candles...")
+        self.event_bus._seeding = True  # Signal pipeline skips during seeding
         total = 0
         for sym in self.symbols:
             for tf in self.timeframes:
@@ -130,6 +132,7 @@ class PaperFeed:
                 if candles:
                     key = f"{sym}:{tf}"
                     self._last_candle_time[key] = candles[-1].timestamp
+        self.event_bus._seeding = False
         logger.info("PaperFeed: seeded {} candles across {} symbols × {} timeframes",
                      total, len(self.symbols), len(self.timeframes))
         self._seeding_complete = True

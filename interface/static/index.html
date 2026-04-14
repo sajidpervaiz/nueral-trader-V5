@@ -988,7 +988,7 @@ function renderPipeline(layers, quality, session) {
   // Quality Score
   html+='<div style="font:700 13px sans-serif;color:var(--text1);margin-bottom:10px">Quality Score</div>';
   const total = quality.total||0;
-  const qColor = total>=80?'var(--green)':total>=65?'var(--yellow)':'var(--red)';
+  const qColor = total>=90?'var(--green)':total>=65?'var(--yellow)':'var(--red)';
   html+='<div style="text-align:center;margin-bottom:12px"><span style="font:700 36px \'JetBrains Mono\';color:'+qColor+'">'+total+'</span><span style="font:11px sans-serif;color:var(--text3)"> / 100</span></div>';
   const comps = quality.components||{};
   for(const[k,v] of Object.entries(comps)) {
