@@ -38,7 +38,7 @@ from engine.signal_generator import SignalGenerator
 
 from execution.risk_manager import RiskManager
 from execution.order_manager import OrderManager
-from execution.exchange_factory import create_all_executors
+from execution.exchange_factory import create_all_executors, create_variational_executor
 from execution.smart_order_router import SmartOrderRouter
 from execution.startup_validation import StartupValidator, ValidationError
 from execution.reconciliation import StartupReconciler
@@ -163,6 +163,9 @@ async def main() -> None:
     order_mgr = OrderManager(config, event_bus, risk_mgr._circuit_breaker)
 
     executors = create_all_executors(config, event_bus, risk_mgr)
+
+    # Variational DEX executor (perpetual futures via RFQ)
+    variational_executor = create_variational_executor(config, event_bus, risk_mgr)
 
     by_exchange = {getattr(executor, "exchange_id", ""): executor for executor in executors}
     smart_router = SmartOrderRouter(
@@ -310,6 +313,9 @@ async def main() -> None:
 
     for executor in executors:
         tasks.append(asyncio.create_task(executor.run(), name=f"exec_{executor.exchange_id}"))
+
+    if variational_executor is not None:
+        tasks.append(asyncio.create_task(variational_executor.run(), name="exec_variational"))
 
     if app is not None:
         tasks.append(asyncio.create_task(run_dashboard(config, app), name="dashboard"))

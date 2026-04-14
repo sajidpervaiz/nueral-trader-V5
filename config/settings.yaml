@@ -106,6 +106,20 @@ dex:
     ws_endpoint: "${DYDX_WS_ENDPOINT}"
     mnemonic: "${DYDX_MNEMONIC}"
 
+# ── Variational DEX (perpetual futures via RFQ) ──────────────────────────────
+variational:
+  enabled: false
+  testnet: true
+  api_key: "${VARIATIONAL_API_KEY}"
+  api_secret: "${VARIATIONAL_API_SECRET}"
+  counterparty: ""                     # Omni market-maker company ID (leave empty for broadcast)
+  pool_location: ""                    # Reuse existing settlement pool (leave empty to create new)
+  max_trade_usd: 50                    # Max trade size in USD
+  symbols:
+    - BTC/USDT:USDT
+    - ETH/USDT:USDT
+    - SOL/USDT:USDT
+
 # ── Macro data feeds ──────────────────────────────────────────────────────────
 macro:
   funding_rates:
