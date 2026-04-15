@@ -452,6 +452,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <div class="panel-hdr" onclick="toggleSection('sec-guardrails')"><span class="panel-title">Guardrails</span><span class="chevron">▼</span></div>
         <div style="padding:8px 10px" id="guardrailsPanel"><div style="color:var(--text3);font-size:10px">Loading...</div></div>
       </div>
+
+      <!-- Variational DEX -->
+      <div class="sidebar-section" id="sec-variational">
+        <div class="panel-hdr" onclick="toggleSection('sec-variational')"><span class="panel-title">Variational DEX</span><span class="chevron">▼</span></div>
+        <div style="padding:8px 10px" id="variationalPanel"><div style="color:var(--text3);font-size:10px">Loading...</div></div>
+      </div>
     </div>
   </div>
 </div>
@@ -659,7 +665,7 @@ function applySnapshot(s) {
 
 /* ── Loaders ── */
 async function loadAll() {
-  await Promise.all([loadStatus(), loadMarket(), loadFG(), loadOB(), loadTech(), loadCandles(), loadAutoStatus(), loadPaperTrades(), loadSession(), loadRegime(), loadGuardrails()]);
+  await Promise.all([loadStatus(), loadMarket(), loadFG(), loadOB(), loadTech(), loadCandles(), loadAutoStatus(), loadPaperTrades(), loadSession(), loadRegime(), loadGuardrails(), loadVariational()]);
 }
 
 async function loadStatus() { try { applyStatus(await (await fetch('/api/status')).json()); } catch(_){} }
@@ -1067,6 +1073,49 @@ async function loadGuardrails() {
       html+='</div>';
     });
     $('guardrailsPanel').innerHTML=html;
+  } catch(_){}
+}
+
+/* ── Sidebar: Variational DEX ── */
+async function loadVariational() {
+  try {
+    const d = await (await fetch('/api/variational/status')).json();
+    let html='';
+    if (!d.enabled) {
+      html='<div style="color:var(--text3);font-size:10px">Disabled in config</div>';
+      html+='<div style="margin-top:6px;font-size:9px;color:var(--text3)">Set <code>variational.enabled: true</code></div>';
+    } else {
+      const connColor = d.connected ? 'var(--green)' : 'var(--red)';
+      const connText = d.connected ? 'Connected' : 'Disconnected';
+      const netText = d.testnet ? 'TESTNET' : 'MAINNET';
+      html+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)">';
+      html+='<span style="font:10px sans-serif;color:var(--text2)">Status</span>';
+      html+='<span style="font:600 9px \'JetBrains Mono\';color:'+connColor+'">'+esc(connText)+' ('+esc(netText)+')</span></div>';
+      html+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)">';
+      html+='<span style="font:10px sans-serif;color:var(--text2)">Max Trade</span>';
+      html+='<span style="font:600 9px \'JetBrains Mono\';color:var(--text1)">$'+(d.max_trade_usd||50)+'</span></div>';
+      if (d.portfolio && d.portfolio.balance!==undefined) {
+        html+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)">';
+        html+='<span style="font:10px sans-serif;color:var(--text2)">Balance</span>';
+        html+='<span style="font:600 9px \'JetBrains Mono\';color:var(--text1)">$'+Number(d.portfolio.balance).toFixed(2)+'</span></div>';
+        html+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)">';
+        html+='<span style="font:10px sans-serif;color:var(--text2)">uPnL</span>';
+        const upnl=Number(d.portfolio.unrealized_pnl||0);
+        html+='<span style="font:600 9px \'JetBrains Mono\';color:'+(upnl>=0?'var(--green)':'var(--red)')+'">'+upnl.toFixed(2)+'</span></div>';
+      }
+      if (d.positions && d.positions.length>0) {
+        html+='<div style="margin-top:4px;font:600 9px sans-serif;color:var(--text2)">Positions:</div>';
+        d.positions.forEach(p => {
+          const sideColor = p.side==='long'?'var(--green)':'var(--red)';
+          html+='<div style="display:flex;justify-content:space-between;padding:2px 0;font-size:9px">';
+          html+='<span style="color:'+sideColor+'">'+esc(p.side.toUpperCase())+' '+esc(p.symbol)+'</span>';
+          html+='<span style="color:var(--text2)">'+Number(p.qty).toFixed(6)+' @ $'+Number(p.entry_price).toFixed(2)+'</span></div>';
+        });
+      } else if (d.connected) {
+        html+='<div style="margin-top:4px;font-size:9px;color:var(--text3)">No open positions</div>';
+      }
+    }
+    $('variationalPanel').innerHTML=html;
   } catch(_){}
 }
 

@@ -937,6 +937,37 @@ def build_app(
         _dex_cache["fail_until"] = now + 120
         return _dex_cache["data"]
 
+    # ── /api/variational — Variational DEX status & positions ─────────────
+    @app.get("/api/variational/status")
+    async def api_variational_status() -> dict[str, Any]:
+        var_cfg = config.get_value("variational") or {}
+        enabled = var_cfg.get("enabled", False)
+        if not enabled:
+            return {"enabled": False, "connected": False, "testnet": True, "positions": [], "portfolio": {}}
+        # Find Variational executor from executors list
+        var_exec = None
+        for ex in (executors or []):
+            if hasattr(ex, "get_portfolio_summary"):
+                var_exec = ex
+                break
+        if var_exec is None:
+            return {"enabled": True, "connected": False, "testnet": var_cfg.get("testnet", True), "positions": [], "portfolio": {}}
+        try:
+            positions = await var_exec.get_positions()
+            portfolio = await var_exec.get_portfolio_summary()
+            return {
+                "enabled": True,
+                "connected": var_exec._client is not None,
+                "testnet": var_cfg.get("testnet", True),
+                "max_trade_usd": var_cfg.get("max_trade_usd", 50),
+                "symbols": var_cfg.get("symbols", []),
+                "positions": positions,
+                "portfolio": portfolio,
+            }
+        except Exception as exc:
+            logger.debug("Variational status error: {}", exc)
+            return {"enabled": True, "connected": False, "error": str(exc), "positions": [], "portfolio": {}}
+
     # ── /api/news — live news feed ────────────────────────────────────────
     @app.get("/api/news")
     async def api_news() -> dict[str, Any]:
