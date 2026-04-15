@@ -38,6 +38,9 @@ class Metrics:
         self.config = config
         self.event_bus = event_bus
         self._running = False
+        self._feed_lag_samples: list[tuple[str, float]] = []  # (exchange, lag_s)
+        self._order_latency_samples: list[tuple[str, str, float]] = []  # (exchange, type, lat_s)
+        self._max_samples = 500
 
         if _PROMETHEUS:
             self.ticks_total = Counter(
@@ -93,6 +96,23 @@ class Metrics:
                 "DEX quote generation latency",
                 buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
             )
+            self.ws_feed_lag = Histogram(
+                "neuraltrader_ws_feed_lag_seconds",
+                "WebSocket feed lag (receive_time - exchange_timestamp)",
+                ["exchange"],
+                buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+            )
+            self.order_execution_latency = Histogram(
+                "neuraltrader_order_execution_seconds",
+                "Order execution round-trip latency",
+                ["exchange", "order_type"],
+                buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0],
+            )
+            self.clock_drift = Gauge(
+                "neuraltrader_clock_drift_ms",
+                "Clock drift between bot and exchange in ms",
+                ["exchange"],
+            )
             self.service_health = Gauge(
                 "neuraltrader_service_health",
                 "Health of external services (1=up, 0=down)",
@@ -135,7 +155,9 @@ class Metrics:
                 "ticks_total", "signals_total", "orders_total",
                 "open_positions", "equity", "daily_pnl",
                 "funding_rate", "open_interest_usd", "vix_proxy",
-                "rust_tick_latency", "dex_quote_latency", "service_health",
+                "rust_tick_latency", "dex_quote_latency",
+                "ws_feed_lag", "order_execution_latency", "clock_drift",
+                "service_health",
                 "alerts_total", "alerts_suppressed_total",
                 "circuit_breaker_trips_total", "safe_mode_active",
                 "kill_switch_active", "stop_loss_hits_total",
@@ -147,6 +169,55 @@ class Metrics:
         tick = payload
         if hasattr(tick, "exchange") and hasattr(tick, "symbol"):
             self.ticks_total.labels(exchange=tick.exchange, symbol=tick.symbol).inc()
+            # Track WebSocket feed lag
+            recv = getattr(tick, "receive_time_us", 0)
+            ts = getattr(tick, "timestamp_us", 0)
+            if recv > 0 and ts > 0:
+                lag_s = (recv - ts) / 1_000_000.0
+                if -1.0 < lag_s < 10.0:  # sanity bounds
+                    self.ws_feed_lag.labels(exchange=tick.exchange).observe(lag_s)
+                    # Keep rolling stats for /api/latency
+                    self._feed_lag_samples.append((tick.exchange, lag_s))
+            # Trim rolling buffer
+            if len(self._feed_lag_samples) > self._max_samples:
+                self._feed_lag_samples = self._feed_lag_samples[-self._max_samples:]
+
+    def record_order_latency(self, exchange: str, order_type: str, latency_s: float) -> None:
+        """Record order execution latency (called from trade endpoints)."""
+        self.order_execution_latency.labels(exchange=exchange, order_type=order_type).observe(latency_s)
+        self._order_latency_samples.append((exchange, order_type, latency_s))
+        if len(self._order_latency_samples) > self._max_samples:
+            self._order_latency_samples = self._order_latency_samples[-self._max_samples:]
+
+    def get_latency_stats(self) -> dict[str, Any]:
+        """Return current latency statistics for the /api/latency endpoint."""
+        import statistics
+        result: dict[str, Any] = {"feed_lag": {}, "order_latency": {}}
+        # Feed lag stats per exchange
+        by_exchange: dict[str, list[float]] = {}
+        for ex, lag in self._feed_lag_samples:
+            by_exchange.setdefault(ex, []).append(lag)
+        for ex, lags in by_exchange.items():
+            result["feed_lag"][ex] = {
+                "count": len(lags),
+                "avg_ms": round(statistics.mean(lags) * 1000, 1) if lags else 0,
+                "p50_ms": round(statistics.median(lags) * 1000, 1) if lags else 0,
+                "p95_ms": round(sorted(lags)[int(len(lags) * 0.95)] * 1000, 1) if len(lags) > 1 else 0,
+                "max_ms": round(max(lags) * 1000, 1) if lags else 0,
+            }
+        # Order latency stats
+        by_type: dict[str, list[float]] = {}
+        for ex, otype, lat in self._order_latency_samples:
+            key = f"{ex}_{otype}"
+            by_type.setdefault(key, []).append(lat)
+        for key, lats in by_type.items():
+            result["order_latency"][key] = {
+                "count": len(lats),
+                "avg_ms": round(statistics.mean(lats) * 1000, 0) if lats else 0,
+                "p50_ms": round(statistics.median(lats) * 1000, 0) if lats else 0,
+                "max_ms": round(max(lats) * 1000, 0) if lats else 0,
+            }
+        return result
 
     async def _handle_signal(self, payload: Any) -> None:
         signal = payload

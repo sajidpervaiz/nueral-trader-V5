@@ -114,6 +114,7 @@ class CEXExecutor:
             leverage = int(cfg.get("leverage", self.risk_manager._leverage if hasattr(self.risk_manager, '_leverage') else 1))
             margin_mode = str(cfg.get("margin_mode", "isolated")).lower()
             symbols = cfg.get("symbols", [])
+            self._symbols = symbols
             for sym in symbols:
                 try:
                     await self._client.set_margin_mode(margin_mode, sym)
@@ -124,6 +125,11 @@ class CEXExecutor:
                 except Exception as e:
                     logger.debug("{} set_leverage({}, {}): {}", self.exchange_id, leverage, sym, e)
             logger.info("{} CEX client initialized (leverage={}, margin={})", self.exchange_id, leverage, margin_mode)
+            # Pre-warm HTTP connection pool to eliminate cold-start latency
+            try:
+                await self._client.fetch_ticker(symbols[0] if symbols else "BTC/USDT:USDT")
+            except Exception:
+                pass
         except Exception as exc:
             logger.warning("{} client init failed: {}", self.exchange_id, exc)
             self._client = None

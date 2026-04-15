@@ -124,6 +124,7 @@ def build_app(
     user_stream: Any = None,
     reconciliation_result: Any = None,
     sqlite_store: Any = None,
+    metrics: Any = None,
 ) -> Any:
     if not _FASTAPI:
         return None
@@ -838,7 +839,17 @@ def build_app(
                 rl = getattr(exc, "_rate_limiter", None)
                 if rl:
                     await rl.acquire()
-                raw_orders = await client.fetch_open_orders()
+                # Fetch per-symbol to avoid slow all-symbol scan
+                symbols = getattr(exc, "_symbols", None) or []
+                if symbols:
+                    raw_orders = []
+                    for sym in symbols:
+                        try:
+                            raw_orders.extend(await client.fetch_open_orders(sym))
+                        except Exception:
+                            pass
+                else:
+                    raw_orders = await client.fetch_open_orders()
                 for o in raw_orders:
                     all_orders.append({
                         "exchange": ex_id,
@@ -855,6 +866,15 @@ def build_app(
             except Exception as exc_err:
                 logger.warning("fetch_open_orders failed for {}: {}", ex_id, exc_err)
         return {"orders": all_orders, "total": len(all_orders)}
+
+    # ── /api/latency — live latency statistics ────────────────────────────
+    @app.get("/api/latency")
+    async def api_latency() -> dict[str, Any]:
+        """Return current latency statistics: feed lag, order execution times."""
+        stats: dict[str, Any] = {"feed_lag": {}, "order_latency": {}}
+        if metrics and hasattr(metrics, "get_latency_stats"):
+            stats = metrics.get_latency_stats()
+        return stats
 
     # ── /api/exchange/currencies — all currencies from connected exchanges ─
     @app.get("/api/exchange/currencies")
@@ -1303,6 +1323,7 @@ def build_app(
                     await rate_limiter.acquire()
 
                 ccxt_side = "buy" if side_str == "BUY" else "sell"
+                t_order_start = time.monotonic()
                 if order_type_str == "market":
                     order = await client.create_market_order(
                         symbol=sym, side=ccxt_side, amount=size, params={},
@@ -1312,6 +1333,10 @@ def build_app(
                         symbol=sym, side=ccxt_side, amount=size,
                         price=price, params={},
                     )
+                order_latency = time.monotonic() - t_order_start
+
+                if metrics and hasattr(metrics, "record_order_latency"):
+                    metrics.record_order_latency(venue, order_type_str, order_latency)
 
                 fill_price = float(order.get("average", order.get("price", price or 0)))
                 filled = float(order.get("filled", size))
@@ -1392,10 +1417,14 @@ def build_app(
                         if rl:
                             await rl.acquire()
                         close_side = "sell" if pos.direction == "long" else "buy"
+                        t_close_start = time.monotonic()
                         await client.create_market_order(
                             symbol=symbol, side=close_side, amount=abs(pos.size),
                             params={"reduceOnly": True},
                         )
+                        close_latency = time.monotonic() - t_close_start
+                        if metrics and hasattr(metrics, "record_order_latency"):
+                            metrics.record_order_latency(ex_id, "close", close_latency)
                         # Cancel protective orders
                         placer = getattr(exc, "_order_placer", None)
                         if placer:

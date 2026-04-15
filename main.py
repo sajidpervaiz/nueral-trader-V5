@@ -234,6 +234,7 @@ async def main() -> None:
         user_stream=user_stream,
         reconciliation_result=recon_result,
         sqlite_store=sqlite_store,
+        metrics=metrics,
     )
 
     # Re-add the dashboard log sink (logger.remove() in _setup_logging wipes it)
