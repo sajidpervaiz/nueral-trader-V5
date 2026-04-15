@@ -71,11 +71,27 @@ class CEXExecutor:
         if passphrase:
             params["password"] = passphrase
         if cfg.get("testnet"):
-            params["options"] = {"defaultType": cfg.get("type", "future")}
+            # Normalize type: ccxt expects 'future' not 'futures'
+            raw_type = cfg.get("type", "future")
+            if raw_type == "futures":
+                raw_type = "future"
+            params["options"] = {
+                "defaultType": raw_type,
+                # Skip sapi calls (spot auth) — testnet keys only work on futures endpoints
+                "fetchCurrencies": False,
+                "fetchMargins": False,
+                "warnOnFetchOpenOrdersWithoutSymbol": False,
+            }
         try:
             self._client = cls(params)
             if cfg.get("testnet"):
-                self._client.set_sandbox_mode(True)
+                # Proper testnet setup: manually swap only futures URLs
+                # instead of set_sandbox_mode() which triggers ccxt's
+                # deprecation error for Binance futures testnet.
+                testnet_urls = self._client.urls.get("test", {})
+                for key, url in testnet_urls.items():
+                    if key.startswith(("fapi", "dapi")) and key in self._client.urls["api"]:
+                        self._client.urls["api"][key] = url
             await self._client.load_markets()
             # Detect hedge mode (dual position side)
             hedge_mode = bool(cfg.get("hedge_mode", False))

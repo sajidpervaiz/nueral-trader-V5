@@ -180,12 +180,15 @@ class TestCircuitBreaker:
         assert not cb.tripped
 
     def test_timed_auto_resume(self) -> None:
+        """Circuit breaker requires manual reset — no auto-resume after pause."""
         import time
         cb = CircuitBreaker(max_daily_loss_pct=0.03, max_drawdown_pct=0.10, pause_seconds=0.1)
         cb.record_pnl(-0.05, 95000)
         assert cb.tripped
         time.sleep(0.15)
-        assert not cb.tripped  # Should auto-reset after pause
+        assert cb.tripped  # Must stay tripped until manual reset
+        cb.reset()
+        assert not cb.tripped  # Manual reset clears it
 
 
 class TestKillSwitch:

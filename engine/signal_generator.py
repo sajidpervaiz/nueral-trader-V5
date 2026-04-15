@@ -604,7 +604,7 @@ class SignalGenerator:
         self._macro_ts: float = 0.0
         self._score_ttl: float = 3600.0  # seconds before scores go stale
         self._min_factor_magnitude: float = 0.05  # minimum |score| to count as contributing
-        self._risk_manager = None  # set externally for position counting
+        self._risk_manager = None  # use set_risk_manager() to wire
         self._last_signal_time: dict[str, float] = {}
         self._min_signal_interval = 60.0
         self._auto_trading_enabled = False
@@ -643,6 +643,7 @@ class SignalGenerator:
         self._min_factors = int(signals_cfg.get("min_contributing_factors", 3))
         self._primary_tf = signals_cfg.get("primary_timeframe", "15m")
         self._confirmation_tfs: list[str] = list(signals_cfg.get("confirmation_timeframes", ["1h", "4h"]))
+        self._htf_threshold = float(signals_cfg.get("htf_threshold", 3.0))
 
         # ── Pipeline status tracking for dashboard API ────────────────────
         self._last_layer_status: dict[str, str] = {}
@@ -800,6 +801,11 @@ class SignalGenerator:
         if prev != enabled:
             logger.info("Auto-trading toggled: {} → {}", prev, enabled)
 
+    def set_risk_manager(self, risk_manager: Any) -> None:
+        """Wire risk manager for position counting. Use this instead of accessing _risk_manager directly."""
+        self._risk_manager = risk_manager
+        logger.debug("SignalGenerator: risk_manager wired")
+
     @property
     def auto_trading_enabled(self) -> bool:
         return self._auto_trading_enabled
@@ -944,11 +950,11 @@ class SignalGenerator:
 
         detail_str = f"weighted={weighted_sum:.1f}/7 [{', '.join(detail_parts)}]"
 
-        # Spec: For long, require weighted_sum >= 5.0; for short, <= -5.0
-        # HARD GATE: relaxed from spec 5/7 to 3/7 for paper mode (requires at least Daily+4H agreement)
-        if direction == "long" and weighted_sum >= 3.0:
+        # Spec: For long, require weighted_sum >= threshold; for short, <= -threshold
+        htf_thresh = self._htf_threshold
+        if direction == "long" and weighted_sum >= htf_thresh:
             return True, f"HTF_pass_long {detail_str}", normalized_score, agreement_count
-        elif direction == "short" and weighted_sum <= -3.0:
+        elif direction == "short" and weighted_sum <= -htf_thresh:
             return True, f"HTF_pass_short {detail_str}", normalized_score, agreement_count
         else:
             return False, f"HTF_fail {detail_str}", normalized_score, agreement_count

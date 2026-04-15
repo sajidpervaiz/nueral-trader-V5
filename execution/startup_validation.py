@@ -160,21 +160,29 @@ class StartupValidator:
         """Check that API key has trading permissions."""
         if self._client is None:
             return
-        try:
-            balance = await self._client.fetch_balance()
-            if not balance:
-                raise ValidationError("Empty balance response — check API permissions")
-            # Cache for subsequent checks
-            self._cached_balance = balance
-            result.checks["permissions"] = "ok"
-            logger.info("Exchange permissions OK (read+trade)")
-        except ValidationError:
-            raise
-        except Exception as exc:
-            raise ValidationError(
-                f"API permission check failed: {exc}. "
-                "Ensure API key has 'Enable Futures' and 'Enable Reading' permissions."
-            ) from exc
+        import asyncio
+        last_exc = None
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    await asyncio.sleep(2)
+                balance = await self._client.fetch_balance()
+                if not balance:
+                    raise ValidationError("Empty balance response — check API permissions")
+                # Cache for subsequent checks
+                self._cached_balance = balance
+                result.checks["permissions"] = "ok"
+                logger.info("Exchange permissions OK (read+trade)")
+                return
+            except ValidationError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Balance fetch attempt {}/3 failed: {}", attempt + 1, exc)
+        raise ValidationError(
+            f"API permission check failed: {last_exc}. "
+            "Ensure API key has 'Enable Futures' and 'Enable Reading' permissions."
+        )
 
     # ── 4. Balance + feasibility ─────────────────────────────────────────
 

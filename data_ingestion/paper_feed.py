@@ -38,11 +38,13 @@ class PaperFeed:
         symbols: list[str] | None = None,
         timeframes: list[str] | None = None,
         poll_interval: float = 30.0,
+        data_manager: Any = None,
     ) -> None:
         self.event_bus = event_bus
         self.symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         self.timeframes = timeframes or ["1m", "15m", "1h", "4h"]
         self.poll_interval = poll_interval
+        self._data_manager = data_manager
         self._running = False
         self._seeding_complete = False
         self._client: httpx.AsyncClient | None = None
@@ -119,30 +121,56 @@ class PaperFeed:
         return emitted
 
     async def seed_history(self) -> None:
-        """Seed DataManager with historical candles on startup."""
+        """Seed DataManager with historical candles on startup.
+        
+        If data_manager is available, seeds directly (fast, no event bus overhead).
+        Otherwise falls back to publishing through event bus.
+        """
         logger.info("PaperFeed: seeding historical candles...")
         self.event_bus._seeding = True  # Signal pipeline skips during seeding
         total = 0
         for sym in self.symbols:
             for tf in self.timeframes:
                 candles = await self._fetch_klines(sym, tf, limit=200)
-                for c in candles:
-                    await self.event_bus.publish("CANDLE", c)
-                    total += 1
+                if self._data_manager is not None:
+                    # Direct inject — bypasses EventBus queue, skip indicator compute per-candle
+                    for c in candles:
+                        self._data_manager._store_candle(c.exchange, c.symbol, c.timeframe, c, compute=False)
+                        total += 1
+                else:
+                    for c in candles:
+                        await self.event_bus.publish("CANDLE", c)
+                        total += 1
+                        if total % 50 == 0:
+                            await asyncio.sleep(0)
                 if candles:
                     key = f"{sym}:{tf}"
                     self._last_candle_time[key] = candles[-1].timestamp
+                # Yield to event loop between symbol/tf combos so HTTP stays responsive
+                await asyncio.sleep(0)
+
+        # Bulk recompute indicators once after all candles are loaded
+        if self._data_manager is not None:
+            self._data_manager.recompute_all()
+
         self.event_bus._seeding = False
         logger.info("PaperFeed: seeded {} candles across {} symbols × {} timeframes",
                      total, len(self.symbols), len(self.timeframes))
         self._seeding_complete = True
 
-    async def run(self) -> None:
-        """Main loop: seed history, then poll for new candles."""
+    async def run(self, seed_only: bool = False) -> None:
+        """Main loop: seed history, then poll for new candles.
+        
+        Args:
+            seed_only: If True, seed history and return (used in live mode where WS provides data).
+        """
         self._running = True
         self._client = httpx.AsyncClient()
         try:
             await self.seed_history()
+            if seed_only:
+                logger.info("PaperFeed: seed-only mode — polling disabled (live WS provides data)")
+                return
             logger.info("PaperFeed started — polling every {}s for {}", 
                         self.poll_interval, self.symbols)
             while self._running:

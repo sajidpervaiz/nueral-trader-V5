@@ -20,6 +20,7 @@ import json
 import time
 from typing import Any
 
+import orjson
 import websockets
 from loguru import logger
 
@@ -301,8 +302,8 @@ class UserDataStream:
         """Parse and dispatch user data stream messages with dedup and state tracking."""
         self.metrics["messages_received"] += 1
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
+            data = orjson.loads(raw)
+        except (orjson.JSONDecodeError, ValueError):
             logger.warning("Invalid JSON from user stream: {}", raw[:200])
             return
 

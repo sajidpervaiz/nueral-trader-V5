@@ -29,13 +29,9 @@ class CandleAggregator:
         self._start_bucket: int | None = None
 
     def _current_bucket(self, ts_us: int) -> int:
+        """Wall-clock aligned bucket so candles match standard boundaries (e.g. :00, :15, :30, :45)."""
         ts_s = ts_us // 1_000_000
-        if self._start_bucket is None:
-            self._start_bucket = ts_s
-            return ts_s
-        offset = ts_s - self._start_bucket
-        bucket_offset = (offset // self.timeframe_seconds) * self.timeframe_seconds
-        return self._start_bucket + bucket_offset
+        return (ts_s // self.timeframe_seconds) * self.timeframe_seconds
 
     def add_tick(self, tick: Tick) -> Candle | None:
         if _RUST_AVAILABLE:

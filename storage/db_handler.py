@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -130,18 +131,21 @@ class DBHandler:
         self._pool_size = int(pg.get("pool_size", 10))
         self._timescale = bool(pg.get("timescaledb", True))
 
-    async def connect(self) -> None:
+    async def connect(self, timeout: float = 10.0) -> None:
         if self._pool is not None:
             return  # Already connected — avoid creating a second pool
         if not _ASYNCPG:
             logger.warning("asyncpg not installed — DB disabled")
             return
         try:
-            self._pool = await asyncpg.create_pool(
-                dsn=self._dsn,
-                min_size=2,
-                max_size=self._pool_size,
-                command_timeout=30,
+            self._pool = await asyncio.wait_for(
+                asyncpg.create_pool(
+                    dsn=self._dsn,
+                    min_size=2,
+                    max_size=self._pool_size,
+                    command_timeout=30,
+                ),
+                timeout=timeout,
             )
             await self._migrate()
             logger.info("Database connected (pool_size={})", self._pool_size)

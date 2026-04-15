@@ -410,6 +410,14 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         </div>
       </div>
 
+      <!-- Available Pairs / Currencies -->
+      <div class="sidebar-section panel" id="sec-currencies">
+        <div class="panel-hdr" onclick="toggleSection('sec-currencies');loadCurrencies()"><span class="panel-title">Exchange Pairs <span class="panel-badge" id="currCount">0</span></span><span class="chevron">▼</span></div>
+        <div class="panel-body" id="currenciesBody" style="padding:0;max-height:200px;overflow-y:auto">
+          <div style="color:var(--text3);font-size:10px;padding:8px">Click to load available pairs...</div>
+        </div>
+      </div>
+
       <!-- Technical Analysis -->
       <div class="sidebar-section panel" id="sec-tech">
         <div class="panel-hdr" onclick="toggleSection('sec-tech')"><span class="panel-title">Technical</span><span class="chevron">▼</span></div>
@@ -492,6 +500,15 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
       <label><input type="checkbox" id="cfgAutoTP"> Auto TP</label>
       <label><input type="checkbox" id="cfgTrail"> Trailing</label>
     </div>
+    <div class="modal-section">Trading Mode</div>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <select id="cfgTradingMode" onchange="updateModeWarning()" style="background:var(--bg0);color:var(--text1);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font:11px 'JetBrains Mono';flex:1;max-width:200px">
+        <option value="paper">PAPER</option>
+        <option value="simulation">SIMULATION</option>
+        <option value="live">LIVE</option>
+      </select>
+      <span id="modeWarning" style="color:var(--red);font:700 10px 'JetBrains Mono';display:none">⚠ REAL MONEY</span>
+    </div>
     <div id="connRegistry" style="margin-top:10px;padding:8px;background:var(--bg0);border-radius:6px;font:10px 'JetBrains Mono';color:var(--text3)"></div>
     <div class="modal-btns">
       <button class="btn btn-buy" onclick="saveSettings()">Save</button>
@@ -511,6 +528,10 @@ let autoTrading = false, killActive = false;
 let watchlistData = [];
 let streamSource = null;
 let lastSnap = 0;
+let isLiveMode = false;
+let exchangePositions = [];
+let exchangeOrders = [];
+let exchangeCurrencies = [];
 
 /* ── Helpers ── */
 function esc(v) { return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -665,7 +686,13 @@ function applySnapshot(s) {
 
 /* ── Loaders ── */
 async function loadAll() {
-  await Promise.all([loadStatus(), loadMarket(), loadFG(), loadOB(), loadTech(), loadCandles(), loadAutoStatus(), loadPaperTrades(), loadSession(), loadRegime(), loadGuardrails(), loadVariational()]);
+  await Promise.all([loadStatus(), loadMarket(), loadFG(), loadOB(), loadTech(), loadCandles(), loadAutoStatus(), loadSession(), loadRegime(), loadGuardrails(), loadVariational()]);
+  // Mode-specific loaders
+  if (isLiveMode) {
+    await Promise.all([loadExchangePositions(), loadExchangeOrders()]);
+  } else {
+    await loadPaperTrades();
+  }
 }
 
 async function loadStatus() { try { applyStatus(await (await fetch('/api/status')).json()); } catch(_){} }
@@ -694,35 +721,41 @@ function applyStatus(d) {
   // Exchange-style positions table
   const el = $('positionsBody');
   if (!el) return;
-  const positions = d.positions||[];
-  if (!positions.length) {
+  // In live mode, prefer exchange positions (fetched from actual exchange)
+  const positions = (isLiveMode && exchangePositions.length) ? exchangePositions : (d.positions||[]);
+  const posN2 = positions.length;
+  $('posCount').textContent = posN2;
+  if (!posN2) {
     el.innerHTML = '<div class="empty-row">No open positions</div>';
     return;
   }
   let h = '<table class="ex-table"><thead><tr>';
-  h += '<th>Instrument</th><th>Quantity</th><th class="r">Mark</th><th class="r">Value</th>';
-  h += '<th class="r">Entry Price</th><th class="r">Liq. Price</th><th class="r">Funding</th>';
-  h += '<th class="r">UPnL</th><th class="r">RPnL</th><th></th>';
+  h += '<th>Instrument</th><th>Side</th><th>Quantity</th><th class="r">Mark</th><th class="r">Value</th>';
+  h += '<th class="r">Entry Price</th><th class="r">Liq. Price</th><th class="r">Leverage</th>';
+  h += '<th class="r">UPnL</th><th></th>';
   h += '</tr></thead><tbody>';
   for (const p of positions) {
-    const isLong = p.side === 'long';
-    const pnl = Number(p.pnl||0);
-    const mark = Number(p.current||p.entry||0);
-    const entry = Number(p.entry||0);
-    const size = Number(p.size||0);
-    const value = mark * size;
+    const side = p.side || (p.direction||'');
+    const isLong = side === 'long';
+    const pnl = Number(p.pnl||p.unrealizedPnl||0);
+    const mark = Number(p.current||p.markPrice||p.entry||0);
+    const entry = Number(p.entry||p.entryPrice||0);
+    const size = Number(p.size||p.contracts||0);
+    const value = Math.abs(Number(p.notional || mark * size));
+    const liq = Number(p.liquidation||p.liquidationPrice||0);
+    const lev = Number(p.leverage||1);
     const pnlPct = entry > 0 ? ((mark - entry) / entry * 100 * (isLong?1:-1)) : 0;
     h += '<tr>';
     h += '<td class="sym-cell"><span style="color:var(--text3);margin-right:4px">\u25C6</span>' + esc(p.symbol) + '</td>';
-    h += '<td class="' + (isLong?'dir-long':'dir-short') + '">' + size.toFixed(4) + '</td>';
+    h += '<td class="' + (isLong?'dir-long':'dir-short') + '" style="font-weight:600">' + (isLong?'▲ LONG':'▼ SHORT') + '</td>';
+    h += '<td class="r">' + size.toFixed(4) + '</td>';
     h += '<td class="r">$' + mark.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
     h += '<td class="r">$' + value.toFixed(2) + '</td>';
     h += '<td class="r">$' + entry.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
-    h += '<td class="r" style="color:var(--red)">$' + (Number(p.liquidation||0)).toFixed(2) + '</td>';
-    h += '<td class="r" style="color:' + (Number(p.funding||0)>=0?'var(--green)':'var(--red)') + '">$' + Number(p.funding||0).toFixed(2) + '</td>';
+    h += '<td class="r" style="color:var(--red)">$' + liq.toFixed(2) + '</td>';
+    h += '<td class="r" style="color:var(--cyan)">' + lev.toFixed(0) + 'x</td>';
     h += '<td class="r ' + (pnl>=0?'pnl-pos':'pnl-neg') + '">$' + pnl.toFixed(2) + ' (' + (pnlPct>=0?'+':'') + pnlPct.toFixed(2) + '%)</td>';
-    h += '<td class="r ' + (pnl>=0?'pnl-pos':'pnl-neg') + '">$' + Number(p.rpnl||0).toFixed(2) + '</td>';
-    h += '<td><button class="close-btn" onclick="closePosition(\'' + esc(p.symbol) + '\')">✕</button></td>';
+    h += '<td><button class="close-btn" onclick="closePosition(\'' + esc(p.symbol) + '\',\'' + esc(p.exchange||'binance') + '\')">✕</button></td>';
     h += '</tr>';
   }
   h += '</tbody></table>';
@@ -805,7 +838,144 @@ function setCandles(c) {
 }
 
 async function loadAutoStatus() {
-  try { const d=await(await fetch('/api/auto/status')).json(); autoTrading=!!d.enabled; $('autoBtn').classList.toggle('active',autoTrading); $('modeBadge').textContent=String(d.mode||'paper').toUpperCase(); } catch(_){}
+  try {
+    const d=await(await fetch('/api/auto/status')).json();
+    autoTrading=!!d.enabled;
+    isLiveMode = d.mode === 'live';
+    $('autoBtn').classList.toggle('active',autoTrading);
+    $('modeBadge').textContent=String(d.mode||'paper').toUpperCase();
+    if (isLiveMode) {
+      $('modeBadge').style.background='linear-gradient(135deg,#ff3b30,#ff2d55)';
+      // Update trade form default to futures format
+      if ($('tradeSym') && $('tradeSym').value === 'BTC/USDT') $('tradeSym').value = 'BTC/USDT:USDT';
+    }
+  } catch(_){}
+}
+
+/* ── Exchange Positions (live mode) ── */
+async function loadExchangePositions() {
+  try {
+    const d = await (await fetch('/api/exchange/positions')).json();
+    exchangePositions = d.positions || [];
+    // Re-render positions tab with exchange data
+    const el = $('positionsBody');
+    if (!el) return;
+    $('posCount').textContent = exchangePositions.length;
+    if (!exchangePositions.length) {
+      el.innerHTML = '<div class="empty-row">No open positions on exchange</div>';
+      return;
+    }
+    let h = '<table class="ex-table"><thead><tr>';
+    h += '<th>Instrument</th><th>Side</th><th>Quantity</th><th class="r">Mark</th><th class="r">Value</th>';
+    h += '<th class="r">Entry Price</th><th class="r">Liq. Price</th><th class="r">Leverage</th>';
+    h += '<th class="r">UPnL</th><th></th>';
+    h += '</tr></thead><tbody>';
+    for (const p of exchangePositions) {
+      const isLong = p.side === 'long';
+      const pnl = Number(p.pnl||0);
+      const mark = Number(p.current||0);
+      const entry = Number(p.entry||0);
+      const size = Number(p.size||0);
+      const value = Math.abs(Number(p.notional || mark * size));
+      const liq = Number(p.liquidation||0);
+      const lev = Number(p.leverage||1);
+      const pnlPct = entry > 0 ? ((mark - entry) / entry * 100 * (isLong?1:-1)) : 0;
+      h += '<tr>';
+      h += '<td class="sym-cell"><span style="color:var(--green);margin-right:4px">●</span>' + esc(p.symbol) + '</td>';
+      h += '<td class="' + (isLong?'dir-long':'dir-short') + '" style="font-weight:600">' + (isLong?'▲ LONG':'▼ SHORT') + '</td>';
+      h += '<td class="r">' + size.toFixed(4) + '</td>';
+      h += '<td class="r">$' + mark.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+      h += '<td class="r">$' + value.toFixed(2) + '</td>';
+      h += '<td class="r">$' + entry.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+      h += '<td class="r" style="color:var(--red)">$' + liq.toFixed(2) + '</td>';
+      h += '<td class="r" style="color:var(--cyan)">' + lev.toFixed(0) + 'x</td>';
+      h += '<td class="r ' + (pnl>=0?'pnl-pos':'pnl-neg') + '">$' + pnl.toFixed(2) + ' (' + (pnlPct>=0?'+':'') + pnlPct.toFixed(2) + '%)</td>';
+      h += '<td><button class="close-btn" onclick="closePosition(\'' + esc(p.symbol) + '\',\'' + esc(p.exchange||'binance') + '\')">✕</button></td>';
+      h += '</tr>';
+    }
+    h += '</tbody></table>';
+    el.innerHTML = h;
+    // Also update paper trades tab to show "Live mode" message
+    const ptEl = $('paperTradesBody');
+    if (ptEl) {
+      ptEl.innerHTML = '<div class="empty-row" style="color:var(--green)">● Live trading mode — positions shown in Positions tab</div>';
+      $('paperCount').textContent = '0';
+    }
+  } catch(e) { console.warn('Exchange positions error:', e); }
+}
+
+/* ── Exchange Open Orders (live mode) ── */
+async function loadExchangeOrders() {
+  try {
+    const d = await (await fetch('/api/exchange/orders')).json();
+    exchangeOrders = d.orders || [];
+    const el = $('ordersBody');
+    if (!el) return;
+    $('orderCount').textContent = exchangeOrders.length;
+    if (!exchangeOrders.length) {
+      el.innerHTML = '<div class="empty-row">No open orders</div>';
+      return;
+    }
+    let h = '<table class="ex-table"><thead><tr>';
+    h += '<th>Instrument</th><th>Type</th><th>Side</th><th class="r">Amount</th>';
+    h += '<th class="r">Price</th><th class="r">Filled</th><th>Status</th><th>Time</th>';
+    h += '</tr></thead><tbody>';
+    for (const o of exchangeOrders) {
+      const isBuy = (o.side||'').toLowerCase() === 'buy';
+      const tm = o.timestamp ? new Date(o.timestamp).toLocaleTimeString('en-GB') : '--';
+      h += '<tr>';
+      h += '<td class="sym-cell">' + esc(o.symbol) + '</td>';
+      h += '<td style="color:var(--cyan);font-size:10px;text-transform:uppercase">' + esc(o.type) + '</td>';
+      h += '<td class="' + (isBuy?'dir-long':'dir-short') + '">' + (isBuy?'BUY':'SELL') + '</td>';
+      h += '<td class="r">' + Number(o.amount||0).toFixed(4) + '</td>';
+      h += '<td class="r">$' + Number(o.price||0).toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+      h += '<td class="r">' + Number(o.filled||0).toFixed(4) + '</td>';
+      h += '<td style="color:var(--yellow);font-size:10px">' + esc(o.status) + '</td>';
+      h += '<td style="color:var(--text3);font-size:10px">' + tm + '</td>';
+      h += '</tr>';
+    }
+    h += '</tbody></table>';
+    el.innerHTML = h;
+  } catch(e) { console.warn('Exchange orders error:', e); }
+}
+
+/* ── Exchange Currencies ── */
+let currenciesLoaded = false;
+async function loadCurrencies() {
+  if (currenciesLoaded) return;
+  try {
+    const d = await (await fetch('/api/exchange/currencies?quote=USDT&type=swap&limit=100')).json();
+    const allPairs = [];
+    for (const [ex, syms] of Object.entries(d.exchanges || {})) {
+      for (const s of syms) allPairs.push({...s, exchange: ex});
+    }
+    exchangeCurrencies = allPairs;
+    currenciesLoaded = true;
+    $('currCount').textContent = allPairs.length;
+    renderCurrencies();
+  } catch(e) { console.warn('Currencies error:', e); }
+}
+function renderCurrencies() {
+  const el = $('currenciesBody');
+  if (!el) return;
+  if (!exchangeCurrencies.length) {
+    el.innerHTML = '<div style="color:var(--text3);font-size:10px;padding:4px 8px">No currencies loaded</div>';
+    return;
+  }
+  let h = '';
+  for (const c of exchangeCurrencies.slice(0, 50)) {
+    const sym = c.symbol || '';
+    const base = c.base || '';
+    h += '<div class="wl-item" onclick="selectCurrency(\'' + esc(sym) + '\')" style="cursor:pointer">';
+    h += '<div><div class="wl-sym">' + esc(base) + '</div><div class="wl-sub">' + esc(c.type||'swap') + '</div></div>';
+    h += '<div style="color:var(--text2);font-size:9px">' + esc(sym) + '</div>';
+    h += '</div>';
+  }
+  el.innerHTML = h;
+}
+function selectCurrency(sym) {
+  if ($('tradeSym')) $('tradeSym').value = sym;
+  toast('info', 'Selected ' + sym);
 }
 
 /* ── Paper Trades ── */
@@ -1044,11 +1214,12 @@ async function loadRegime() {
     let html='';
     for(const[sym,r] of Object.entries(d.regimes||{})) {
       const color = r.regime==='trending'?'var(--green)':r.regime==='breakout'?'var(--yellow)':'var(--blue)';
+      const tradeColor = r.tradeable?'var(--green)':'var(--red)';
       html+='<div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px solid var(--border)">';
       html+='<span style="font:600 10px sans-serif;color:var(--text1)">'+esc(sym.split('/')[0])+'</span>';
-      html+='<span style="font:600 9px \'JetBrains Mono\';color:'+color+'">'+esc(r.regime.toUpperCase())+' '+Math.round(r.confidence*100)+'%</span>';
+      html+='<span style="font:600 9px \'JetBrains Mono\';color:'+color+'">'+esc((r.regime_raw||r.regime).toUpperCase())+' '+Math.round(r.confidence*100)+'%</span>';
       html+='</div>';
-      html+='<div style="font:9px sans-serif;color:var(--text3)">Risk: '+(r.risk_pct*100).toFixed(1)+'% · Candles: '+r.candles_in_state+(r.in_transition?' · <span style="color:var(--yellow)">TRANSITION</span>':'')+'</div>';
+      html+='<div style="font:9px sans-serif;color:var(--text3)">ADX: '+Number(r.adx||0).toFixed(1)+' · Risk: '+(r.risk_pct*100).toFixed(1)+'% · <span style="color:'+tradeColor+'">'+(r.tradeable?'TRADEABLE':'NO TRADE')+'</span>'+(r.in_transition?' · <span style="color:var(--yellow)">TRANSITION</span>':'')+'</div>';
     }
     if(!html) html='<div style="color:var(--text3);font-size:10px">No regime data</div>';
     $('regimePanel').innerHTML=html;
@@ -1160,23 +1331,30 @@ async function loadPortfolio() {
 
 /* ── Trading ── */
 async function executeTrade(side) {
-  const sym=$('tradeSym').value, type=$('tradeType').value;
+  let sym=$('tradeSym').value, type=$('tradeType').value;
   const size=parseFloat($('tradeSize').value||'0'), price=parseFloat($('tradePrice').value||'0');
   const sl=parseFloat($('tradeSL').value||'0'), tp=parseFloat($('tradeTP').value||'0');
   const lev=parseInt($('tradeLev').value||'1',10);
   if(size<=0) return toast('error','Size must be > 0');
+  // Auto-normalize symbol for futures
+  if(isLiveMode && sym.includes('/') && !sym.includes(':USDT') && sym.endsWith('USDT')) sym += ':USDT';
   try{
-    const d=await(await fetch('/api/trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,side,size,order_type:type,price,stop_loss_pct:sl,take_profit_pct:tp,leverage:lev})})).json();
-    if(d.success){toast('success',side+' order placed');loadStatus();}else toast('error',d.error||'Order failed');
+    const d=await(await fetch('/api/trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,side,size,order_type:type,price,stop_loss_pct:sl,take_profit_pct:tp,leverage:lev,venue:'binance'})})).json();
+    if(d.success){
+      const msg = d.paper ? side+' paper order placed' : side+' '+d.status+' @ $'+(d.price||0).toFixed(2)+' qty='+(d.filled||size);
+      toast('success', msg);
+      loadAll();
+    } else toast('error',d.error||'Order failed');
   }catch(_){toast('error','Connection error');}
 }
 async function closeAll() {
   if(!confirm('Close all positions?'))return;
   try{await fetch('/api/positions/close-all',{method:'POST'});toast('success','Close-all requested');loadStatus();}catch(_){toast('error','Failed');}
 }
-async function closePosition(sym) {
+async function closePosition(sym, venue) {
+  venue = venue || 'binance';
   if(!confirm('Close position for '+sym+'?'))return;
-  try{const d=await(await fetch('/api/positions/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym})})).json();if(d.success)toast('success','Position closed');else toast('error',d.error||'Failed');loadStatus();}catch(_){toast('error','Failed');}
+  try{const d=await(await fetch('/api/positions/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,venue:venue})})).json();if(d.success){toast('success','Position closed — PnL: $'+(d.realized_pnl||0).toFixed(2));loadAll();}else toast('error',d.error||'Failed');}catch(_){toast('error','Failed');}
 }
 async function toggleAuto() {
   autoTrading=!autoTrading;
@@ -1214,7 +1392,19 @@ async function loadCfg(){
     $('cfgAutoOn').checked=!!d.auto_trading_enabled;$('cfgAutoSL').checked=!!d.auto_stop_loss_enabled;
     $('cfgAutoTP').checked=!!d.auto_take_profit_enabled;$('cfgTrail').checked=!!d.trailing_stops_enabled;
     renderReg(d.connection_registry);
+    // Load trading mode
+    try{
+      const m=await(await fetch('/api/config/trading-mode')).json();
+      $('cfgTradingMode').value=m.mode||'paper';
+      updateModeWarning();
+    }catch(_){}
   }catch(_){}
+}
+function updateModeWarning(){
+  const v=$('cfgTradingMode').value;
+  $('modeWarning').style.display=v==='live'?'inline':'none';
+  $('modeBadge').textContent=v.toUpperCase();
+  $('modeBadge').style.background=v==='live'?'linear-gradient(135deg,#ff3b30,#ff2d55)':v==='simulation'?'linear-gradient(135deg,#5856d6,#af52de)':'linear-gradient(135deg,#ff9500,#ff5e3a)';
 }
 function renderReg(recs){
   const el=$('connRegistry');
@@ -1225,7 +1415,15 @@ async function saveSettings(){
   try{
     const body={binance_api_key:$('cfgBinKey').value,binance_secret:$('cfgBinSec').value,bybit_api_key:$('cfgBybitKey').value,bybit_secret:$('cfgBybitSec').value,okx_api_key:$('cfgOkxKey').value,okx_secret:$('cfgOkxSec').value,kraken_api_key:$('cfgKrakenKey').value,kraken_secret:$('cfgKrakenSec').value,dex_rpc_url:$('cfgRpc').value,dex_private_key:$('cfgWallet').value,telegram_bot_token:$('cfgTgToken').value,telegram_chat_id:$('cfgTgChat').value,binance_enabled:$('cfgBinOn').checked,bybit_enabled:$('cfgBybitOn').checked,okx_enabled:$('cfgOkxOn').checked,kraken_enabled:$('cfgKrakenOn').checked,auto_trading_enabled:$('cfgAutoOn').checked};
     const d=await(await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
-    if(d.success){toast('success','Settings saved');renderReg(d.connection_registry);}else toast('error',d.error||'Save failed');
+    if(d.success){renderReg(d.connection_registry);}else{toast('error',d.error||'Save failed');return;}
+    // Save trading mode
+    const mode=$('cfgTradingMode').value;
+    if(mode==='live'&&!confirm('Switch to LIVE trading? This uses REAL MONEY. Are you sure?')){$('cfgTradingMode').value='paper';updateModeWarning();toast('info','Kept paper mode');return;}
+    try{
+      await fetch('/api/config/trading-mode?confirmation='+(mode==='live'?'true':'false'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(mode)});
+    }catch(_){}
+    updateModeWarning();
+    toast('success','Settings saved');
   }catch(_){toast('error','Save failed');}
 }
 async function testConns(){

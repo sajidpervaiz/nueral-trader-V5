@@ -589,6 +589,9 @@ def build_app(
                     "entry": p.entry_price,
                     "current": p.current_price,
                     "pnl": p.pnl,
+                    "liquidation": getattr(p, 'liquidation_price', 0.0),
+                    "funding": getattr(p, 'funding_payment', 0.0),
+                    "rpnl": getattr(p, 'realized_pnl', 0.0),
                 }
                 for p in positions.values()
             ]
@@ -784,6 +787,121 @@ def build_app(
             return {"coins": _market_cache["coins"][:min(per_page, 50)]}
 
         return {"coins": coins}
+
+    # ── /api/exchange/positions — fetch REAL exchange positions ────────────
+    @app.get("/api/exchange/positions")
+    async def api_exchange_positions() -> dict[str, Any]:
+        """Fetch actual open positions from connected exchanges."""
+        all_positions: list[dict] = []
+        for exc in (executors or []):
+            client = getattr(exc, "_client", None)
+            ex_id = getattr(exc, "exchange_id", "unknown")
+            if client is None:
+                continue
+            try:
+                rl = getattr(exc, "_rate_limiter", None)
+                if rl:
+                    await rl.acquire()
+                raw_positions = await client.fetch_positions()
+                for p in raw_positions:
+                    contracts = float(p.get("contracts", 0) or 0)
+                    if contracts == 0:
+                        continue
+                    all_positions.append({
+                        "exchange": ex_id,
+                        "symbol": p.get("symbol", ""),
+                        "side": p.get("side", ""),
+                        "size": contracts,
+                        "entry": float(p.get("entryPrice", 0) or 0),
+                        "current": float(p.get("markPrice", 0) or 0),
+                        "pnl": float(p.get("unrealizedPnl", 0) or 0),
+                        "liquidation": float(p.get("liquidationPrice", 0) or 0),
+                        "leverage": float(p.get("leverage", 1) or 1),
+                        "margin": float(p.get("initialMargin", 0) or 0),
+                        "notional": float(p.get("notional", 0) or 0),
+                    })
+            except Exception as exc_err:
+                logger.warning("fetch_positions failed for {}: {}", ex_id, exc_err)
+        return {"positions": all_positions, "total": len(all_positions)}
+
+    # ── /api/exchange/orders — fetch REAL open orders from exchange ────────
+    @app.get("/api/exchange/orders")
+    async def api_exchange_orders() -> dict[str, Any]:
+        """Fetch actual open orders from connected exchanges."""
+        all_orders: list[dict] = []
+        for exc in (executors or []):
+            client = getattr(exc, "_client", None)
+            ex_id = getattr(exc, "exchange_id", "unknown")
+            if client is None:
+                continue
+            try:
+                rl = getattr(exc, "_rate_limiter", None)
+                if rl:
+                    await rl.acquire()
+                raw_orders = await client.fetch_open_orders()
+                for o in raw_orders:
+                    all_orders.append({
+                        "exchange": ex_id,
+                        "id": o.get("id", ""),
+                        "symbol": o.get("symbol", ""),
+                        "type": o.get("type", ""),
+                        "side": o.get("side", ""),
+                        "amount": float(o.get("amount", 0) or 0),
+                        "price": float(o.get("price", 0) or 0),
+                        "filled": float(o.get("filled", 0) or 0),
+                        "status": o.get("status", ""),
+                        "timestamp": o.get("timestamp", 0),
+                    })
+            except Exception as exc_err:
+                logger.warning("fetch_open_orders failed for {}: {}", ex_id, exc_err)
+        return {"orders": all_orders, "total": len(all_orders)}
+
+    # ── /api/exchange/currencies — all currencies from connected exchanges ─
+    @app.get("/api/exchange/currencies")
+    async def api_exchange_currencies(
+        exchange: str | None = Query(None, description="Filter by exchange id"),
+        quote: str | None = Query(None, description="Filter by quote currency (e.g. USDT)"),
+        market_type: str | None = Query(None, alias="type", description="Filter by market type (spot, swap, future)"),
+        active_only: bool = Query(True, description="Only return active markets"),
+        limit: int = Query(500, ge=1, le=5000),
+    ) -> dict[str, Any]:
+        if not executors:
+            return {"exchanges": [], "total": 0, "error": "No executors configured"}
+        result: dict[str, list[dict[str, Any]]] = {}
+        for ex in executors:
+            client = getattr(ex, "_client", None)
+            if client is None:
+                continue
+            ex_id = getattr(ex, "exchange_id", str(type(ex).__name__))
+            if exchange and ex_id != exchange:
+                continue
+            markets = getattr(client, "markets", None)
+            if not markets:
+                continue
+            symbols: list[dict[str, Any]] = []
+            for sym, info in markets.items():
+                if active_only and not info.get("active", True):
+                    continue
+                if quote and info.get("quote", "").upper() != quote.upper():
+                    continue
+                mtype = info.get("type", "")
+                if market_type and mtype != market_type:
+                    continue
+                symbols.append({
+                    "symbol": sym,
+                    "base": info.get("base", ""),
+                    "quote": info.get("quote", ""),
+                    "type": mtype,
+                    "active": info.get("active", True),
+                    "contractSize": info.get("contractSize"),
+                    "precision": info.get("precision", {}),
+                    "limits": info.get("limits", {}),
+                })
+                if len(symbols) >= limit:
+                    break
+            result[ex_id] = symbols
+        total = sum(len(v) for v in result.values())
+        return {"exchanges": result, "total": total}
 
     # ── /api/feargreed — fear & greed index ───────────────────────────────
     @app.get("/api/feargreed")
@@ -1133,61 +1251,102 @@ def build_app(
     @app.post("/api/trade")
     async def api_trade(request: Request) -> dict[str, Any]:
         body = await request.json()
-        if order_manager is None:
-            return {"success": False, "error": "order_manager not available"}
         try:
-            from execution.order_manager import OrderSide, OrderType
-            sym = str(body.get("symbol", "BTC/USDT"))
+            sym = str(body.get("symbol", "BTC/USDT:USDT"))
             side_str = str(body.get("side", "BUY")).upper()
-            side = OrderSide.BUY if side_str == "BUY" else OrderSide.SELL
             size = float(body.get("size", 0))
             order_type_str = str(body.get("order_type", "market")).lower()
-            ot = OrderType.MARKET if order_type_str == "market" else OrderType.LIMIT
-            price = float(body.get("price", 0)) if ot == OrderType.LIMIT else None
-            if ot == OrderType.LIMIT and (price is None or price <= 0):
+            price = float(body.get("price", 0)) if order_type_str == "limit" else None
+            leverage = int(body.get("leverage", 1))
+
+            if order_type_str == "limit" and (price is None or price <= 0):
                 return {"success": False, "error": "price required and must be > 0 for LIMIT orders"}
             if size <= 0:
                 return {"success": False, "error": "size must be > 0"}
+
+            # Normalize symbol: BTC/USDT → BTC/USDT:USDT for futures
+            if "/" in sym and ":USDT" not in sym and sym.endswith("USDT"):
+                sym = sym + ":USDT"
+
+            venue = str(body.get("venue", "binance"))
+
             if config.paper_mode:
-                # Paper mode: record order locally without hitting exchange
+                if order_manager is None:
+                    return {"success": False, "error": "order_manager not available"}
+                from execution.order_manager import OrderSide, OrderType
+                side = OrderSide.BUY if side_str == "BUY" else OrderSide.SELL
+                ot = OrderType.MARKET if order_type_str == "market" else OrderType.LIMIT
                 success, order, reason = await order_manager.place_order(
-                    exchange="binance",
-                    symbol=sym,
-                    side=side,
-                    quantity=size,
-                    price=price or 0,
-                    order_type=ot,
-                    metadata={
-                        "source": "ui",
-                        "paper": True,
-                        "stop_loss_pct": body.get("stop_loss_pct", 2),
-                        "take_profit_pct": body.get("take_profit_pct", 4),
-                        "leverage": body.get("leverage", 1),
-                    },
+                    exchange=venue, symbol=sym, side=side, quantity=size,
+                    price=price or 0, order_type=ot,
+                    metadata={"source": "ui", "paper": True,
+                              "stop_loss_pct": body.get("stop_loss_pct", 2),
+                              "take_profit_pct": body.get("take_profit_pct", 4),
+                              "leverage": leverage},
                 )
                 if not success:
                     return {"success": False, "error": reason}
                 return {"success": True, "order_id": getattr(order, "order_id", "unknown"), "paper": True}
             else:
-                # Live mode: also use place_order (executor handles real submission)
-                success, order, reason = await order_manager.place_order(
-                    exchange="binance",
-                    symbol=sym,
-                    side=side,
-                    quantity=size,
-                    price=price or 0,
-                    order_type=ot,
-                    metadata={
-                        "source": "ui",
-                        "stop_loss_pct": body.get("stop_loss_pct", 2),
-                        "take_profit_pct": body.get("take_profit_pct", 4),
-                        "leverage": body.get("leverage", 1),
-                    },
-                )
-                if not success:
-                    return {"success": False, "error": reason}
-                return {"success": True, "order_id": getattr(order, "order_id", "unknown"), "paper": False}
+                # Live mode: send order directly to the exchange via executor client
+                client = None
+                rate_limiter = None
+                for exc in (executors or []):
+                    if getattr(exc, "exchange_id", "") == venue:
+                        client = getattr(exc, "_client", None)
+                        rate_limiter = getattr(exc, "_rate_limiter", None)
+                        break
+                if client is None:
+                    return {"success": False, "error": f"No live client for {venue}"}
+
+                if rate_limiter:
+                    await rate_limiter.acquire()
+
+                ccxt_side = "buy" if side_str == "BUY" else "sell"
+                if order_type_str == "market":
+                    order = await client.create_market_order(
+                        symbol=sym, side=ccxt_side, amount=size, params={},
+                    )
+                else:
+                    order = await client.create_limit_order(
+                        symbol=sym, side=ccxt_side, amount=size,
+                        price=price, params={},
+                    )
+
+                fill_price = float(order.get("average", order.get("price", price or 0)))
+                filled = float(order.get("filled", size))
+                status = order.get("status", "unknown")
+
+                # Track in risk_manager if filled
+                if status in ("closed", "filled") and filled > 0 and risk_manager:
+                    from engine.signal_generator import TradingSignal
+                    direction = "long" if side_str == "BUY" else "short"
+                    sl_pct = float(body.get("stop_loss_pct", 2)) / 100
+                    tp_pct = float(body.get("take_profit_pct", 4)) / 100
+                    sig = TradingSignal(
+                        exchange=venue, symbol=sym, direction=direction,
+                        price=fill_price, score=1.0, quality_score=100,
+                        stop_loss=fill_price * (1 - sl_pct) if direction == "long" else fill_price * (1 + sl_pct),
+                        take_profit=fill_price * (1 + tp_pct) if direction == "long" else fill_price * (1 - tp_pct),
+                        technical_score=0.0, ml_score=0.0, sentiment_score=0.0,
+                        macro_score=0.0, news_score=0.0, orderbook_score=0.0,
+                        regime="unknown", regime_confidence=0.0,
+                        atr=fill_price * 0.01,
+                        timestamp=int(time.time()),
+                        metadata={"source": "manual_ui"},
+                    )
+                    await risk_manager.open_position(sig, filled * fill_price)
+
+                return {
+                    "success": True,
+                    "order_id": order.get("id", ""),
+                    "paper": False,
+                    "status": status,
+                    "filled": filled,
+                    "price": fill_price,
+                }
         except Exception as exc:
+            logger.error("Manual trade error: {}", exc)
             return {"success": False, "error": str(exc)}
 
     # ── /api/positions/close-all — close all positions ────────────────────
@@ -1198,6 +1357,72 @@ def build_app(
         closed = await risk_manager.activate_kill_switch()
         risk_manager.deactivate_kill_switch()
         return {"success": True, "closed": len(closed)}
+
+    # ── /api/positions/close — close single position (frontend format) ───
+    @app.post("/api/positions/close")
+    async def api_close_position(request: Request) -> dict[str, Any]:
+        """Close a single position. Body: {symbol: "BTC/USDT:USDT", venue: "binance"}."""
+        if risk_manager is None:
+            return {"success": False, "error": "risk_manager not available"}
+        try:
+            body = await request.json()
+            symbol = str(body.get("symbol", ""))
+            venue = str(body.get("venue", "binance"))
+            if not symbol:
+                return {"success": False, "error": "symbol required"}
+
+            key = f"{venue}:{symbol}"
+            pos = risk_manager.positions.get(key)
+            if pos is None:
+                return {"success": False, "error": f"Position not found: {symbol}"}
+
+            close_price = float(pos.current_price)
+
+            # In live mode: close on exchange first
+            if not config.paper_mode:
+                for exc in (executors or []):
+                    ex_id = getattr(exc, "exchange_id", "")
+                    if ex_id != venue:
+                        continue
+                    client = getattr(exc, "_client", None)
+                    if client is None:
+                        continue
+                    try:
+                        rl = getattr(exc, "_rate_limiter", None)
+                        if rl:
+                            await rl.acquire()
+                        close_side = "sell" if pos.direction == "long" else "buy"
+                        await client.create_market_order(
+                            symbol=symbol, side=close_side, amount=abs(pos.size),
+                            params={"reduceOnly": True},
+                        )
+                        # Cancel protective orders
+                        placer = getattr(exc, "_order_placer", None)
+                        if placer:
+                            try:
+                                await placer.cancel_all_for_symbol(symbol)
+                                placer.remove_tracking(symbol)
+                            except Exception:
+                                pass
+                        logger.info("Exchange-side close for {} {} qty={}", venue, symbol, pos.size)
+                    except Exception as exc_err:
+                        logger.error("Exchange close failed for {}: {}", symbol, exc_err)
+                        return {"success": False, "error": f"Exchange close failed: {exc_err}"}
+
+            closed = await risk_manager.close_position(venue, symbol, close_price)
+            if closed is None:
+                return {"success": False, "error": "Position not found in risk manager"}
+
+            return {
+                "success": True,
+                "symbol": symbol,
+                "venue": venue,
+                "exit_price": close_price,
+                "realized_pnl": round(float(closed.pnl), 4),
+            }
+        except Exception as exc:
+            logger.error("Close position error: {}", exc)
+            return {"success": False, "error": str(exc)}
 
     # ── /api/positions/breakeven — set break-even on positions ────────────
     @app.post("/api/positions/breakeven")
@@ -1728,10 +1953,64 @@ def build_app(
     @app.post("/api/config")
     async def api_config_post(request: Request) -> dict[str, Any]:
         body = await request.json()
-        # Apply auto-trading toggle
+
+        # ── Apply CEX API keys to runtime config ──
+        exchanges = config._data.setdefault("exchanges", {})
+        for venue, key_field, sec_field in [
+            ("binance", "binance_api_key", "binance_secret"),
+            ("bybit", "bybit_api_key", "bybit_secret"),
+            ("okx", "okx_api_key", "okx_secret"),
+            ("kraken", "kraken_api_key", "kraken_secret"),
+        ]:
+            venue_cfg = exchanges.setdefault(venue, {})
+            key_val = body.get(key_field, "")
+            sec_val = body.get(sec_field, "")
+            # Only overwrite if user provided a real value (not masked ****)
+            if key_val and key_val != "****":
+                venue_cfg["api_key"] = key_val
+            if sec_val and sec_val != "****":
+                venue_cfg["api_secret"] = sec_val
+            # Venue enable/disable
+            enabled_key = f"{venue}_enabled"
+            if enabled_key in body:
+                venue_cfg["enabled"] = bool(body[enabled_key])
+
+        # ── DEX config ──
+        dex_cfg = config._data.setdefault("dex", {})
+        rpc_val = body.get("dex_rpc_url", "")
+        wallet_val = body.get("dex_private_key", "")
+        if rpc_val:
+            dex_cfg["rpc_url"] = rpc_val
+        if wallet_val and wallet_val != "****":
+            dex_cfg["private_key"] = wallet_val
+
+        # ── Telegram notifications ──
+        notif = config._data.setdefault("notifications", {}).setdefault("telegram", {})
+        tg_token = body.get("telegram_bot_token", "")
+        tg_chat = body.get("telegram_chat_id", "")
+        if tg_token and tg_token != "****":
+            notif["bot_token"] = tg_token
+        if tg_chat:
+            notif["chat_id"] = tg_chat
+
+        # ── Auto-trading toggle ──
         if signal_generator and hasattr(signal_generator, "set_auto_trading"):
             signal_generator.set_auto_trading(bool(body.get("auto_trading_enabled", False)))
-        return {"success": True, "message": "Settings applied to runtime", "connection_registry": []}
+
+        # ── Build updated connection registry ──
+        registry = []
+        for name in ["binance", "bybit", "okx", "kraken"]:
+            ex = exchanges.get(name, {})
+            has_key = bool(ex.get("api_key"))
+            registry.append({
+                "exchange": name,
+                "venue_type": "CEX",
+                "connected": has_key and ex.get("enabled", False),
+                "status": "connected" if (has_key and ex.get("enabled", False)) else "disconnected",
+            })
+
+        logger.info("Settings saved to runtime config")
+        return {"success": True, "message": "Settings applied to runtime", "connection_registry": registry}
 
     # ── /api/config/test — test exchange connections ──────────────────────
     @app.post("/api/config/test")
@@ -1938,17 +2217,34 @@ def build_app(
     async def api_regime() -> dict[str, Any]:
         """Return current regime state and transition info per symbol."""
         regimes: dict[str, Any] = {}
-        if signal_generator is not None:
-            detectors = getattr(signal_generator, '_regime_detectors', {})
-            for sym, det in detectors.items():
-                state = det.current_state()
+        # Regime data lives on data_manager._regimes (keyed as "exchange:symbol")
+        if data_manager is not None:
+            raw_regimes: dict = getattr(data_manager, '_regimes', {})
+            # Map MarketRegime enum values to frontend categories
+            _regime_category = {
+                "strong_trend_up": "trending", "weak_trend_up": "trending",
+                "strong_trend_down": "trending", "weak_trend_down": "trending",
+                "compression": "breakout", "range_chop": "ranging",
+                "unknown": "unknown",
+            }
+            _regime_risk = {
+                "trending": 0.02, "breakout": 0.025, "ranging": 0.015, "unknown": 0.02,
+            }
+            for key, state in raw_regimes.items():
+                # key is "exchange:symbol" — extract symbol part for display
+                sym = key.split(":", 1)[1] if ":" in key else key
+                regime_val = str(state.regime.value) if hasattr(state.regime, 'value') else str(state.regime)
+                category = _regime_category.get(regime_val, "unknown")
                 regimes[sym] = {
-                    "regime": state.regime,
-                    "confidence": state.confidence,
-                    "candles_in_state": state.candles_in_state,
-                    "trend_strength": state.trend_strength,
+                    "regime": category,
+                    "regime_raw": regime_val,
+                    "confidence": float(state.confidence),
+                    "candles_in_state": int(state.candles_in_state),
+                    "trend_strength": float(state.trend_slope),
+                    "adx": float(state.adx),
                     "in_transition": state.candles_in_state <= 2,
-                    "risk_pct": {"trending": 0.02, "ranging": 0.015, "breakout": 0.025}.get(state.regime, 0.02),
+                    "risk_pct": _regime_risk.get(category, 0.02),
+                    "tradeable": state.tradeable,
                 }
         return {"regimes": regimes}
 

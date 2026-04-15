@@ -6,6 +6,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Coroutine
 
+import orjson
 import websockets
 from loguru import logger
 
@@ -92,8 +93,8 @@ class CEXWebSocketManager:
 
     async def _handle_message(self, exchange: str, raw: str) -> None:
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
+            data = orjson.loads(raw)
+        except (orjson.JSONDecodeError, ValueError):
             return
 
         ticks = self.normalizer.normalize_tick_batch(exchange, data)
