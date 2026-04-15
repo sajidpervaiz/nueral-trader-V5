@@ -128,10 +128,12 @@ class CircuitBreaker:
 
 
 class RiskManager:
-    def __init__(self, config: Config, event_bus: EventBus, safe_mode: SafeModeManager | None = None) -> None:
+    def __init__(self, config: Config, event_bus: EventBus, safe_mode: SafeModeManager | None = None, sqlite_store: Any | None = None) -> None:
         self.config = config
         self.event_bus = event_bus
         self.safe_mode = safe_mode or SafeModeManager()
+        self._sqlite_store = sqlite_store
+        self._closed_trades: list[dict] = []  # in-memory closed trade log
         risk_cfg = config.get_value("risk") or {}
 
         # ── Position sizing (V6.0: 1.5% hard cap) ─────────────────────
@@ -1177,6 +1179,16 @@ class RiskManager:
             key = f"{signal.exchange}:{signal.symbol}"
             self._positions[key] = pos
             self._last_trade_time[signal.symbol] = time.time()
+            # Persist to SQLite
+            if self._sqlite_store:
+                try:
+                    db_id = self._sqlite_store.insert_position(
+                        signal.exchange, signal.symbol, signal.direction,
+                        signal.price, pos.size, is_paper=self.config.paper_mode,
+                    )
+                    pos._db_id = db_id
+                except Exception as e:
+                    logger.debug("SQLite insert_position failed: {}", e)
             logger.info(
                 "Position opened: {}/{} {} size={:.4f} @ {:.2f} SL={:.2f} TP={:.2f} (ATR-based)",
                 signal.exchange, signal.symbol, signal.direction,
@@ -1209,6 +1221,24 @@ class RiskManager:
                 "Position closed: {}/{} pnl={:.2f} ({:.2%}) equity={:.2f} held={:.0f}s",
                 exchange, symbol, pnl_dollar, pos.pnl_pct, self._equity, pos.hold_seconds,
             )
+            # Persist to SQLite
+            db_id = getattr(pos, '_db_id', None)
+            if self._sqlite_store and db_id:
+                try:
+                    self._sqlite_store.close_position(db_id, exit_price, pnl_dollar, pos.pnl_pct)
+                except Exception as e:
+                    logger.debug("SQLite close_position failed: {}", e)
+            # Keep in-memory closed trade log
+            self._closed_trades.append({
+                "exchange": exchange, "symbol": symbol, "direction": pos.direction,
+                "entry_price": pos.entry_price, "exit_price": exit_price,
+                "size": pos.size, "pnl": round(pnl_dollar, 4),
+                "pnl_pct": round(pos.pnl_pct * 100, 4),
+                "hold_seconds": pos.hold_seconds,
+                "open_time": pos.open_time, "close_time": int(time.time()),
+            })
+            if len(self._closed_trades) > 500:
+                self._closed_trades = self._closed_trades[-500:]
             return pos
 
     # ── Trailing stop / breakeven / time exit ─────────────────────────────

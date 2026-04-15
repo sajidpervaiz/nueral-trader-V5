@@ -158,7 +158,7 @@ async def main() -> None:
     signal_gen = SignalGenerator(config, event_bus, data_manager)
     # Auto-trading defaults to ON in paper mode for immediate signal generation
     signal_gen.set_auto_trading(True)
-    risk_mgr = RiskManager(config, event_bus)
+    risk_mgr = RiskManager(config, event_bus, sqlite_store=sqlite_store)
     signal_gen.set_risk_manager(risk_mgr)  # wire for accurate position counting
     order_mgr = OrderManager(config, event_bus, risk_mgr._circuit_breaker)
 

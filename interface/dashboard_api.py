@@ -876,6 +876,54 @@ def build_app(
             stats = metrics.get_latency_stats()
         return stats
 
+    # ── /api/trade-history — closed trades + realized PnL ─────────────────
+    @app.get("/api/trade-history")
+    async def api_trade_history(limit: int = Query(100, ge=1, le=1000)) -> dict[str, Any]:
+        """Return closed trade history and realized PnL summary."""
+        trades: list[dict] = []
+        # 1. In-memory closed trades from risk_manager (current session)
+        if risk_manager and hasattr(risk_manager, "_closed_trades"):
+            trades = list(risk_manager._closed_trades)
+        # 2. Supplement from SQLite (previous sessions)
+        if sqlite_store and sqlite_store.available:
+            try:
+                db_trades = sqlite_store.get_trade_history(limit=limit)
+                # Merge: deduplicate by open_time+symbol
+                seen = {(t["symbol"], t["open_time"]) for t in trades}
+                for dt in db_trades:
+                    key = (dt.get("symbol", ""), dt.get("open_time_ns", 0) // 10**9)
+                    if key not in seen:
+                        trades.append({
+                            "exchange": dt.get("exchange", ""),
+                            "symbol": dt.get("symbol", ""),
+                            "direction": dt.get("direction", ""),
+                            "entry_price": dt.get("entry_price", 0),
+                            "exit_price": dt.get("exit_price", 0),
+                            "size": dt.get("size", 0),
+                            "pnl": dt.get("pnl", 0),
+                            "pnl_pct": round((dt.get("pnl_pct", 0) or 0) * 100, 4),
+                            "hold_seconds": 0,
+                            "open_time": dt.get("open_time_ns", 0) // 10**9,
+                            "close_time": dt.get("close_time_ns", 0) // 10**9,
+                        })
+            except Exception as e:
+                logger.debug("SQLite trade history error: {}", e)
+        # Sort by close_time desc
+        trades.sort(key=lambda t: t.get("close_time", 0), reverse=True)
+        trades = trades[:limit]
+        # Summary
+        total_pnl = sum(t.get("pnl", 0) for t in trades)
+        wins = sum(1 for t in trades if t.get("pnl", 0) > 0)
+        losses = sum(1 for t in trades if t.get("pnl", 0) <= 0)
+        return {
+            "trades": trades,
+            "total": len(trades),
+            "total_pnl": round(total_pnl, 4),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / len(trades) * 100, 1) if trades else 0,
+        }
+
     # ── /api/exchange/currencies — all currencies from connected exchanges ─
     @app.get("/api/exchange/currencies")
     async def api_exchange_currencies(

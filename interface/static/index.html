@@ -689,7 +689,7 @@ async function loadAll() {
   await Promise.all([loadStatus(), loadMarket(), loadFG(), loadOB(), loadTech(), loadCandles(), loadAutoStatus(), loadSession(), loadRegime(), loadGuardrails(), loadVariational()]);
   // Mode-specific loaders
   if (isLiveMode) {
-    await Promise.all([loadExchangePositions(), loadExchangeOrders()]);
+    await Promise.all([loadExchangePositions(), loadExchangeOrders(), loadTradeHistory()]);
   } else {
     await loadPaperTrades();
   }
@@ -937,6 +937,84 @@ async function loadExchangeOrders() {
     h += '</tbody></table>';
     el.innerHTML = h;
   } catch(e) { console.warn('Exchange orders error:', e); }
+}
+
+/* ── Trade History + Realized PnL (live mode) ── */
+async function loadTradeHistory() {
+  try {
+    const d = await (await fetch('/api/trade-history?limit=200')).json();
+    const trades = d.trades || [];
+    // ── History tab ──
+    const histEl = $('historyBody');
+    if (histEl) {
+      if (!trades.length) {
+        histEl.innerHTML = '<div class="empty-row">No trade history yet — execute trades to start</div>';
+      } else {
+        let h = '<table class="ex-table"><thead><tr>';
+        h += '<th>Time</th><th>Instrument</th><th>Direction</th><th class="r">Size</th>';
+        h += '<th class="r">Entry</th><th class="r">Exit</th><th class="r">PnL</th><th class="r">PnL%</th><th class="r">Hold</th>';
+        h += '</tr></thead><tbody>';
+        for (const t of trades) {
+          const isLong = t.direction === 'long';
+          const closeTime = t.close_time ? new Date(t.close_time * 1000).toLocaleString('en-GB') : '--';
+          const pnl = Number(t.pnl || 0);
+          const pnlPct = Number(t.pnl_pct || 0);
+          const holdMins = t.hold_seconds ? Math.round(t.hold_seconds / 60) : 0;
+          const holdStr = holdMins >= 60 ? (holdMins/60).toFixed(1)+'h' : holdMins+'m';
+          h += '<tr>';
+          h += '<td style="color:var(--text3);font-size:10px">' + closeTime + '</td>';
+          h += '<td class="sym-cell">' + esc(t.symbol) + '</td>';
+          h += '<td class="' + (isLong?'dir-long':'dir-short') + '">' + (isLong?'LONG':'SHORT') + '</td>';
+          h += '<td class="r">' + Number(t.size||0).toFixed(4) + '</td>';
+          h += '<td class="r">$' + Number(t.entry_price||0).toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+          h += '<td class="r">$' + Number(t.exit_price||0).toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+          h += '<td class="r ' + (pnl>=0?'pnl-pos':'pnl-neg') + '">' + (pnl>=0?'+':'') + '$' + pnl.toFixed(4) + '</td>';
+          h += '<td class="r ' + (pnlPct>=0?'pnl-pos':'pnl-neg') + '">' + (pnlPct>=0?'+':'') + pnlPct.toFixed(2) + '%</td>';
+          h += '<td class="r" style="color:var(--text3);font-size:10px">' + holdStr + '</td>';
+          h += '</tr>';
+        }
+        h += '</tbody></table>';
+        histEl.innerHTML = h;
+      }
+    }
+    // ── Realized PnL tab ──
+    const pnlEl = $('pnlBody');
+    if (pnlEl) {
+      const totalPnl = Number(d.total_pnl || 0);
+      const wins = d.wins || 0, losses = d.losses || 0, winRate = d.win_rate || 0;
+      const total = d.total || 0;
+      let ph = '<div style="padding:14px"><div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px">';
+      ph += '<div class="port-stat" style="background:var(--bg2);padding:12px 16px;border-radius:8px"><div class="port-stat-lbl">Total Realized PnL</div>';
+      ph += '<div class="port-stat-val" style="font-size:20px;color:' + (totalPnl>=0?'var(--green)':'var(--red)') + '">' + (totalPnl>=0?'+':'') + '$' + totalPnl.toFixed(4) + '</div></div>';
+      ph += '<div class="port-stat" style="background:var(--bg2);padding:12px 16px;border-radius:8px"><div class="port-stat-lbl">Trades</div>';
+      ph += '<div class="port-stat-val" style="font-size:20px">' + total + '</div></div>';
+      ph += '<div class="port-stat" style="background:var(--bg2);padding:12px 16px;border-radius:8px"><div class="port-stat-lbl">Win Rate</div>';
+      ph += '<div class="port-stat-val" style="font-size:20px;color:' + (winRate>=50?'var(--green)':'var(--yellow)') + '">' + winRate.toFixed(1) + '%</div></div>';
+      ph += '<div class="port-stat" style="background:var(--bg2);padding:12px 16px;border-radius:8px"><div class="port-stat-lbl">W / L</div>';
+      ph += '<div class="port-stat-val" style="font-size:20px"><span style="color:var(--green)">' + wins + '</span> / <span style="color:var(--red)">' + losses + '</span></div></div>';
+      ph += '</div>';
+      if (!trades.length) {
+        ph += '<div style="color:var(--text3);font-size:11px">No realized trades yet.</div>';
+      } else {
+        // Recent trades mini-table
+        ph += '<div style="font-size:11px;color:var(--text2);margin-bottom:8px">Recent Trades</div>';
+        ph += '<table class="ex-table"><thead><tr><th>Time</th><th>Symbol</th><th>Dir</th><th class="r">PnL</th><th class="r">PnL%</th></tr></thead><tbody>';
+        for (const t of trades.slice(0, 20)) {
+          const pnl = Number(t.pnl||0), pnlPct = Number(t.pnl_pct||0);
+          const isLong = t.direction === 'long';
+          const tm = t.close_time ? new Date(t.close_time * 1000).toLocaleTimeString('en-GB') : '--';
+          ph += '<tr><td style="color:var(--text3);font-size:10px">' + tm + '</td>';
+          ph += '<td class="sym-cell">' + esc(t.symbol) + '</td>';
+          ph += '<td class="' + (isLong?'dir-long':'dir-short') + '">' + (isLong?'L':'S') + '</td>';
+          ph += '<td class="r ' + (pnl>=0?'pnl-pos':'pnl-neg') + '">' + (pnl>=0?'+':'') + '$' + pnl.toFixed(4) + '</td>';
+          ph += '<td class="r ' + (pnlPct>=0?'pnl-pos':'pnl-neg') + '">' + (pnlPct>=0?'+':'') + pnlPct.toFixed(2) + '%</td></tr>';
+        }
+        ph += '</tbody></table>';
+      }
+      ph += '</div>';
+      pnlEl.innerHTML = ph;
+    }
+  } catch(e) { console.warn('Trade history error:', e); }
 }
 
 /* ── Exchange Currencies ── */
