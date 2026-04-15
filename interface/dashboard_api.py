@@ -75,6 +75,19 @@ _orderbook_cache: dict[str, dict[str, Any]] = {}
 _log_buffer: deque[dict[str, Any]] = deque(maxlen=200)
 _market_cache: dict[str, Any] = {"coins": [], "ts": 0.0}  # TTL cache for market data
 
+# ── TTL cache for exchange REST calls (avoids hammering exchange on every poll) ─
+_exchange_cache: dict[str, tuple[float, Any]] = {}  # key -> (expiry_ts, data)
+_EXCHANGE_CACHE_TTL = 5.0  # seconds
+
+def _cache_get(key: str) -> Any | None:
+    entry = _exchange_cache.get(key)
+    if entry and entry[0] > time.monotonic():
+        return entry[1]
+    return None
+
+def _cache_set(key: str, data: Any) -> None:
+    _exchange_cache[key] = (time.monotonic() + _EXCHANGE_CACHE_TTL, data)
+
 # Loguru sink that captures recent log lines for the /api/logs/recent endpoint
 
 def _log_sink(message: Any) -> None:
@@ -793,6 +806,9 @@ def build_app(
     @app.get("/api/exchange/positions")
     async def api_exchange_positions() -> dict[str, Any]:
         """Fetch actual open positions from connected exchanges."""
+        cached = _cache_get("positions")
+        if cached is not None:
+            return cached
         all_positions: list[dict] = []
         for exc in (executors or []):
             client = getattr(exc, "_client", None)
@@ -823,12 +839,17 @@ def build_app(
                     })
             except Exception as exc_err:
                 logger.warning("fetch_positions failed for {}: {}", ex_id, exc_err)
-        return {"positions": all_positions, "total": len(all_positions)}
+        result = {"positions": all_positions, "total": len(all_positions)}
+        _cache_set("positions", result)
+        return result
 
     # ── /api/exchange/orders — fetch REAL open orders from exchange ────────
     @app.get("/api/exchange/orders")
     async def api_exchange_orders() -> dict[str, Any]:
         """Fetch actual open orders from connected exchanges."""
+        cached = _cache_get("orders")
+        if cached is not None:
+            return cached
         all_orders: list[dict] = []
         for exc in (executors or []):
             client = getattr(exc, "_client", None)
@@ -839,15 +860,16 @@ def build_app(
                 rl = getattr(exc, "_rate_limiter", None)
                 if rl:
                     await rl.acquire()
-                # Fetch per-symbol to avoid slow all-symbol scan
+                # Fetch per-symbol in parallel to reduce latency
                 symbols = getattr(exc, "_symbols", None) or []
                 if symbols:
-                    raw_orders = []
-                    for sym in symbols:
+                    async def _fetch_sym(sym: str):
                         try:
-                            raw_orders.extend(await client.fetch_open_orders(sym))
+                            return await client.fetch_open_orders(sym)
                         except Exception:
-                            pass
+                            return []
+                    results = await asyncio.gather(*[_fetch_sym(s) for s in symbols])
+                    raw_orders = [o for batch in results for o in batch]
                 else:
                     raw_orders = await client.fetch_open_orders()
                 for o in raw_orders:
@@ -865,7 +887,9 @@ def build_app(
                     })
             except Exception as exc_err:
                 logger.warning("fetch_open_orders failed for {}: {}", ex_id, exc_err)
-        return {"orders": all_orders, "total": len(all_orders)}
+        result = {"orders": all_orders, "total": len(all_orders)}
+        _cache_set("orders", result)
+        return result
 
     # ── /api/latency — live latency statistics ────────────────────────────
     @app.get("/api/latency")
@@ -1409,6 +1433,9 @@ def build_app(
                         metadata={"source": "manual_ui"},
                     )
                     await risk_manager.open_position(sig, filled * fill_price)
+                # Invalidate cache after position change
+                _exchange_cache.pop("positions", None)
+                _exchange_cache.pop("orders", None)
 
                 return {
                     "success": True,
@@ -1466,21 +1493,28 @@ def build_app(
                             await rl.acquire()
                         close_side = "sell" if pos.direction == "long" else "buy"
                         t_close_start = time.monotonic()
-                        await client.create_market_order(
+                        # Run close order + cancel protective orders concurrently
+                        close_coro = client.create_market_order(
                             symbol=symbol, side=close_side, amount=abs(pos.size),
                             params={"reduceOnly": True},
                         )
+                        placer = getattr(exc, "_order_placer", None)
+                        if placer:
+                            async def _cancel_protective():
+                                try:
+                                    await placer.cancel_all_for_symbol(symbol)
+                                    placer.remove_tracking(symbol)
+                                except Exception:
+                                    pass
+                            await asyncio.gather(close_coro, _cancel_protective())
+                        else:
+                            await close_coro
                         close_latency = time.monotonic() - t_close_start
                         if metrics and hasattr(metrics, "record_order_latency"):
                             metrics.record_order_latency(ex_id, "close", close_latency)
-                        # Cancel protective orders
-                        placer = getattr(exc, "_order_placer", None)
-                        if placer:
-                            try:
-                                await placer.cancel_all_for_symbol(symbol)
-                                placer.remove_tracking(symbol)
-                            except Exception:
-                                pass
+                        # Invalidate cache after position change
+                        _exchange_cache.pop("positions", None)
+                        _exchange_cache.pop("orders", None)
                         logger.info("Exchange-side close for {} {} qty={}", venue, symbol, pos.size)
                     except Exception as exc_err:
                         logger.error("Exchange close failed for {}: {}", symbol, exc_err)

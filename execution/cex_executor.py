@@ -296,6 +296,9 @@ class CEXExecutor:
         order_id = order.get("id", "")
         for attempt in range(max_retries):
             await asyncio.sleep(wait_sec)
+            if self._client is None:
+                logger.warning("{} client gone during fill wait — returning last order state", self.exchange_id)
+                return order
             try:
                 await self._rate_limiter.acquire()
                 fetched = await self._client.fetch_order(order_id, signal.symbol)
@@ -310,6 +313,9 @@ class CEXExecutor:
             logger.debug("{} order {} not filled after {}s, attempt {}/{}",
                          self.exchange_id, order_id, (attempt + 1) * wait_sec, attempt + 1, max_retries)
 
+        if self._client is None:
+            return order
+
         # Cancel the limit order and fall back to market
         try:
             await self._rate_limiter.acquire()
@@ -318,6 +324,9 @@ class CEXExecutor:
                         self.exchange_id, order_id)
         except Exception as exc:
             logger.warning("{} cancel failed (may already be filled): {}", self.exchange_id, exc)
+
+        if self._client is None:
+            return order
 
         # P0: Re-fetch order to check what filled during cancel race
         already_filled = 0.0
@@ -333,6 +342,9 @@ class CEXExecutor:
         remaining = amount - already_filled
         if remaining <= 0:
             return final_state
+
+        if self._client is None:
+            return order
 
         side = "buy" if signal.is_long else "sell"
         await self._rate_limiter.acquire()
