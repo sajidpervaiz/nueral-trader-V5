@@ -38,7 +38,7 @@ from engine.signal_generator import SignalGenerator
 
 from execution.risk_manager import RiskManager
 from execution.order_manager import OrderManager
-from execution.exchange_factory import create_all_executors
+from execution.exchange_factory import create_all_executors, create_variational_executor
 from execution.smart_order_router import SmartOrderRouter
 from execution.startup_validation import StartupValidator, ValidationError
 from execution.reconciliation import StartupReconciler
@@ -115,8 +115,8 @@ async def main() -> None:
                 v=getattr(candle, "volume", 0),
                 ts_ns=int(getattr(candle, "timestamp", 0) * 1e9),
             )
-        except Exception:
-            pass  # non-critical
+        except Exception as exc:
+            logger.error("Failed to persist candle: {}", exc)
     event_bus.subscribe("CANDLE", _persist_candle)
     # ── Database ──────────────────────────────────────────────────────────
     await db.connect()
@@ -156,13 +156,16 @@ async def main() -> None:
 
     data_manager = DataManager(config, event_bus)
     signal_gen = SignalGenerator(config, event_bus, data_manager)
-    # Auto-trading defaults to off — requires explicit UI toggle
-    signal_gen.set_auto_trading(False)
-    risk_mgr = RiskManager(config, event_bus)
-    signal_gen._risk_manager = risk_mgr  # wire for accurate position counting
+    # Auto-trading defaults to ON in paper mode for immediate signal generation
+    signal_gen.set_auto_trading(True)
+    risk_mgr = RiskManager(config, event_bus, sqlite_store=sqlite_store)
+    signal_gen.set_risk_manager(risk_mgr)  # wire for accurate position counting
     order_mgr = OrderManager(config, event_bus, risk_mgr._circuit_breaker)
 
     executors = create_all_executors(config, event_bus, risk_mgr)
+
+    # Variational DEX executor (perpetual futures via RFQ)
+    variational_executor = create_variational_executor(config, event_bus, risk_mgr)
 
     by_exchange = {getattr(executor, "exchange_id", ""): executor for executor in executors}
     smart_router = SmartOrderRouter(
@@ -231,6 +234,7 @@ async def main() -> None:
         user_stream=user_stream,
         reconciliation_result=recon_result,
         sqlite_store=sqlite_store,
+        metrics=metrics,
     )
 
     # Re-add the dashboard log sink (logger.remove() in _setup_logging wipes it)
@@ -291,7 +295,20 @@ async def main() -> None:
             except asyncio.TimeoutError:
                 pass
 
+    # ── Startup historical data seed (populates regimes, indicators, etc.) ──
+    # In paper mode, PaperFeed seeds + polls continuously (no live WS feed).
+    # In live mode, PaperFeed seeds only — live data comes from CEX WebSocket.
+    from data_ingestion.paper_feed import PaperFeed
+    paper_feed = PaperFeed(
+        event_bus=event_bus,
+        symbols=config.get_value("exchanges", "binance", "symbols") or ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
+        timeframes=["1m", "5m", "15m", "1h", "4h", "1d"],
+        data_manager=data_manager,
+    )
+    _seed_only = not config.paper_mode  # live mode: seed only, WS provides data
+
     tasks = [
+        asyncio.create_task(paper_feed.run(seed_only=_seed_only), name="paper_feed"),
         asyncio.create_task(dispatcher.start(), name="dispatcher"),
         asyncio.create_task(ws_manager.run(), name="cex_ws"),
         asyncio.create_task(dex_feed.run(), name="dex_rpc"),
@@ -310,6 +327,9 @@ async def main() -> None:
 
     for executor in executors:
         tasks.append(asyncio.create_task(executor.run(), name=f"exec_{executor.exchange_id}"))
+
+    if variational_executor is not None:
+        tasks.append(asyncio.create_task(variational_executor.run(), name="exec_variational"))
 
     if app is not None:
         tasks.append(asyncio.create_task(run_dashboard(config, app), name="dashboard"))

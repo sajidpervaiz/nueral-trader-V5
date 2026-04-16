@@ -15,6 +15,7 @@ class Tick:
     volume: float
     side: str = ""
     trade_id: str = ""
+    receive_time_us: int = 0
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Tick":

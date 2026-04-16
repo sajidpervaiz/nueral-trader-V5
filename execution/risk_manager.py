@@ -91,16 +91,14 @@ class CircuitBreaker:
 
     @property
     def tripped(self) -> bool:
-        if self._tripped and self._pause_seconds > 0:
-            elapsed = time.time() - self._trip_time
-            if elapsed >= self._pause_seconds:
-                logger.info(
-                    "Circuit breaker auto-reset after {:.0f}s pause (was: {})",
-                    elapsed, self._trip_reason,
-                )
-                self._tripped = False
-                self._trip_reason = ""
         return self._tripped
+
+    @property
+    def trip_elapsed(self) -> float:
+        """Seconds since the circuit breaker was tripped."""
+        if not self._tripped:
+            return 0.0
+        return time.time() - self._trip_time
 
     @property
     def trip_reason(self) -> str:
@@ -130,10 +128,12 @@ class CircuitBreaker:
 
 
 class RiskManager:
-    def __init__(self, config: Config, event_bus: EventBus, safe_mode: SafeModeManager | None = None) -> None:
+    def __init__(self, config: Config, event_bus: EventBus, safe_mode: SafeModeManager | None = None, sqlite_store: Any | None = None) -> None:
         self.config = config
         self.event_bus = event_bus
         self.safe_mode = safe_mode or SafeModeManager()
+        self._sqlite_store = sqlite_store
+        self._closed_trades: list[dict] = []  # in-memory closed trade log
         risk_cfg = config.get_value("risk") or {}
 
         # ── Position sizing (V6.0: 1.5% hard cap) ─────────────────────
@@ -147,7 +147,7 @@ class RiskManager:
         # ── Pre-trade filters ─────────────────────────────────────────────
         self._max_spread_bps = float(risk_cfg.get("max_spread_bps", 10.0))
         self._max_atr_pct = float(risk_cfg.get("max_atr_pct", 0.05))
-        self._max_exposure_per_symbol = float(risk_cfg.get("max_exposure_per_symbol_pct", 0.06))  # §9: 6% per-symbol
+        self._max_exposure_per_symbol = float(risk_cfg.get("max_exposure_per_symbol_pct", 0.10))  # Match settings.yaml default
         # V6.0: total portfolio exposure hard limit
         self._max_total_exposure_pct = float(risk_cfg.get("max_total_exposure_pct", 0.06))
         self._cooldown_seconds = float(risk_cfg.get("cooldown_seconds", 300.0))
@@ -172,6 +172,8 @@ class RiskManager:
         self._min_orderbook_depth_usd = float(risk_cfg.get("min_orderbook_depth_usd", 50_000.0))
         self._max_order_size_usd = float(risk_cfg.get("max_order_size_usd", 500_000.0))
         self._max_leverage_per_symbol: dict[str, float] = risk_cfg.get("max_leverage_per_symbol", {})
+        self._min_signal_score = float(risk_cfg.get("min_signal_score", 0.5))
+        self._min_risk_reward = float(risk_cfg.get("min_risk_reward", 1.5))
 
         # ── State ─────────────────────────────────────────────────────────
         self._positions: dict[str, Position] = {}
@@ -280,10 +282,12 @@ class RiskManager:
         self._dd_graduation_threshold: int = int(arms_cfg.get("dd_graduation_trades", 3))
 
         # ── ARMS-V2.1: Correlation groups (§8) ───────────────────────────
-        self._correlation_groups: dict[str, list[str]] = {
-            "btc_group": ["BTC/USDT", "BTC/USDC", "BTC/USD", "BTCUSDT", "BTCUSDC"],
-            "eth_group": ["ETH/USDT", "ETH/USDC", "ETH/USD", "ETHUSDT", "ETHUSDC"],
+        default_groups = {
+            "btc_group": ["BTC/USDT", "BTC/USDC", "BTC/USD", "BTCUSDT", "BTCUSDC", "BTC/USDT:USDT"],
+            "eth_group": ["ETH/USDT", "ETH/USDC", "ETH/USD", "ETHUSDT", "ETHUSDC", "ETH/USDT:USDT"],
+            "sol_group": ["SOL/USDT", "SOL/USDC", "SOLUSDT", "SOL/USDT:USDT"],
         }
+        self._correlation_groups: dict[str, list[str]] = arms_cfg.get("correlation_groups", default_groups)
         self._max_group_exposure_pct = float(arms_cfg.get("max_group_exposure_pct", 0.15))
 
         # ── ARMS-V2.1: 8h funding re-check (§9) ─────────────────────────
@@ -931,11 +935,11 @@ class RiskManager:
         if len(self._positions) >= self._max_open:
             return False, f"max_positions_reached ({self._max_open})", 0.0
 
-        if signal.score < 0.5:
-            return False, f"score_too_low ({signal.score:.2f})", 0.0
+        if signal.score < self._min_signal_score:
+            return False, f"score_too_low ({signal.score:.2f} < {self._min_signal_score})", 0.0
 
-        if signal.risk_reward < 1.5:
-            return False, f"poor_risk_reward ({signal.risk_reward:.2f})", 0.0
+        if signal.risk_reward < self._min_risk_reward:
+            return False, f"poor_risk_reward ({signal.risk_reward:.2f} < {self._min_risk_reward})", 0.0
 
         # ── New pre-trade filters ─────────────────────────────────────────
         ok, reason = self._check_session_window()
@@ -1175,6 +1179,16 @@ class RiskManager:
             key = f"{signal.exchange}:{signal.symbol}"
             self._positions[key] = pos
             self._last_trade_time[signal.symbol] = time.time()
+            # Persist to SQLite
+            if self._sqlite_store:
+                try:
+                    db_id = self._sqlite_store.insert_position(
+                        signal.exchange, signal.symbol, signal.direction,
+                        signal.price, pos.size, is_paper=self.config.paper_mode,
+                    )
+                    pos._db_id = db_id
+                except Exception as e:
+                    logger.debug("SQLite insert_position failed: {}", e)
             logger.info(
                 "Position opened: {}/{} {} size={:.4f} @ {:.2f} SL={:.2f} TP={:.2f} (ATR-based)",
                 signal.exchange, signal.symbol, signal.direction,
@@ -1207,6 +1221,24 @@ class RiskManager:
                 "Position closed: {}/{} pnl={:.2f} ({:.2%}) equity={:.2f} held={:.0f}s",
                 exchange, symbol, pnl_dollar, pos.pnl_pct, self._equity, pos.hold_seconds,
             )
+            # Persist to SQLite
+            db_id = getattr(pos, '_db_id', None)
+            if self._sqlite_store and db_id:
+                try:
+                    self._sqlite_store.close_position(db_id, exit_price, pnl_dollar, pos.pnl_pct)
+                except Exception as e:
+                    logger.debug("SQLite close_position failed: {}", e)
+            # Keep in-memory closed trade log
+            self._closed_trades.append({
+                "exchange": exchange, "symbol": symbol, "direction": pos.direction,
+                "entry_price": pos.entry_price, "exit_price": exit_price,
+                "size": pos.size, "pnl": round(pnl_dollar, 4),
+                "pnl_pct": round(pos.pnl_pct * 100, 4),
+                "hold_seconds": pos.hold_seconds,
+                "open_time": pos.open_time, "close_time": int(time.time()),
+            })
+            if len(self._closed_trades) > 500:
+                self._closed_trades = self._closed_trades[-500:]
             return pos
 
     # ── Trailing stop / breakeven / time exit ─────────────────────────────

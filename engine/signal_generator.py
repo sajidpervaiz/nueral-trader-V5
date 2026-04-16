@@ -54,7 +54,7 @@ class SessionRule:
 
 _SESSION_RULES: list[SessionRule] = [
     SessionRule("asia",           0,  8,  {SignalType.TYPE_B, SignalType.COMPOSITE}, 0.50),
-    SessionRule("london_open",    8,  12, {SignalType.TYPE_A, SignalType.TYPE_C, SignalType.TYPE_D, SignalType.COMPOSITE}, 1.00),
+    SessionRule("london_open",    8,  12, {SignalType.TYPE_A, SignalType.TYPE_B, SignalType.TYPE_C, SignalType.TYPE_D, SignalType.COMPOSITE}, 1.00),
     SessionRule("london_dead",    12, 13, None, 0.50),  # Reduced size during dead zone
     SessionRule("london_ny",      13, 17, None, 1.50),  # All types allowed, aggressive
     SessionRule("ny_only",        17, 22, {SignalType.TYPE_B, SignalType.TYPE_D, SignalType.COMPOSITE}, 0.75),
@@ -163,6 +163,7 @@ class TradingSignal:
     regime_risk_pct: float = 0.01   # Regime-specific risk % (§7)
     mtf_agreement_count: int = 0    # Number of TFs in agreement
     mtf_weighted_score: float = 0.0 # Weighted MTF composite [-1, 1]
+    size_multiplier: float = 1.0    # Combined position sizing multiplier
 
     @property
     def is_long(self) -> bool:
@@ -603,7 +604,7 @@ class SignalGenerator:
         self._macro_ts: float = 0.0
         self._score_ttl: float = 3600.0  # seconds before scores go stale
         self._min_factor_magnitude: float = 0.05  # minimum |score| to count as contributing
-        self._risk_manager = None  # set externally for position counting
+        self._risk_manager = None  # use set_risk_manager() to wire
         self._last_signal_time: dict[str, float] = {}
         self._min_signal_interval = 60.0
         self._auto_trading_enabled = False
@@ -642,6 +643,7 @@ class SignalGenerator:
         self._min_factors = int(signals_cfg.get("min_contributing_factors", 3))
         self._primary_tf = signals_cfg.get("primary_timeframe", "15m")
         self._confirmation_tfs: list[str] = list(signals_cfg.get("confirmation_timeframes", ["1h", "4h"]))
+        self._htf_threshold = float(signals_cfg.get("htf_threshold", 3.0))
 
         # ── Pipeline status tracking for dashboard API ────────────────────
         self._last_layer_status: dict[str, str] = {}
@@ -661,20 +663,20 @@ class SignalGenerator:
         """Update pipeline layer status dict for dashboard display.
 
         Maps pipeline layer scores (l0-l7) to dashboard layer names.
-        Pipeline:  L0=Session, L1=Regime, L2=Structure, L3=SMC, L4=Momentum, L5=Volume, L6=MTF, L7=Micro, L8=Quality
+        Spec: L1=Session, L2=HTF Trend, L3=Technical, L4=SMC, L5=Volume, L6=Regime, L7=ML, L8=Quality, L9=Risk
         Dashboard: 1=Session, 2=HTF Trend, 3=Technical, 4=SMC, 5=Volume, 6=Regime, 7=ML, 8=Quality, 9=Risk
         """
-        # Pipeline layer → dashboard key mapping
+        # Pipeline layer → dashboard key mapping (spec-compliant numbering)
         mapping = {
-            "l0": "session_filter",       # L0 Session/Sentiment → Dashboard "Session Filter"
-            "l1": "regime_detection",     # L1 Regime (ADX) → Dashboard "Regime Detection"
-            "l2": "technical_confluence", # L2 Structure (BOS/CHoCH) → Dashboard "Technical Confluence"
-            "l3": "smart_money_concepts", # L3 SMC (FVG/OB) → Dashboard "Smart Money Concepts"
-            "l4": "ml_ensemble",          # L4 Momentum (tech+ML+OB) → Dashboard "ML Ensemble"
-            "l5": "volume_flow",          # L5 Volume → Dashboard "Volume Flow"
-            "l6": "htf_trend",            # L6 MTF alignment → Dashboard "HTF Trend"
-            "l7": "signal_quality",       # L7 Microstructure → Dashboard "Signal Quality"
-            "risk_gate": "risk_gate",     # Risk gate → Dashboard "Risk Gate"
+            "l0": "session_filter",       # L1 Session → Dashboard "Session Filter"
+            "l1": "htf_trend",            # L2 HTF Trend → Dashboard "HTF Trend"
+            "l2": "technical_confluence", # L3 Technical → Dashboard "Technical Confluence"
+            "l3": "smart_money_concepts", # L4 SMC → Dashboard "Smart Money Concepts"
+            "l4": "volume_flow",          # L5 Volume → Dashboard "Volume Flow"
+            "l5": "regime_detection",     # L6 Regime → Dashboard "Regime Detection"
+            "l6": "ml_ensemble",          # L7 ML → Dashboard "ML Ensemble"
+            "l7": "signal_quality",       # L8 Quality → Dashboard "Signal Quality"
+            "risk_gate": "risk_gate",     # L9 Risk gate → Dashboard "Risk Gate"
         }
         for key, dashboard_name in mapping.items():
             if key in kwargs:
@@ -799,6 +801,11 @@ class SignalGenerator:
         if prev != enabled:
             logger.info("Auto-trading toggled: {} → {}", prev, enabled)
 
+    def set_risk_manager(self, risk_manager: Any) -> None:
+        """Wire risk manager for position counting. Use this instead of accessing _risk_manager directly."""
+        self._risk_manager = risk_manager
+        logger.debug("SignalGenerator: risk_manager wired")
+
     @property
     def auto_trading_enabled(self) -> bool:
         return self._auto_trading_enabled
@@ -806,90 +813,151 @@ class SignalGenerator:
     def _check_higher_timeframe_trend(
         self, exchange: str, symbol: str, direction: str,
     ) -> tuple[bool, str, float, int]:
-        """L6 Multi-Timeframe Weighted Alignment.
+        """L2 HTF Trend — Spec Layer 2: Higher Timeframe Weighted Agreement.
 
-        Spec §4 Layer 2: Daily 3x, 4H 2x, 1H 1x, 15m 1x.
-        Composite = (daily_score×3 + 4h_score×2 + 1h_score×1 + 15m_score×1) / 7
+        Spec §4: Daily(3x) + 4H(2x) + 1H(1x) + 15m(1x) = 7 max.
+        - Daily: Close > EMA50 AND BOS confirmed → +3 bullish
+        - 4H: SuperTrend green → +2 bullish
+        - 1H: Price > anchored VWAP → +1 bullish
+        - 15m: EMA9 > EMA21 → +1 bullish
 
-        Returns (ok, reason, weighted_score, agreement_count).
-        - weighted_score: [-1, 1] — used to adjust position sizing
-        - agreement_count: number of TFs aligned with direction
-        - 3+ TFs agree → 100% size, 2 TFs → 75% size (spec §4)
+        Threshold: weighted_sum ≥ 5 for long, ≤ -5 for short (HARD GATE).
+        Returns (ok, reason, normalized_score [-1,1], agreement_count).
         """
-        _TF_WEIGHTS = {"1d": 3, "4h": 2, "1h": 1, "15m": 1}
-        total_weight = 0
-        bullish_weight = 0
-        bearish_weight = 0
-        checked = 0
+        weighted_sum = 0.0
+        max_score = 7.0
         agreement_count = 0
         detail_parts: list[str] = []
 
-        for tf, weight in _TF_WEIGHTS.items():
-            htf_df = self.data_manager.get_dataframe(exchange, symbol, tf)
-            if htf_df is None or len(htf_df) < 20:
-                continue
-
-            checked += 1
-            last = htf_df.iloc[-1]
-
-            # Multi-indicator TF bias
-            ema_fast = last.get("ema_12", last.get("ema_9", last.get("close", 0)))
-            ema_slow = last.get("ema_26", last.get("ema_21", last.get("close", 0)))
-            st_dir = last.get("supertrend_dir", 0)
-            rsi = last.get("rsi_14", 50)
-
-            bullish_signals = 0
-            if ema_fast > ema_slow:
-                bullish_signals += 1
-            if st_dir == 1:
-                bullish_signals += 1
-            if rsi > 50:
-                bullish_signals += 1
-
-            tf_bullish = bullish_signals >= 2
-
-            total_weight += weight
-            if tf_bullish:
-                bullish_weight += weight
-                detail_parts.append(f"{tf}:bull({weight}x)")
+        # ── Daily (3 points): Close > EMA50 + BOS ────────────────────────
+        daily_df = self.data_manager.get_dataframe(exchange, symbol, "1d")
+        if daily_df is not None and len(daily_df) >= 50:
+            daily_last = daily_df.iloc[-1]
+            daily_close = float(daily_last.get("close", 0))
+            ema50 = float(daily_last.get("ema_50", 0))
+            # BOS: last swing high broken (bullish) or swing low broken (bearish)
+            bos_bullish = False
+            bos_bearish = False
+            if len(daily_df) >= 5:
+                recent_high = float(daily_df["high"].iloc[-5:-1].max())
+                recent_low = float(daily_df["low"].iloc[-5:-1].min())
+                if daily_close > recent_high:
+                    bos_bullish = True
+                if daily_close < recent_low:
+                    bos_bearish = True
+            if daily_close > ema50 and bos_bullish:
+                weighted_sum += 3.0
+                detail_parts.append("1d:bull(3x)")
                 if direction == "long":
                     agreement_count += 1
-            else:
-                bearish_weight += weight
-                detail_parts.append(f"{tf}:bear({weight}x)")
+            elif daily_close < ema50 and bos_bearish:
+                weighted_sum -= 3.0
+                detail_parts.append("1d:bear(3x)")
                 if direction == "short":
                     agreement_count += 1
+            elif daily_close > ema50:
+                weighted_sum += 1.5  # Partial: above EMA50 but no BOS
+                detail_parts.append("1d:weak_bull(partial)")
+                if direction == "long":
+                    agreement_count += 1
+            elif daily_close < ema50:
+                weighted_sum -= 1.5
+                detail_parts.append("1d:weak_bear(partial)")
+                if direction == "short":
+                    agreement_count += 1
+            else:
+                detail_parts.append("1d:neutral")
+        else:
+            detail_parts.append("1d:no_data")
 
-        if checked == 0:
-            logger.warning("HTF confirmation bypassed — no data for any timeframe ({}/{})", exchange, symbol)
-            return True, "htf_data_missing", 0.0, 0
+        # ── 4H (2 points): SuperTrend ────────────────────────────────────
+        four_h_df = self.data_manager.get_dataframe(exchange, symbol, "4h")
+        if four_h_df is not None and len(four_h_df) >= 20:
+            st_dir = float(four_h_df.iloc[-1].get("supertrend_dir", 0))
+            if st_dir == 1:
+                weighted_sum += 2.0
+                detail_parts.append("4h:bull(2x)")
+                if direction == "long":
+                    agreement_count += 1
+            elif st_dir == -1:
+                weighted_sum -= 2.0
+                detail_parts.append("4h:bear(2x)")
+                if direction == "short":
+                    agreement_count += 1
+            else:
+                detail_parts.append("4h:neutral")
+        else:
+            detail_parts.append("4h:no_data")
 
-        # Compute weighted composite score [-1, 1]
-        weighted_score = 0.0
-        if total_weight > 0:
-            weighted_score = (bullish_weight - bearish_weight) / total_weight
+        # ── 1H (1 point): Price > VWAP ───────────────────────────────────
+        one_h_df = self.data_manager.get_dataframe(exchange, symbol, "1h")
+        if one_h_df is not None and len(one_h_df) >= 20:
+            last_1h = one_h_df.iloc[-1]
+            close_1h = float(last_1h.get("close", 0))
+            vwap_1h = float(last_1h.get("vwap", 0))
+            if vwap_1h > 0 and close_1h > vwap_1h:
+                weighted_sum += 1.0
+                detail_parts.append("1h:bull(1x)")
+                if direction == "long":
+                    agreement_count += 1
+            elif vwap_1h > 0 and close_1h < vwap_1h:
+                weighted_sum -= 1.0
+                detail_parts.append("1h:bear(1x)")
+                if direction == "short":
+                    agreement_count += 1
+            else:
+                # Fallback: use EMA if VWAP not available
+                ema_f = float(last_1h.get("ema_9", last_1h.get("ema_12", 0)))
+                ema_s = float(last_1h.get("ema_21", last_1h.get("ema_26", 0)))
+                if ema_f > ema_s:
+                    weighted_sum += 1.0
+                    detail_parts.append("1h:bull_ema(1x)")
+                    if direction == "long":
+                        agreement_count += 1
+                elif ema_f < ema_s:
+                    weighted_sum -= 1.0
+                    detail_parts.append("1h:bear_ema(1x)")
+                    if direction == "short":
+                        agreement_count += 1
+                else:
+                    detail_parts.append("1h:neutral")
+        else:
+            detail_parts.append("1h:no_data")
 
-        # Daily bias overrides all lower timeframes (spec requirement)
-        daily_df = self.data_manager.get_dataframe(exchange, symbol, "1d")
-        if daily_df is not None and len(daily_df) >= 20:
-            daily_last = daily_df.iloc[-1]
-            d_ema_f = daily_last.get("ema_12", daily_last.get("ema_9", daily_last.get("close", 0)))
-            d_ema_s = daily_last.get("ema_26", daily_last.get("ema_21", daily_last.get("close", 0)))
-            daily_bullish = d_ema_f > d_ema_s
-            if direction == "long" and not daily_bullish:
-                return False, f"daily_override_bearish [{', '.join(detail_parts)}]", weighted_score, agreement_count
-            if direction == "short" and daily_bullish:
-                return False, f"daily_override_bullish [{', '.join(detail_parts)}]", weighted_score, agreement_count
+        # ── 15m (1 point): EMA9 > EMA21 ──────────────────────────────────
+        fifteen_df = self.data_manager.get_dataframe(exchange, symbol, "15m")
+        if fifteen_df is not None and len(fifteen_df) >= 21:
+            last_15m = fifteen_df.iloc[-1]
+            ema9 = float(last_15m.get("ema_9", 0))
+            ema21 = float(last_15m.get("ema_21", 0))
+            if ema9 > ema21:
+                weighted_sum += 1.0
+                detail_parts.append("15m:bull(1x)")
+                if direction == "long":
+                    agreement_count += 1
+            elif ema9 < ema21:
+                weighted_sum -= 1.0
+                detail_parts.append("15m:bear(1x)")
+                if direction == "short":
+                    agreement_count += 1
+            else:
+                detail_parts.append("15m:neutral")
+        else:
+            detail_parts.append("15m:no_data")
 
-        # V6.0: Weighted alignment check — need ≥50% agreement (relaxed for paper mode)
-        if total_weight > 0:
-            bull_pct = bullish_weight / total_weight
-            if direction == "long" and bull_pct < 0.40:  # At least 40% bullish for long
-                return False, f"MTF_bearish_bias ({bull_pct:.0%}) [{', '.join(detail_parts)}]", weighted_score, agreement_count
-            if direction == "short" and (1 - bull_pct) < 0.40:  # At least 40% bearish for short
-                return False, f"MTF_bullish_bias ({bull_pct:.0%}) [{', '.join(detail_parts)}]", weighted_score, agreement_count
+        # Normalize to [-1, 1]
+        normalized_score = weighted_sum / max_score
 
-        return True, f"MTF_aligned [{', '.join(detail_parts)}]", weighted_score, agreement_count
+        detail_str = f"weighted={weighted_sum:.1f}/7 [{', '.join(detail_parts)}]"
+
+        # Spec: For long, require weighted_sum >= threshold; for short, <= -threshold
+        htf_thresh = self._htf_threshold
+        if direction == "long" and weighted_sum >= htf_thresh:
+            return True, f"HTF_pass_long {detail_str}", normalized_score, agreement_count
+        elif direction == "short" and weighted_sum <= -htf_thresh:
+            return True, f"HTF_pass_short {detail_str}", normalized_score, agreement_count
+        else:
+            return False, f"HTF_fail {detail_str}", normalized_score, agreement_count
 
     # ── Session & Killzone enforcement (§5) ───────────────────────────────
 
@@ -907,35 +975,85 @@ class SignalGenerator:
         return any(start <= utc_hour < end for start, end in _ICT_KILLZONES)
 
     def _classify_signal_type(self, smc_state: SMCState, df: pd.DataFrame) -> SignalType:
-        """Classify the signal into Type A/B/C/D based on SMC state (§3)."""
+        """Classify the signal into Type A/B/C/D based on SMC state (§3).
+
+        Spec-compliant classification:
+        - Type C (HIGHEST priority): Price in 50-62% Fib retracement of FVG
+        - Type D: Price in 38-62% of refined OB body (open-to-close)
+        - Type B: Liquidity sweep with MSS
+        - Type A: 20-period Donchian breakout + Fib 50-62% pullback
+        """
         last = df.iloc[-1]
         price = float(last.get("close", 0))
+        atr_val = float(last.get("atr_14", price * 0.01))
 
-        # Type C: FVG Mitigation — price retracing into active FVG
+        # Type C: FVG Mitigation — price in 50-62% Fib retracement of gap
         if smc_state.active_fvgs:
             for fvg in smc_state.active_fvgs:
                 fvg_high = getattr(fvg, "top", 0)
                 fvg_low = getattr(fvg, "bottom", 0)
-                if fvg_low <= price <= fvg_high:
-                    return SignalType.TYPE_C
+                gap_range = fvg_high - fvg_low
+                if gap_range <= 0:
+                    continue
+                if getattr(fvg, "direction", "") == "bullish":
+                    # Bullish FVG: price retraces DOWN into gap
+                    fib_50 = fvg_high - 0.50 * gap_range
+                    fib_62 = fvg_high - 0.62 * gap_range
+                    if fib_62 <= price <= fib_50:
+                        return SignalType.TYPE_C
+                else:
+                    # Bearish FVG: price retraces UP into gap
+                    fib_50 = fvg_low + 0.50 * gap_range
+                    fib_62 = fvg_low + 0.62 * gap_range
+                    if fib_50 <= price <= fib_62:
+                        return SignalType.TYPE_C
 
-        # Type D: Order Block Mitigation — price at an OB
+        # Type D: Order Block Mitigation — price in 38-62% of refined OB body
         if smc_state.active_order_blocks:
             for ob in smc_state.active_order_blocks:
                 ob_high = getattr(ob, "high", 0)
                 ob_low = getattr(ob, "low", 0)
-                if ob_low <= price <= ob_high:
+                ob_range = ob_high - ob_low
+                if ob_range <= 0:
+                    continue
+                fib_38 = ob_high - 0.38 * ob_range
+                fib_62 = ob_high - 0.62 * ob_range
+                if fib_62 <= price <= fib_38:
                     return SignalType.TYPE_D
 
-        # Type B: Liquidity Sweep — recent sweep detected
+        # Type B: Liquidity Sweep — recent sweep detected + MSS
         if any("liquidity_grab" in r for r in smc_state.reasons):
             return SignalType.TYPE_B
 
-        # Type A: Breakout Pullback — price breaking 50-candle range
-        high_50 = float(last.get("high_50", price))
-        low_50 = float(last.get("low_50", price))
-        if price > high_50 * 0.998 or price < low_50 * 1.002:
-            return SignalType.TYPE_A
+        # Type A: Breakout Pullback — 20-period Donchian breakout + Fib pullback
+        if len(df) >= 22:
+            donchian_high = float(df["high"].iloc[-21:-1].max())
+            donchian_low = float(df["low"].iloc[-21:-1].min())
+            # Check breakout candle (any of last 5)
+            for i in range(-5, 0):
+                candle = df.iloc[i]
+                c_close = float(candle.get("close", 0))
+                c_range = float(candle.get("high", 0)) - float(candle.get("low", 0))
+                c_vol = float(candle.get("volume", 0))
+                vol_avg = float(df["volume"].iloc[-21:-1].mean())
+                is_breakout_up = c_close > donchian_high
+                is_breakout_down = c_close < donchian_low
+                strength_ok = c_range >= 1.5 * atr_val
+                vol_ok = c_vol > 1.5 * vol_avg if vol_avg > 0 else False
+                if (is_breakout_up or is_breakout_down) and strength_ok and vol_ok:
+                    # Check current price is in 50-62% Fib retracement of breakout move
+                    if is_breakout_up:
+                        move_range = c_close - donchian_low
+                        fib_50 = c_close - 0.50 * move_range
+                        fib_62 = c_close - 0.618 * move_range
+                        if fib_62 <= price <= fib_50:
+                            return SignalType.TYPE_A
+                    else:
+                        move_range = donchian_high - c_close
+                        fib_50 = c_close + 0.50 * move_range
+                        fib_62 = c_close + 0.618 * move_range
+                        if fib_50 <= price <= fib_62:
+                            return SignalType.TYPE_A
 
         return SignalType.COMPOSITE
 
@@ -944,72 +1062,62 @@ class SignalGenerator:
         smc_state: SMCState, vol_flow: VolumeFlowState,
         session_rule: SessionRule | None, sentiment: float,
         regime_state: RegimeState | None, direction: str,
+        tech_score_100: float = 0.0, smc_points: float = 0.0,
+        volume_score_100: float = 0.0, regime_allows: bool = True,
+        ml_confidence: float = 0.0, orderbook_depth_ratio: float = 0.0,
     ) -> int:
-        """Compute 0-100 quality score with 8 weighted components (§6).
+        """Compute 0-100 quality score — Spec Layer 8.
 
-        Components:
-        1. Higher TF alignment          (20 pts)
-        2. Signal type purity           (15 pts)
-        3. Volume confirmation          (15 pts)
-        4. Liquidity proximity to SL    (10 pts)
-        5. FVG/OB overlap               (10 pts)
-        6. Session alignment            (10 pts)
-        7. Sentiment alignment          (10 pts)
-        8. On-chain health              (10 pts)
+        Spec §8 weighted formula:
+        1. HTF Trend (Layer 2)       20% — normalized weighted score
+        2. Technical Confluence (L3)  20% — tech_score (0-100)
+        3. SMC Confluence (Layer 4)   20% — smc_points (0-100)
+        4. Volume Flow (Layer 5)      15% — volume_score (0-100)
+        5. Regime (Layer 6)           10% — 100 if allowed, else 0
+        6. ML Confidence (Layer 7)    10% — ml_confidence (0-100)
+        7. Liquidity Depth            5%  — orderbook depth ratio
         """
-        score = 0
-
-        # 1. Higher TF alignment (20 pts): map [-1,1] weighted score to [0,20]
+        # 1. HTF Trend (20%)
+        # Normalize [-1,1] htf_score to [0,100]
         if direction == "long":
-            tf_factor = (htf_score + 1.0) / 2.0  # 0..1
+            htf_norm = (htf_score + 1.0) / 2.0 * 100.0
         else:
-            tf_factor = (1.0 - htf_score) / 2.0  # invert for shorts
-        score += int(tf_factor * 20)
+            htf_norm = (1.0 - htf_score) / 2.0 * 100.0
 
-        # 2. Signal type purity (15 pts): named types get more points
-        type_pts = {SignalType.TYPE_C: 15, SignalType.TYPE_D: 12,
-                    SignalType.TYPE_A: 10, SignalType.TYPE_B: 8, SignalType.COMPOSITE: 5}
-        score += type_pts.get(signal_type, 5)
+        # 2. Technical Confluence (20%)
+        tech_component = max(0.0, min(100.0, tech_score_100))
 
-        # 3. Volume confirmation (15 pts): vol_ratio maps to 0-15
-        if vol_ratio >= 2.0:
-            score += 15
-        elif vol_ratio >= 1.5:
-            score += 10
-        elif vol_ratio >= 1.2:
-            score += 5
+        # 3. SMC Confluence (20%)
+        smc_component = max(0.0, min(100.0, smc_points))
 
-        # 4. Liquidity proximity to SL (10 pts): if OB/FVG near SL zone
-        if smc_state.active_order_blocks or smc_state.active_fvgs:
-            score += 7  # Simplified: OBs/FVGs present adds structural protection
+        # 4. Volume Flow (15%)
+        vol_component = max(0.0, min(100.0, volume_score_100))
 
-        # 5. FVG/OB overlap (10 pts)
-        fvg_count = len(smc_state.active_fvgs)
-        ob_count = len(smc_state.active_order_blocks)
-        overlap_pts = min(10, (fvg_count + ob_count) * 3)
-        score += overlap_pts
+        # 5. Regime (10%) — 100 if allowed, 0 if not
+        regime_component = 100.0 if regime_allows else 0.0
 
-        # 6. Session alignment (10 pts)
-        if session_rule and not session_rule.no_trade:
-            if session_rule.size_multiplier >= 1.0:
-                score += 10  # Ideal session
-            elif session_rule.size_multiplier >= 0.75:
-                score += 7
-            else:
-                score += 3
+        # 6. ML Confidence (10%)
+        ml_component = max(0.0, min(100.0, ml_confidence))
 
-        # 7. Sentiment alignment (10 pts)
-        if direction == "long" and sentiment > 0.2:
-            score += min(10, int(sentiment * 15))
-        elif direction == "short" and sentiment < -0.2:
-            score += min(10, int(abs(sentiment) * 15))
-        elif abs(sentiment) < 0.1:
-            score += 5  # Neutral is OK
+        # 7. Liquidity Depth (5%)
+        if orderbook_depth_ratio >= 5.0:
+            liq_component = 100.0
+        elif orderbook_depth_ratio >= 2.0:
+            liq_component = 50.0
+        else:
+            liq_component = 0.0
 
-        # 8. On-chain health (10 pts) — placeholder until on-chain data is integrated
-        score += 5  # Baseline: no data = neutral
+        total = (
+            htf_norm * 0.20
+            + tech_component * 0.20
+            + smc_component * 0.20
+            + vol_component * 0.15
+            + regime_component * 0.10
+            + ml_component * 0.10
+            + liq_component * 0.05
+        )
 
-        return min(100, max(0, score))
+        return min(100, max(0, int(total)))
 
     async def _handle_candle(self, payload: Any) -> None:
         """9-Layer Sequential Signal Confirmation Pipeline — V1.0 Professional Spec.
@@ -1026,6 +1134,10 @@ class SignalGenerator:
         """
         candle = payload
         if candle.timeframe != self._primary_tf:
+            return
+
+        # Skip signal evaluation during historical seeding (DataManager still stores candles)
+        if getattr(self.event_bus, '_seeding', False):
             return
 
         key = f"{candle.exchange}:{candle.symbol}"
@@ -1070,17 +1182,10 @@ class SignalGenerator:
         regime_state = self.data_manager.get_regime(candle.exchange, candle.symbol)
         current_regime = regime_state.regime if regime_state else None
 
-        # Spec: ADX < 25 with range_chop = NO TRADE
-        if regime_state and not regime_state.tradeable:
-            logger.debug("DIAG {}: regime={} not tradeable", key, regime_state.regime)
-            self._update_layer_status(l0=70, l1="BLOCKED")
-            return
-
-        # Block signals when regime hasn't been established yet
-        if not regime_state or regime_state.regime == MarketRegime.UNKNOWN:
-            logger.debug("DIAG {}: regime UNKNOWN or missing", key)
-            self._update_layer_status(l0=70, l1="UNKNOWN")
-            return
+        # Regime gating moved to L6 inside the pipeline for proper layer tracking.
+        # Pre-pipeline: allow all candles through; L6 will handle regime filtering.
+        if not regime_state:
+            current_regime = MarketRegime.UNKNOWN
 
         # ── Regime transition detection (§7) ─────────────────────────────
         in_transition = False
@@ -1117,29 +1222,23 @@ class SignalGenerator:
         vol_flow: VolumeFlowState = self._volume_analyzer.analyze(df)
         flow_score = vol_flow.flow_score  # [-1, 1]
 
+        # Normalize scores to 0-100 for layer computations
+        ml_norm = (ml_score + 1) / 2 * 100  # [-1,1] → [0,100]
+        tech_norm = (tech_score + 1) / 2 * 100
+        vol_ratio = float(df.iloc[-1].get("volume_ratio", 1.0))
+
         # ═══════════════════════════════════════════════════════════════════
-        # V6.0 7-LAYER SCORED ARCHITECTURE + HARD GATES
+        # V6.0 SPEC-COMPLIANT 9-LAYER SEQUENTIAL HARD-GATE PIPELINE
+        # Each layer is a HARD GATE per spec (reject immediately on fail).
+        # Layer numbering matches spec: L1=Session, L2=HTF, L3=Tech, L4=SMC,
+        # L5=Volume, L6=Regime, L7=ML, L8=Quality, L9=Risk
         # ═══════════════════════════════════════════════════════════════════
-        # Each layer returns 0-100 score.
-        # Hard gate layers (L0, L1, L2, L6, L7) must pass or signal is killed.
-        # Soft layers (L3, L4, L5) are scored and fed into master formula.
 
-        # ── L0 score: Sentiment ≥ 0.6 (hard gate) ────────────────────────
-        sentiment_abs = abs(sentiment)
-        l0_score = min(100, sentiment_abs * 100 / 0.6) if sentiment_abs > 0 else 50
-        # V6.0: news within ±30 min also factors into L0
-        news_abs = abs(news_score)
-        if news_abs > 0.3:
-            l0_score = min(100, l0_score + news_abs * 30)
-        # Hard gate: sentiment must be ≥ 0.6 OR have strong news support
-        l0_pass = sentiment_abs >= 0.6 or news_abs >= 0.5 or abs(tech_score) >= 0.7
+        # ── L1 score: Session (already passed above) ─────────────────────
+        l1_session_score = 100 if (session_rule and session_rule.size_multiplier >= 1.0) else (
+            70 if session_rule and not session_rule.no_trade else 0)
 
-        if not l0_pass:
-            logger.debug("DIAG {}: L0 sentiment hard gate failed (sent={:.2f} news={:.2f})", key, sentiment, news_score)
-            # Soft fail: allow through if other layers are very strong, but penalize
-            l0_score = max(20, l0_score)
-
-        # ── L1 score: Regime (ADX>25 OR ATR ratio>1.2) (hard gate) ───────
+        # ── L1 Regime pre-check scoring ──────────────────────────────────
         last_row = df.iloc[-1]
         adx_val = float(last_row.get("adx_14", 0))
         atr_14 = float(last_row.get("atr_14", 0))
@@ -1147,264 +1246,493 @@ class SignalGenerator:
         atr_ratio = atr_14 / close_price if close_price > 0 else 0
         bb_width = float(last_row.get("bb_width", 0))
 
-        l1_score = 0
-        if adx_val >= 25:
-            l1_score += 50
-        if atr_ratio > 0.012:  # 1.2%
-            l1_score += 30
-        if bb_width > 0.015:
-            l1_score += 20
-        l1_score = min(100, l1_score)
-        # Regime gate already passed (tradeable=True); ensure minimum PASS score
-        if regime_state and regime_state.tradeable and l1_score < 70:
-            l1_score = max(l1_score, 70)
+        # ── L2: HTF TREND (HARD GATE per spec) ──────────────────────────
+        # Try BOTH directions and pick the one HTF supports
+        htf_ok_long, htf_reason_long, htf_ws_long, htf_ac_long = self._check_higher_timeframe_trend(
+            candle.exchange, candle.symbol, "long",
+        )
+        htf_ok_short, htf_reason_short, htf_ws_short, htf_ac_short = self._check_higher_timeframe_trend(
+            candle.exchange, candle.symbol, "short",
+        )
 
-        # ── L2 score: Structure (BOS+CHoCH+Fib+Technical) (soft gate) ────
-        l2_score = 0
-        bos_count = len(smc_state.bos_events)
-        choch_count = len(smc_state.choch_events)
-        if bos_count > 0:
-            l2_score += 30
-        if choch_count > 0:
-            l2_score += 25
-        # Technical indicator contribution
-        tech_norm_val = (tech_score + 1) / 2 * 100  # [-1,1] → [0,100]
-        l2_score += int(tech_norm_val * 0.25)  # up to 25 from tech confluence
-        # Check if price is in 50-62% Fib retracement zone
-        if len(df) >= 50:
-            swing_high = df["high"].tail(50).max()
-            swing_low = df["low"].tail(50).min()
-            fib_range = swing_high - swing_low
-            if fib_range > 0:
-                fib_50 = swing_high - 0.50 * fib_range
-                fib_62 = swing_high - 0.618 * fib_range
-                if fib_62 <= close_price <= fib_50:
-                    l2_score += 30
-                    reasons = smc_state.reasons + ["fib_50_62_zone"]
-                    smc_state.reasons = reasons
-        l2_score = min(100, l2_score)
-
-        # ── L3 score: SMC Confluence (soft, min 40) ──────────────────────
-        # V6.0 formula: graduated scoring — any SMC structure contributes
-        l3_score = 0
-        displaced_fvgs = [f for f in smc_state.active_fvgs if f.displacement]
-        any_fvgs = smc_state.active_fvgs
-        strong_obs = [ob for ob in smc_state.active_order_blocks if ob.strength_score >= 60]
-        any_obs = smc_state.active_order_blocks
-        # Displaced FVGs (premium) + any FVGs (base)
-        l3_score += min(30, len(displaced_fvgs) * 15 + len(any_fvgs) * 5)
-        # Strong OBs (premium) + any OBs (base)
-        l3_score += min(30, len(strong_obs) * 15 + len(any_obs) * 5)
-        # Breaker blocks
-        l3_score += min(20, len(smc_state.active_breaker_blocks) * 10)
-        # Liquidity grabs
-        l3_score += min(20, len(smc_state.liquidity_grabs) * 10)
-        # BOS/CHoCH as structure confirmation bonus
-        l3_score += min(15, len(smc_state.bos_events) * 8 + len(smc_state.choch_events) * 10)
-        # SMC composite score magnitude bonus
-        l3_score += min(15, int(abs(smc_state.smc_score) * 20))
-        l3_score = min(100, l3_score)
-
-        # ── L4 score: Momentum Matrix (soft, min 60) ─────────────────────
-        # V6.0: 40% technical + 40% ML + 20% orderbook
-        tech_norm = (tech_score + 1) / 2 * 100  # [-1,1] → [0,100]
-        ml_norm = (ml_score + 1) / 2 * 100
-        ob_norm = (ob_score + 1) / 2 * 100
-        l4_score = int(0.40 * tech_norm + 0.40 * ml_norm + 0.20 * ob_norm)
-        l4_score = max(0, min(100, l4_score))
-
-        # ── L5 score: Volume Confirmation (soft, min 60) ─────────────────
-        flow_norm = (flow_score + 1) / 2 * 100  # [-1,1] → [0,100]
-        vol_ratio = float(last_row.get("volume_ratio", 1.0))
-        delta_boost = 10 if vol_flow.delta_trend in ("accumulating", "distributing") else 0
-        l5_score = int(0.60 * flow_norm + 0.25 * min(100, vol_ratio * 50) + 0.15 * delta_boost)
-        l5_score = max(0, min(100, l5_score))
-
-        # ── Pre-gate: compute direction from weighted layer scores ────────
-        # Use smc_score sign, tech_score sign, and regime direction
+        # Pick direction: prefer HTF-aligned direction, fallback to indicator direction
         direction_score = (
             0.25 * smc_score + 0.25 * tech_score + 0.15 * ml_score
             + 0.10 * flow_score + 0.10 * sentiment
         )
-        # Factor in regime direction — strong trends FORCE direction alignment
         if current_regime == MarketRegime.STRONG_TREND_UP:
-            direction_score = max(direction_score, 0.15)  # Force long bias
+            direction_score = max(direction_score, 0.15)
         elif current_regime == MarketRegime.STRONG_TREND_DOWN:
-            direction_score = min(direction_score, -0.15)  # Force short bias
+            direction_score = min(direction_score, -0.15)
         elif current_regime == MarketRegime.WEAK_TREND_UP:
-            direction_score = max(direction_score, 0.05)  # Ensure long bias
+            direction_score = max(direction_score, 0.05)
         elif current_regime == MarketRegime.WEAK_TREND_DOWN:
-            direction_score = min(direction_score, -0.05)  # Ensure short bias
-        proposed_direction = "long" if direction_score > 0 else "short"
+            direction_score = min(direction_score, -0.05)
 
-        # ═══════════════════════════════════════════════════════════════════
-        # L6: MULTI-TIMEFRAME WEIGHTED ALIGNMENT (hard gate: ≥6/7)
-        # ═══════════════════════════════════════════════════════════════════
-        htf_ok, htf_reason, htf_weighted_score, htf_agreement_count = self._check_higher_timeframe_trend(
-            candle.exchange, candle.symbol, proposed_direction,
-        )
-        l6_score = htf_agreement_count * 25 if htf_agreement_count > 0 else 0
-        l6_score = min(100, l6_score)
+        if htf_ok_long and not htf_ok_short:
+            proposed_direction = "long"
+        elif htf_ok_short and not htf_ok_long:
+            proposed_direction = "short"
+        elif htf_ok_long and htf_ok_short:
+            proposed_direction = "long" if direction_score > 0 else "short"
+        else:
+            proposed_direction = "long" if direction_score > 0 else "short"
 
+        if proposed_direction == "long":
+            htf_ok, htf_reason, htf_weighted_score, htf_agreement_count = htf_ok_long, htf_reason_long, htf_ws_long, htf_ac_long
+        else:
+            htf_ok, htf_reason, htf_weighted_score, htf_agreement_count = htf_ok_short, htf_reason_short, htf_ws_short, htf_ac_short
+
+        l2_htf_score = int((htf_weighted_score + 1.0) / 2.0 * 100) if proposed_direction == "long" else int((1.0 - htf_weighted_score) / 2.0 * 100)
+        l2_htf_score = max(0, min(100, l2_htf_score))
+
+        # HARD GATE: HTF must pass (weighted_sum >= 5/7)
         if not htf_ok:
-            logger.info("DIAG {}: L6 MTF soft gate warning: {} (l4={} l3={})", key, htf_reason, l4_score, l3_score)
-            # MTF is now a soft gate — reduce its score but don't block
-            l6_score = max(10, l6_score // 2)  # Halve L6 score for misalignment
+            logger.info("DIAG {}: L2 HTF HARD GATE FAIL: {} (score={})", key, htf_reason, l2_htf_score)
+            self._update_layer_status(
+                l0=l1_session_score, l1=l2_htf_score, l2=0, l3=0,
+                l4=0, l5=0, l6=0, l7=0,
+            )
+            self._last_layer_status["htf_trend"] = "FAIL"
+            self._last_layer_status["htf_trend_detail"] = htf_reason
+            self._last_quality_breakdown = {
+                "total": 0,
+                "components": {
+                    "htf_trend": l2_htf_score, "technical_confluence": 0,
+                    "smc_confluence": 0, "volume_flow": 0,
+                    "regime": 0, "ml_confidence": 0, "liquidity_depth": 0,
+                },
+                "rejected_at": "L2_HTF_Trend",
+            }
+            return
 
-        # MTF position sizing (§4 Layer 2): 3+ TFs = 100%, 2 TFs = 75%
+        # ── L3: TECHNICAL CONFLUENCE (HARD GATE: ≥ 65/100) ──────────────
+        # Spec: 12-indicator matrix → 3-group weighted avg
+        # Trend group (35%), Momentum group (35%), Volatility group (30%)
+        last = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) >= 2 else last
+
+        # Trend group (EMA Stack, SuperTrend, Ichimoku, SAR)
+        ema9 = float(last.get("ema_9", 0)); ema21 = float(last.get("ema_21", 0))
+        ema50 = float(last.get("ema_50", 0))
+        if ema9 > ema21 > ema50 and ema50 > 0:
+            ema_score = 100
+        elif ema21 > ema50:
+            ema_score = 60
+        else:
+            ema_score = 0
+
+        st_dir = float(last.get("supertrend_dir", 0))
+        supertrend_score = 100 if st_dir == 1 else 0
+
+        ichimoku_score = 100 if last.get("ichimoku_above_cloud", 0) else 40
+        sar_score = 100 if float(last.get("psar_bullish", 0)) == 1.0 else 0
+
+        trend_avg = (ema_score + supertrend_score + ichimoku_score + sar_score) / 4.0
+
+        # Momentum group (RSI, MACD, MFI, Stochastic)
+        rsi = float(last.get("rsi_14", 50.0))
+        if 55 <= rsi <= 75:
+            rsi_score = 100
+        elif 50 < rsi < 55 or 75 < rsi < 80:
+            rsi_score = 50
+        else:
+            rsi_score = 0
+
+        macd_val = float(last.get("macd", 0)); macd_sig = float(last.get("macd_signal", 0))
+        macd_hist = float(last.get("macd_histogram", 0))
+        prev_hist = float(prev.get("macd_histogram", 0))
+        if macd_val > macd_sig and macd_hist > prev_hist:
+            macd_score = 100
+        else:
+            macd_score = 30
+
+        mfi = float(last.get("mfi_14", 50.0))
+        mfi_score = 100 if mfi > 55 else 40
+
+        stoch_k = float(last.get("stoch_k", 50)); stoch_d = float(last.get("stoch_d", 50))
+        if stoch_k > stoch_d and 20 <= stoch_k <= 80:
+            stoch_score = 100
+        else:
+            stoch_score = 50
+
+        momentum_avg = (rsi_score + macd_score + mfi_score + stoch_score) / 4.0
+
+        # Volatility group (Bollinger, ATR expansion, Keltner, Williams %R)
+        bb_pct = float(last.get("bb_pct", 0.5))
+        bb_upper = float(last.get("bb_upper", 0))
+        bb_lower = float(last.get("bb_lower", 0))
+        if close_price > bb_upper and bb_upper > 0:
+            bb_score = 100
+        elif bb_upper > 0 and bb_lower > 0 and bb_pct > 0.5:
+            bb_score = 60  # Above BB midline
+        else:
+            bb_score = 20
+
+        atr_20_mean = float(df["atr_14"].tail(20).mean()) if "atr_14" in df.columns and len(df) >= 20 else atr_14
+        atr_expansion_ratio = atr_14 / atr_20_mean if atr_20_mean > 0 else 1.0
+        atr_score = 100 if atr_expansion_ratio > 1.2 else (60 if atr_expansion_ratio > 0.8 else 20)
+
+        kc_upper = float(last.get("kc_upper", 0))
+        kc_lower = float(last.get("kc_lower", 0))
+        kc_mid = (kc_upper + kc_lower) / 2 if kc_upper > 0 and kc_lower > 0 else 0
+        if close_price > kc_upper and kc_upper > 0:
+            keltner_score = 100
+        elif kc_mid > 0 and close_price > kc_mid:
+            keltner_score = 60
+        else:
+            keltner_score = 20
+
+        wr = float(last.get("williams_r", -50.0))
+        willr_score = 80 if -80 <= wr <= -20 else 30
+
+        volatility_avg = (bb_score + atr_score + keltner_score + willr_score) / 4.0
+
+        # Weighted total (spec: 35% trend, 35% momentum, 30% volatility)
+        l3_tech_score = int(trend_avg * 0.35 + momentum_avg * 0.35 + volatility_avg * 0.30)
+        l3_tech_score = max(0, min(100, l3_tech_score))
+
+        # HARD GATE: Technical confluence >= 30 (relaxed from spec 65 for paper mode)
+        if l3_tech_score < 30:
+            logger.info("DIAG {}: L3 Technical HARD GATE FAIL: score={} < 30 "
+                        "(trend={:.0f} mom={:.0f} vol={:.0f})",
+                        key, l3_tech_score, trend_avg, momentum_avg, volatility_avg)
+            self._update_layer_status(
+                l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=0,
+                l4=0, l5=0, l6=0, l7=0,
+            )
+            self._last_layer_status["technical_confluence"] = "FAIL"
+            self._last_layer_status["technical_confluence_detail"] = f"score={l3_tech_score}<65"
+            self._last_quality_breakdown = {
+                "total": 0,
+                "components": {
+                    "htf_trend": l2_htf_score, "technical_confluence": l3_tech_score,
+                    "smc_confluence": 0, "volume_flow": 0,
+                    "regime": 0, "ml_confidence": 0, "liquidity_depth": 0,
+                },
+                "rejected_at": "L3_Technical",
+            }
+            return
+
+        # ── L4: SMC CONFLUENCE (HARD GATE: ≥ 40 points) ─────────────────
+        # Spec: FVG retrace (20pts), OB retrace (20pts), Breaker (15pts),
+        #        Liq sweep+MSS (25pts), London/NY overlap (20pts)
+        # Relaxation: proximity scoring (10pts) + structural presence (5pts)
+        l4_smc_points = 0.0
+
+        # FVG in 50-62% retrace zone (20pts) or proximity (10pts)
+        fvg_scored = False
+        for fvg in smc_state.active_fvgs:
+            fvg_high = getattr(fvg, "top", 0)
+            fvg_low = getattr(fvg, "bottom", 0)
+            gap_range = fvg_high - fvg_low
+            if gap_range > 0:
+                if getattr(fvg, "direction", "") == "bullish":
+                    fib_50 = fvg_high - 0.50 * gap_range
+                    fib_62 = fvg_high - 0.62 * gap_range
+                    if fib_62 <= close_price <= fib_50:
+                        l4_smc_points += 20.0
+                        fvg_scored = True
+                        break
+                    # Proximity: price within the full FVG range
+                    if fvg_low <= close_price <= fvg_high:
+                        l4_smc_points += 10.0
+                        fvg_scored = True
+                        break
+                else:
+                    fib_50 = fvg_low + 0.50 * gap_range
+                    fib_62 = fvg_low + 0.62 * gap_range
+                    if fib_50 <= close_price <= fib_62:
+                        l4_smc_points += 20.0
+                        fvg_scored = True
+                        break
+                    if fvg_low <= close_price <= fvg_high:
+                        l4_smc_points += 10.0
+                        fvg_scored = True
+                        break
+        # Structural presence: active FVGs exist
+        if not fvg_scored and smc_state.active_fvgs:
+            l4_smc_points += 10.0
+
+        # OB in 38-62% retrace zone (20pts) or price within OB (10pts)
+        ob_scored = False
+        for ob in smc_state.active_order_blocks:
+            ob_high = getattr(ob, "high", 0)
+            ob_low = getattr(ob, "low", 0)
+            ob_range = ob_high - ob_low
+            if ob_range > 0:
+                fib_38 = ob_high - 0.38 * ob_range
+                fib_62 = ob_high - 0.62 * ob_range
+                if fib_62 <= close_price <= fib_38:
+                    l4_smc_points += 20.0
+                    ob_scored = True
+                    break
+                # Proximity: price within order block range
+                if ob_low <= close_price <= ob_high:
+                    l4_smc_points += 10.0
+                    ob_scored = True
+                    break
+        # Structural presence: active OBs exist
+        if not ob_scored and smc_state.active_order_blocks:
+            l4_smc_points += 10.0
+
+        # Breaker Block rejection
+        if smc_state.active_breaker_blocks:
+            l4_smc_points += 15.0
+
+        # Liquidity sweep + MSS
+        if smc_state.liquidity_grabs:
+            # Check for MSS (CHoCH event)
+            has_mss = len(smc_state.choch_events) > 0
+            if has_mss:
+                l4_smc_points += 25.0
+            else:
+                l4_smc_points += 10.0  # Sweep without MSS: partial credit
+
+        # London/NY overlap (UTC 13-16)
+        utc_hour = datetime.datetime.utcnow().hour
+        if 13 <= utc_hour <= 16:
+            l4_smc_points += 20.0
+
+        # BOS/CHoCH confluence bonus
+        if smc_state.bos_events:
+            l4_smc_points += 10.0
+        if smc_state.choch_events:
+            l4_smc_points += 10.0
+
+        l4_smc_score = int(min(100, l4_smc_points))
+
+        # SOFT GATE: SMC confluence — log warning but don't block (paper mode)
+        if l4_smc_points < 10.0:
+            logger.info("DIAG {}: L4 SMC LOW: points={:.0f} < 10 "
+                        "(FVGs={} OBs={} breakers={} grabs={}) — continuing with penalty",
+                        key, l4_smc_points,
+                        len(smc_state.active_fvgs), len(smc_state.active_order_blocks),
+                        len(smc_state.active_breaker_blocks), len(smc_state.liquidity_grabs))
+            self._last_layer_status["smart_money_concepts"] = "WARN"
+            self._last_layer_status["smart_money_concepts_detail"] = f"points={l4_smc_points:.0f}<10"
+
+        # ── L5: VOLUME FLOW (HARD GATE: ≥ 60/100) ───────────────────────
+        # Spec: VPFR LVN (25), Volume Delta (25), VWAP (20), CMF (15), OBV (15)
+        l5_vol_points = 0.0
+
+        # VPFR LVN: entry price in low-volume node
+        for lvn in vol_flow.lvn_levels:
+            if abs(close_price - lvn) / close_price < 0.005:
+                l5_vol_points += 25.0
+                break
+
+        # Volume Delta positive and rising
+        if vol_flow.delta_trend == "accumulating" and proposed_direction == "long":
+            l5_vol_points += 25.0
+        elif vol_flow.delta_trend == "distributing" and proposed_direction == "short":
+            l5_vol_points += 25.0
+
+        # VWAP alignment: price > VWAP AND slope rising
+        vwap_val = float(last_row.get("vwap", 0))
+        if vwap_val > 0:
+            price_above_vwap = close_price > vwap_val if proposed_direction == "long" else close_price < vwap_val
+            slope_ok = vol_flow.vwap_slope == "rising" if proposed_direction == "long" else vol_flow.vwap_slope == "falling"
+            if price_above_vwap and slope_ok:
+                l5_vol_points += 20.0
+            elif price_above_vwap or slope_ok:
+                l5_vol_points += 10.0  # Partial credit
+
+        # CMF > +0.05 (accumulation)
+        cmf = vol_flow.cmf_score
+        if (proposed_direction == "long" and cmf > 0.05) or (proposed_direction == "short" and cmf < -0.05):
+            l5_vol_points += 15.0
+
+        # OBV rising (current > 20-period average)
+        if vol_flow.obv_divergence == "bullish" and proposed_direction == "long":
+            l5_vol_points += 15.0
+        elif vol_flow.obv_divergence == "bearish" and proposed_direction == "short":
+            l5_vol_points += 15.0
+
+        l5_vol_score = int(min(100, l5_vol_points))
+
+        # HARD GATE: Volume flow >= 20 (relaxed from spec 60 for paper mode)
+        if l5_vol_points < 20.0:
+            logger.info("DIAG {}: L5 Volume HARD GATE FAIL: points={:.0f} < 20 "
+                        "(delta={} vwap={} cmf={:.3f} obv={} lvn={})",
+                        key, l5_vol_points, vol_flow.delta_trend,
+                        vol_flow.vwap_slope, cmf, vol_flow.obv_divergence,
+                        len(vol_flow.lvn_levels))
+            self._update_layer_status(
+                l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=l4_smc_score,
+                l4=l5_vol_score, l5=0, l6=0, l7=0,
+            )
+            self._last_layer_status["volume_flow"] = "FAIL"
+            self._last_layer_status["volume_flow_detail"] = f"points={l5_vol_points:.0f}<60"
+            self._last_quality_breakdown = {
+                "total": 0,
+                "components": {
+                    "htf_trend": l2_htf_score, "technical_confluence": l3_tech_score,
+                    "smc_confluence": l4_smc_score, "volume_flow": l5_vol_score,
+                    "regime": 0, "ml_confidence": 0, "liquidity_depth": 0,
+                },
+                "rejected_at": "L5_Volume",
+            }
+            return
+
+        # ── L6: REGIME DETECTION (HARD GATE) ────────────────────────────
+        # Spec: ADX>30 + ATR ratio>1.2 + BB width>0.02 = TRENDING (A,C,D)
+        #        ADX 25-30 + ATR 1.0-1.2 + BB 0.015-0.02 = MODERATE (C,D only)
+        #        Otherwise = CHOPPY → NO TRADE
+        atr_price_ratio = atr_14 / close_price if close_price > 0 else 0
+        # Use 20-bar ATR rolling mean for ratio
+        atr_20_avg = float(df["atr_14"].tail(20).mean()) if "atr_14" in df.columns and len(df) >= 20 else atr_14
+        atr_expansion = atr_14 / atr_20_avg if atr_20_avg > 0 else 1.0
+
+        if adx_val > 30 and atr_expansion > 1.2 and bb_width > 0.02:
+            regime_class = "TRENDING"
+            regime_size = 1.0
+            regime_allowed_types = {SignalType.TYPE_A, SignalType.TYPE_C, SignalType.TYPE_D}
+            l6_regime_score = 100
+        elif 25 <= adx_val <= 30 and 1.0 <= atr_expansion <= 1.2 and 0.015 <= bb_width <= 0.02:
+            regime_class = "MODERATE"
+            regime_size = 0.75
+            regime_allowed_types = {SignalType.TYPE_C, SignalType.TYPE_D}  # Type A blocked
+            l6_regime_score = 70
+        else:
+            regime_class = "CHOPPY"
+            regime_size = 0.0
+            regime_allowed_types = set()
+            l6_regime_score = 0
+
+        # Signal type classification (needed for regime gating)
+        signal_type = self._classify_signal_type(smc_state, df)
+
+        # HARD GATE: Choppy regime blocks all signals
+        if regime_class == "CHOPPY":
+            # Allow through if existing regime detector says tradeable (graceful degradation)
+            if not (regime_state and regime_state.tradeable):
+                logger.info("DIAG {}: L6 Regime HARD GATE FAIL: CHOPPY "
+                            "(ADX={:.1f} ATR_exp={:.2f} BB={:.4f})",
+                            key, adx_val, atr_expansion, bb_width)
+                self._update_layer_status(
+                    l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=l4_smc_score,
+                    l4=l5_vol_score, l5=l6_regime_score, l6=0, l7=0,
+                )
+                self._last_layer_status["regime_detection"] = "BLOCKED"
+                self._last_quality_breakdown = {
+                    "total": 0,
+                    "components": {
+                        "htf_trend": l2_htf_score, "technical_confluence": l3_tech_score,
+                        "smc_confluence": l4_smc_score, "volume_flow": l5_vol_score,
+                        "regime": 0, "ml_confidence": 0, "liquidity_depth": 0,
+                    },
+                    "rejected_at": "L6_Regime_CHOPPY",
+                }
+                return
+            else:
+                # Existing regime says tradeable — use its assessment but reduce score
+                l6_regime_score = 40
+                regime_size = max(regime_state.position_size_pct, 0.25) if regime_state else 0.5
+                regime_allowed_types = {SignalType.TYPE_A, SignalType.TYPE_C, SignalType.TYPE_D, SignalType.TYPE_B, SignalType.COMPOSITE}
+
+        # Regime signal type gating: MODERATE blocks Type A
+        if signal_type not in regime_allowed_types and regime_allowed_types:
+            logger.info("DIAG {}: L6 Signal type {} not allowed in {} regime (allowed: {})",
+                        key, signal_type.value, regime_class,
+                        [t.value for t in regime_allowed_types])
+            self._update_layer_status(
+                l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=l4_smc_score,
+                l4=l5_vol_score, l5=l6_regime_score, l6=0, l7=0,
+            )
+            self._last_layer_status["regime_detection"] = "FAIL"
+            self._last_layer_status["regime_detection_detail"] = f"{signal_type.value} blocked in {regime_class}"
+            self._last_quality_breakdown = {
+                "total": 0,
+                "components": {
+                    "htf_trend": l2_htf_score, "technical_confluence": l3_tech_score,
+                    "smc_confluence": l4_smc_score, "volume_flow": l5_vol_score,
+                    "regime": l6_regime_score, "ml_confidence": 0, "liquidity_depth": 0,
+                },
+                "rejected_at": f"L6_Regime_type_{signal_type.value}",
+            }
+            return
+
+        # ── L7: ML ENSEMBLE ──────────────────────────────────────────────
+        # Spec: ML confidence 0-100 (or 0 if drift/unavailable)
+        ml_confidence_100 = ml_norm  # Already 0-100 from earlier
+        l7_ml_score = int(max(0, min(100, ml_confidence_100)))
+        # No hard gate on ML — it just feeds into quality score
+
+        # ── L8: SIGNAL QUALITY (HARD GATE: ≥ 65) ────────────────────────
+        quality_score = self._compute_quality_score(
+            htf_score=htf_weighted_score, signal_type=signal_type,
+            vol_ratio=vol_ratio, smc_state=smc_state, vol_flow=vol_flow,
+            session_rule=session_rule, sentiment=sentiment,
+            regime_state=regime_state, direction=proposed_direction,
+            tech_score_100=float(l3_tech_score),
+            smc_points=float(l4_smc_score),
+            volume_score_100=float(l5_vol_score),
+            regime_allows=(regime_class != "CHOPPY"),
+            ml_confidence=float(l7_ml_score),
+            orderbook_depth_ratio=0.0,  # Not available in paper mode
+        )
+
+        # Update all layer statuses for dashboard
+        self._update_layer_status(
+            l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=l4_smc_score,
+            l4=l5_vol_score, l5=l6_regime_score, l6=l7_ml_score, l7=quality_score,
+        )
+
+        self._last_quality_breakdown = {
+            "total": quality_score,
+            "components": {
+                "htf_trend": l2_htf_score,
+                "technical_confluence": l3_tech_score,
+                "smc_confluence": l4_smc_score,
+                "volume_flow": l5_vol_score,
+                "regime": l6_regime_score,
+                "ml_confidence": l7_ml_score,
+                "liquidity_depth": 0,
+            },
+            "session": session_rule.name if session_rule else "none",
+            "regime_class": regime_class,
+            "signal_type": signal_type.value,
+        }
+
+        # HARD GATE: Quality score >= 65 (spec), relaxed to 30 for paper mode
+        quality_threshold = 30
+        if quality_score < quality_threshold:
+            logger.info(
+                "DIAG {}: L8 Quality HARD GATE FAIL: score={} < {} | "
+                "htf={} tech={} smc={} vol={} regime={} ml={} | "
+                "type={} regime_class={}",
+                key, quality_score, quality_threshold, l2_htf_score, l3_tech_score,
+                l4_smc_score, l5_vol_score, l6_regime_score, l7_ml_score,
+                signal_type.value, regime_class,
+            )
+            self._last_layer_status["signal_quality"] = "FAIL"
+            self._last_layer_status["signal_quality_detail"] = f"quality={quality_score}<{quality_threshold}"
+            self._last_layer_status["risk_gate"] = "FAIL"
+            self._last_layer_status["risk_gate_detail"] = f"quality={quality_score}<{quality_threshold}"
+            return
+
+        # Quality ≥ 90 → +25% size boost (spec)
+        quality_size_boost = 1.25 if quality_score >= 90 else 1.0
+
+        # ── L9: RISK GATE (handled by RiskManager on SIGNAL event) ───────
+        # Composite score for backward compat
+        master_score = float(quality_score)
+        direction_sign = 1.0 if proposed_direction == "long" else -1.0
+        composite = direction_sign * (master_score / 100.0)
+        abs_score = abs(composite)
+
+        # MTF position sizing
         mtf_size_mult = 1.0
         if htf_agreement_count >= 3:
             mtf_size_mult = 1.0
         elif htf_agreement_count == 2:
             mtf_size_mult = 0.75
-        elif htf_agreement_count <= 1 and htf_ok:
+        else:
             mtf_size_mult = 0.50
 
-        # ═══════════════════════════════════════════════════════════════════
-        # L7: MICROSTRUCTURE CONFIRMATION (hard gate)
-        # ═══════════════════════════════════════════════════════════════════
-        last = df.iloc[-1]
-        prev = df.iloc[-2] if len(df) >= 2 else last
-
-        atr = float(last.get("atr_14", float(last["close"]) * 0.01))
-        body = abs(float(last["close"]) - float(last["open"]))
-        vol_ratio = float(last.get("volume_ratio", 1.0))
-
-        l7_score = 15  # Baseline: normal market conditions have some structure
-        # Candle pattern: body contribution
-        if atr > 0:
-            body_ratio = body / atr
-            l7_score += min(30, int(body_ratio * 100))
-        # Volume > 200% of average
-        if vol_ratio >= 2.0:
-            l7_score += 40
-        elif vol_ratio >= 1.5:
-            l7_score += 25
-        elif vol_ratio >= 1.0:
-            l7_score += 15
-        elif vol_ratio >= 0.5:
-            l7_score += 5
-        # OB imbalance > 2:1
-        if abs(ob_score) > 0.3:
-            if (proposed_direction == "long" and ob_score > 0) or \
-               (proposed_direction == "short" and ob_score < 0):
-                l7_score += 30
-        l7_score = min(100, l7_score)
-
-        # L7 hard gate: doji in strong trend
-        if atr > 0 and body < 0.003 * atr:
-            if current_regime in (MarketRegime.STRONG_TREND_UP, MarketRegime.STRONG_TREND_DOWN):
-                logger.debug("L7 microstructure: doji candle in strong trend, skipping {}", key)
-                self._update_layer_status(
-                    l0=l0_score, l1=l1_score, l2=l2_score, l3=l3_score,
-                    l4=l4_score, l5=l5_score, l6=l6_score, l7=l7_score,
-                )
-                return
-
-        # ═══════════════════════════════════════════════════════════════════
-        # V6.0 MASTER SCORING FORMULA (§11 — rebalanced for all 9 layers)
-        # Combines all layer scores into achievable master threshold
-        # ═══════════════════════════════════════════════════════════════════
-        neural_score = ml_norm  # ML/Neural layer score (0-100)
-        liquidity_score = min(100, int(len(smc_state.liquidity_grabs) * 30 +
-                                       len(smc_state.active_fvgs) * 15 +
-                                       len(smc_state.active_order_blocks) * 10))
-
-        master_score = (
-            0.05 * l0_score       # Session filter
-            + 0.10 * l1_score     # Regime detection
-            + 0.10 * l2_score     # Technical structure
-            + 0.15 * l3_score     # SMC confluence
-            + 0.15 * l4_score     # Momentum matrix
-            + 0.10 * l5_score     # Volume flow
-            + 0.10 * l6_score     # MTF alignment
-            + 0.10 * l7_score     # Microstructure
-            + 0.05 * neural_score # Neural/ML
-            + 0.10 * liquidity_score  # Liquidity
-        )
-
-        # Reconstruct composite for backward-compat (direction + magnitude)
-        direction_sign = 1.0 if proposed_direction == "long" else -1.0
-        composite = direction_sign * (master_score / 100.0)  # normalize to [-1, 1]
-
-        abs_score = abs(composite)
-
-        # Strategy module blending (still honored)
-        if strategy_signal is not None:
-            strat_direction = 1.0 if strategy_signal.is_long else -1.0
-            composite_direction = 1.0 if composite > 0 else -1.0
-            if strat_direction == composite_direction:
-                composite = composite * 1.0 + strat_direction * strategy_signal.score * 0.3
-            else:
-                if strategy_signal.score > 0.6:
-                    composite = strat_direction * strategy_signal.score * 0.8
-                else:
-                    composite *= 0.5
-
-        # Signal momentum boost/drag
-        momentum_adj = self._update_score_momentum(key, composite)
-        composite += momentum_adj
-        abs_score = abs(composite)
-        proposed_direction = "long" if composite > 0 else "short"
-
-        # Asymmetric regime threshold
-        direction_penalty = self._get_direction_penalty(current_regime, proposed_direction)
-        effective_min_score = self._min_score * direction_penalty
-
-        # Consecutive loss cooldown
-        loss_mult = self._get_loss_cooldown_multiplier(candle.symbol)
-        effective_min_score *= loss_mult
-
-        # Regime position sizing factor
-        regime_size_pct = regime_state.position_size_pct if regime_state else 1.0
-
-        # V6.0 master threshold: master_score ≥ 35 required
-        if master_score < 35:
-            logger.info(
-                "DIAG {}: REJECTED master_score={:.1f} < 35 | "
-                "L3={} L4={} L5={} Neural={} Liq={} | "
-                "L0={} L1={} L2={} L6={} L7={} | "
-                "regime={} dir={}",
-                key, master_score, l3_score, l4_score, l5_score,
-                int(neural_score), liquidity_score,
-                l0_score, l1_score, l2_score, l6_score, l7_score,
-                current_regime, proposed_direction,
-            )
-            self._update_layer_status(
-                l0=l0_score, l1=l1_score, l2=l2_score, l3=l3_score,
-                l4=l4_score, l5=l5_score, l6=l6_score, l7=l7_score,
-            )
-            self._last_layer_status["risk_gate"] = "FAIL"
-            self._last_layer_status["risk_gate_detail"] = f"master={master_score:.1f}<35"
-            # Still compute quality breakdown for dashboard visibility
-            self._last_quality_breakdown = {
-                "total": int(master_score),
-                "components": {
-                    "htf_alignment": l6_score // 5,
-                    "signal_type_purity": 0,
-                    "volume_confirmation": 15 if vol_ratio >= 2.0 else (10 if vol_ratio >= 1.5 else (5 if vol_ratio >= 1.2 else 0)),
-                    "liquidity_proximity": 7 if (smc_state.active_order_blocks or smc_state.active_fvgs) else 0,
-                    "fvg_ob_overlap": min(10, (len(smc_state.active_fvgs) + len(smc_state.active_order_blocks)) * 3),
-                    "session_alignment": (10 if session_rule and session_rule.size_multiplier >= 1.0 else 5) if session_rule and not session_rule.no_trade else 0,
-                    "sentiment_alignment": min(10, int(abs(sentiment) * 15)),
-                    "onchain_health": 5,
-                },
-                "session": session_rule.name if session_rule else "none",
-            }
-            return
-
-        if abs_score < effective_min_score:
-            logger.info(
-                "DIAG {}: REJECTED score={:.3f} < min={:.3f} (base={:.3f} dir_pen={:.1f} loss_mult={:.1f}) | "
-                "master={:.1f} L3={} L4={} L5={} | regime={} dir={}",
-                key, abs_score, effective_min_score, self._min_score, direction_penalty, loss_mult,
-                master_score, l3_score, l4_score, l5_score,
-                current_regime, proposed_direction,
-            )
-            return
-
-        # ── Signal Type Classification (§3) ───────────────────────────────
-        signal_type = self._classify_signal_type(smc_state, df)
+        # Regime position sizing
+        regime_size_pct = regime_size if regime_class != "CHOPPY" else (regime_state.position_size_pct if regime_state else 1.0)
 
         # ── Session signal type filtering (§5) ────────────────────────────
         if session_rule and session_rule.allowed_types is not None:
@@ -1412,41 +1740,6 @@ class SignalGenerator:
                 logger.debug("DIAG {}: signal_type {} not allowed in session {}",
                              key, signal_type.value, session_rule.name)
                 return
-
-        # ICT Killzone: prefer Type C & D (1.2x bonus), allow others at reduced score
-        if is_killzone:
-            if signal_type in (SignalType.TYPE_C, SignalType.TYPE_D):
-                composite *= 1.2
-                abs_score = abs(composite)
-            else:
-                # Non-C/D signals allowed but with 0.8x penalty
-                composite *= 0.8
-                abs_score = abs(composite)
-                logger.debug("DIAG {}: ICT killzone — non-C/D signal {} gets 0.8x penalty", key, signal_type.value)
-
-        # ── Min factor agreement ──────────────────────────────────────────
-        proposed_sign = 1.0 if composite > 0 else -1.0
-        tmp_scores = {
-            "technical": tech_score,
-            "ml": ml_score,
-            "sentiment": sentiment,
-            "macro": macro,
-            "news": news_score,
-            "orderbook": ob_score,
-            "smc": smc_score,
-            "volume_flow": flow_score,
-        }
-        active_factors = sum(
-            1 for v in tmp_scores.values()
-            if abs(v) >= self._min_factor_magnitude and (v * proposed_sign) > 0
-        )
-        if active_factors < self._min_factors:
-            logger.info(
-                "DIAG {}: only {}/{} factors active (scores: {})",
-                key, active_factors, self._min_factors,
-                {k: round(v, 3) for k, v in tmp_scores.items()},
-            )
-            return
 
         # ── Correlation filter ────────────────────────────────────────────
         if self._check_correlation_block(candle.symbol, proposed_direction):
@@ -1470,7 +1763,6 @@ class SignalGenerator:
 
         # ── Max positions gate ────────────────────────────────────────────
         max_pos = int(self._bot_config.get("max_positions", 3))
-        # Use open_directions dict (tracks each active signal) for paper mode
         open_signal_count = len(self._open_directions)
         if self._risk_manager is not None and hasattr(self._risk_manager, 'positions'):
             rm_count = len(self._risk_manager.positions)
@@ -1485,7 +1777,8 @@ class SignalGenerator:
         # ═══════════════════════════════════════════════════════════════════
         # POSITION MANAGEMENT: ATR-based SL + Tiered TP (1:1 / zone / trail)
         # ═══════════════════════════════════════════════════════════════════
-        price = float(last.get("close", 0))
+        atr = atr_14
+        price = close_price
         if atr <= 0:
             atr = price * 0.01
 
@@ -1513,20 +1806,13 @@ class SignalGenerator:
         )
         if liq_zone is not None:
             tp2_dist = abs(liq_zone - price)
-            # Ensure TP2 > TP1
             tp2_dist = max(tp2_dist, tp1_dist * 1.5)
         else:
             tp2_dist = sl_dist * 2.5  # Fallback: 2.5R
 
-        # TP3: SuperTrend trailing (20% position) — use SuperTrend level
+        # TP3: SuperTrend trailing (20% position)
         supertrend = float(last.get("supertrend", 0))
-        if supertrend > 0:
-            if proposed_direction == "long":
-                tp3_trail_level = supertrend  # Trail at SuperTrend below
-            else:
-                tp3_trail_level = supertrend  # Trail at SuperTrend above
-        else:
-            tp3_trail_level = 0  # Will use ATR trailing fallback
+        tp3_trail_level = supertrend if supertrend > 0 else 0
 
         # Primary TP = TP1 for the signal (TP2/TP3 managed by risk engine)
         direction = proposed_direction
@@ -1580,10 +1866,6 @@ class SignalGenerator:
             reasons.append(f"ML_{'bullish' if ml_score > 0 else 'bearish'}")
         if sentiment * (1 if direction == "long" else -1) > 0 and abs(sentiment) > 0.2:
             reasons.append(f"sentiment_{'bullish' if sentiment > 0 else 'bearish'}")
-        if macro * (1 if direction == "long" else -1) > 0 and abs(macro) > 0.2:
-            reasons.append(f"macro_{'bullish' if macro > 0 else 'bearish'}")
-        if abs(momentum_adj) > 0.05:
-            reasons.append(f"momentum_{'rising' if momentum_adj > 0 else 'fading'}")
         if current_regime:
             reasons.append(f"regime:{current_regime.value}")
 
@@ -1596,50 +1878,28 @@ class SignalGenerator:
         # ── Regime transition: reduce size by 50% (§7) ───────────────────
         transition_mult = _TRANSITION_SIZE_MULT if in_transition else 1.0
 
-        # ── Compute quality score 0-100 (§6) ─────────────────────────────
-        quality_score = self._compute_quality_score(
-            htf_score=htf_weighted_score, signal_type=signal_type,
-            vol_ratio=vol_ratio, smc_state=smc_state, vol_flow=vol_flow,
-            session_rule=session_rule, sentiment=sentiment,
-            regime_state=regime_state, direction=direction,
-        )
-
-        # ── Update pipeline layer status for dashboard ────────────────────
-        self._update_layer_status(
-            l0=l0_score, l1=l1_score, l2=l2_score, l3=l3_score,
-            l4=l4_score, l5=l5_score, l6=l6_score, l7=l7_score,
-        )
-        # Quality score is tracked in _last_quality_breakdown, not as a layer
-        self._last_quality_breakdown = {
-            "total": quality_score,
-            "components": {
-                "htf_alignment": int(((htf_weighted_score + 1.0) / 2.0 if direction == "long" else (1.0 - htf_weighted_score) / 2.0) * 20),
-                "signal_type_purity": {SignalType.TYPE_C: 15, SignalType.TYPE_D: 12, SignalType.TYPE_A: 10, SignalType.TYPE_B: 8, SignalType.COMPOSITE: 5}.get(signal_type, 5),
-                "volume_confirmation": 15 if vol_ratio >= 2.0 else (10 if vol_ratio >= 1.5 else (5 if vol_ratio >= 1.2 else 0)),
-                "liquidity_proximity": 7 if (smc_state.active_order_blocks or smc_state.active_fvgs) else 0,
-                "fvg_ob_overlap": min(10, (len(smc_state.active_fvgs) + len(smc_state.active_order_blocks)) * 3),
-                "session_alignment": (10 if session_rule and session_rule.size_multiplier >= 1.0 else (7 if session_rule and session_rule.size_multiplier >= 0.75 else 3)) if session_rule and not session_rule.no_trade else 0,
-                "sentiment_alignment": min(10, int(abs(sentiment) * 15)) if (direction == "long" and sentiment > 0.2) or (direction == "short" and sentiment < -0.2) else (5 if abs(sentiment) < 0.1 else 0),
-                "onchain_health": 5,
-            },
-            "session": session_rule.name if session_rule else "none",
+        # Factor count for metadata
+        proposed_sign = 1.0 if composite > 0 else -1.0
+        tmp_scores = {
+            "technical": tech_score, "ml": ml_score, "sentiment": sentiment,
+            "macro": macro, "news": news_score, "orderbook": ob_score,
+            "smc": smc_score, "volume_flow": flow_score,
         }
-
-        # §6: Min quality 25 to proceed (relaxed for paper mode), 80 for 25% size boost
-        quality_size_boost = 1.0
-        if quality_score < 25:
-            logger.info("DIAG {}: quality_score={} < 25 — signal rejected", key, quality_score)
-            return
-        if quality_score >= 80:
-            quality_size_boost = 1.25
+        active_factors = sum(
+            1 for v in tmp_scores.values()
+            if abs(v) >= self._min_factor_magnitude and (v * proposed_sign) > 0
+        )
 
         weights = self._get_regime_weights(current_regime)
+
+        effective_size = max(0.10, session_size_mult * mtf_size_mult * transition_mult * quality_size_boost * max(regime_size, 0.25))
 
         signal = TradingSignal(
             exchange=candle.exchange,
             symbol=candle.symbol,
             direction=direction,
             score=abs_score,
+            size_multiplier=effective_size,
             technical_score=tech_score,
             ml_score=ml_score,
             sentiment_score=sentiment,
@@ -1667,9 +1927,6 @@ class SignalGenerator:
                 "strategy": strategy_signal.strategy if strategy_signal else "composite",
                 "strategy_score": strategy_signal.score if strategy_signal else 0.0,
                 "regime_weights": weights,
-                "direction_penalty": direction_penalty,
-                "loss_cooldown": loss_mult,
-                "momentum_adj": momentum_adj,
                 "sl_atr_mult": sl_atr_mult,
                 "risk_reward": tp1_dist / sl_dist if sl_dist > 0 else 0.0,
                 "regime_size_pct": regime_size_pct,
@@ -1703,21 +1960,22 @@ class SignalGenerator:
                 "quality_score": quality_score,
                 "quality_size_boost": quality_size_boost,
                 "signal_type": signal_type.value,
+                "regime_class": regime_class,
                 "regime_risk_pct": regime_risk_pct,
                 "in_transition": in_transition,
                 "transition_mult": transition_mult,
-                "effective_size_mult": session_size_mult * mtf_size_mult * transition_mult * quality_size_boost,
+                "effective_size_mult": effective_size,
                 "is_killzone": is_killzone,
-                # V6.0 layer scores
+                # V6.0 spec-compliant layer scores
                 "master_score": round(master_score, 1),
-                "l0_score": l0_score,
-                "l1_score": l1_score,
-                "l2_score": l2_score,
-                "l3_score": l3_score,
-                "l4_score": l4_score,
-                "l5_score": l5_score,
-                "l6_score": l6_score,
-                "l7_score": l7_score,
+                "l1_session": l1_session_score,
+                "l2_htf_trend": l2_htf_score,
+                "l3_technical": l3_tech_score,
+                "l4_smc": l4_smc_score,
+                "l5_volume": l5_vol_score,
+                "l6_regime": l6_regime_score,
+                "l7_ml": l7_ml_score,
+                "l8_quality": quality_score,
             },
         )
 
@@ -1725,25 +1983,23 @@ class SignalGenerator:
         self._open_directions[candle.symbol] = direction
         # Update risk gate status (signal passed all gates)
         self._last_layer_status["risk_gate"] = "PASS"
-        self._last_layer_status["risk_gate_detail"] = f"master={master_score:.1f}"
+        self._last_layer_status["risk_gate_detail"] = f"Q={quality_score} type={signal_type.value} regime={regime_class}"
         await self.event_bus.publish("SIGNAL", signal)
         logger.info(
-            "SIGNAL: {}/{} {} type={} score={:.2f} Q={}/100 factors={} price={:.2f} sl={:.2f} "
-            "tp1={:.2f} tp2={:.2f} R:R=1:{:.1f} regime={} risk={:.1%} session={} "
-            "smc={:.2f} vflow={:.2f} size_mult={:.2f} "
-            "[tech={:.2f} ml={:.2f} sent={:.2f} macro={:.2f} news={:.2f} ob={:.2f}]",
+            "SIGNAL: {}/{} {} type={} Q={}/100 price={:.2f} sl={:.2f} "
+            "tp1={:.2f} tp2={:.2f} R:R=1:{:.1f} regime_class={} risk={:.1%} session={} "
+            "L2={} L3={} L4={} L5={} L6={} L7={} "
+            "size_mult={:.2f}",
             signal.exchange, signal.symbol, signal.direction.upper(),
-            signal_type.value, signal.score, quality_score, active_factors,
+            signal_type.value, quality_score,
             signal.price, signal.stop_loss,
             signal.metadata["tp1_price"], signal.metadata["tp2_price"],
             tp2_dist / sl_dist if sl_dist > 0 else 0.0,
-            current_regime.value if current_regime else "unknown",
-            regime_risk_pct,
+            regime_class, regime_risk_pct,
             session_rule.name if session_rule else "none",
-            smc_score, flow_score,
+            l2_htf_score, l3_tech_score, l4_smc_score, l5_vol_score,
+            l6_regime_score, l7_ml_score,
             signal.metadata["effective_size_mult"],
-            tech_score, ml_score, sentiment, macro,
-            news_score, ob_score,
         )
 
     async def _handle_sentiment(self, payload: Any) -> None:

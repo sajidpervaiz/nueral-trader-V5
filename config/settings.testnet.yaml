@@ -1,0 +1,158 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# NUERAL-TRADER-5 — TESTNET LIVE TRADING CONFIG
+# ═══════════════════════════════════════════════════════════════════════════════
+# This config runs REAL orders on Binance Futures TESTNET (fake money).
+# Get testnet API keys at: https://testnet.binancefuture.com
+# ═══════════════════════════════════════════════════════════════════════════════
+
+system:
+  name: NUERAL-TRADER-5
+  version: "4.0.0"
+  paper_mode: false           # FALSE = real orders (on testnet)
+  log_level: INFO
+  log_dir: logs
+  timezone: UTC
+
+# ── Exchange — Binance Futures TESTNET ────────────────────────────────────────
+exchanges:
+  binance:
+    enabled: true
+    api_key: "${BINANCE_API_KEY}"
+    api_secret: "${BINANCE_API_SECRET}"
+    type: futures
+    testnet: true             # TESTNET endpoints — no real money
+    symbols:
+      - BTC/USDT:USDT
+      - ETH/USDT:USDT
+      - SOL/USDT:USDT
+    rate_limit_rpm: 1200
+
+  bybit:
+    enabled: false
+  okx:
+    enabled: false
+  kraken:
+    enabled: false
+
+# ── DEX — disabled for testnet ────────────────────────────────────────────────
+dex:
+  enabled: false
+
+variational:
+  enabled: false
+
+# ── Macro feeds ───────────────────────────────────────────────────────────────
+macro:
+  funding_rates:
+    enabled: true
+    sources: [binance]
+    fetch_interval_seconds: 300
+    arbitrage_threshold_bps: 20
+  open_interest:
+    enabled: true
+    sources: [binance]
+    fetch_interval_seconds: 300
+  vix_proxy:
+    enabled: true
+    method: realized_vol
+    lookback_periods: [7, 14, 30]
+    deribit_enabled: false
+
+# ── RISK — Conservative for $500 testnet ──────────────────────────────────────
+risk:
+  initial_equity: 5000        # Matches testnet balance (5000 USDT)
+  max_position_size_pct: 0.10 # 10% = $500 max per position (before leverage)
+  max_daily_loss_pct: 0.06    # 6% = $300 daily loss limit
+  max_drawdown_pct: 0.15      # 15% = $750 max drawdown
+  max_open_positions: 3       # Max 3 concurrent positions
+  default_leverage: 5.0       # 5x leverage → $250 notional per position
+  stop_loss_pct: 0.015        # 1.5% stop loss
+  take_profit_pct: 0.03       # 3% take profit
+  kelly_fraction: 0.25
+  min_liquidity_usd: 50000
+  min_balance_usd: 10         # Testnet: low minimum
+  sizing_method: risk_based
+  risk_per_trade_pct: 0.02    # 2% risk per trade = $1
+
+  # Pre-trade filters
+  max_spread_bps: 15.0        # Slightly relaxed for testnet
+  max_atr_pct: 0.05
+  max_exposure_per_symbol_pct: 0.60  # 60% — accounts for 5x leverage on testnet
+  max_funding_rate_bps: 50.0
+  min_orderbook_depth_usd: 10000   # Testnet has less depth
+  max_order_size_usd: 3000         # Cap at $3000 per order (supports 5x leverage)
+  max_total_exposure_pct: 3.0      # 300% — accounts for 5x leverage on testnet
+  max_leverage_per_symbol: {}
+  cooldown_seconds: 300
+  session_start_utc: "00:00"
+  session_end_utc: "23:59"
+  min_signal_score: 0.35      # Testnet: lower score threshold (prod: 0.5)
+  min_risk_reward: 1.0        # Testnet: lower R:R threshold (prod: 1.5)
+
+  # Position management
+  atr_sl_multiplier: 1.5
+  rr_ratio: 2.0
+  trailing_activation_atr: 2.0
+  trailing_distance_atr: 1.0
+  breakeven_trigger_atr: 1.0
+  max_hold_minutes: 480       # Close positions after 8 hours (testnet safety)
+
+  # Circuit breaker — 1 hour pause on testnet
+  circuit_breaker_pause_seconds: 3600
+  user_stream_safe_mode_seconds: 5
+
+  # VaR
+  max_portfolio_var_pct: 0.10
+  returns_window: 250
+  var_min_history: 30
+
+# ── Signal engine ─────────────────────────────────────────────────────────────
+signals:
+  timeframes: [1m, 5m, 15m, 1h, 4h, 1d]
+  primary_timeframe: 15m
+  confirmation_timeframes: [1h, 4h]
+  min_score_threshold: 0.35         # Relaxed for testnet demo
+  htf_threshold: 0.5                # Relaxed for testnet (prod=3.0)
+  volume_hard_gate_threshold: 5.0   # Relaxed for testnet (prod=20.0)
+  ml_weight: 0.25
+  technical_weight: 0.30
+  sentiment_weight: 0.10
+  macro_weight: 0.10
+  news_weight: 0.15
+  orderbook_weight: 0.10
+  min_contributing_factors: 2        # Relaxed for testnet (prod=3)
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+storage:
+  postgres:
+    host: "${POSTGRES_HOST:-localhost}"
+    port: 5432
+    database: neural_trader
+    user: "${POSTGRES_USER:-trader}"
+    password: "${POSTGRES_PASSWORD}"
+    pool_size: 10
+    timescaledb: true
+  redis:
+    host: "${REDIS_HOST:-localhost}"
+    port: 6379
+    db: 0
+    password: "${REDIS_PASSWORD:-}"
+    pool_size: 20
+    default_ttl_seconds: 300
+
+# ── Rust hot-path ─────────────────────────────────────────────────────────────
+rust_services:
+  enabled: true
+  fallback_to_python: true
+  tick_parser:
+    batch_size: 1000
+    channel: "ticks:raw"
+  order_matcher:
+    max_depth: 500
+    channel: "orders:matches"
+
+# ── Dashboard API — allow unauthenticated for testnet ──────────────────────────
+monitoring:
+  dashboard_api:
+    auth:
+      allow_unauthenticated_non_paper: true

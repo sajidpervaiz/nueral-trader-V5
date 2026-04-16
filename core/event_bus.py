@@ -17,6 +17,7 @@ CRITICAL_EVENTS = frozenset({
 
 # Events that require serial (ordered) handler execution
 SERIAL_EVENTS = frozenset({
+    "SIGNAL",
     "STOP_LOSS", "TAKE_PROFIT", "KILL_SWITCH", "LIQUIDATION",
     "MARGIN_CALL", "ORDER_FILLED", "ORDER_PARTIALLY_FILLED",
     "FILL_CONFIRMED", "POSITION_CLOSED",
@@ -29,6 +30,8 @@ class EventBus:
         self._queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=10_000)
         self._running = False
         self._background_tasks: set[asyncio.Task] = set()
+        self._dropped_count: int = 0
+        self._backpressure_warned: bool = False
 
     def subscribe(self, event_type: str, handler: Handler) -> None:
         self._handlers[event_type].append(handler)
@@ -42,6 +45,12 @@ class EventBus:
             pass
 
     async def publish(self, event_type: str, payload: Any = None) -> None:
+        qsize = self._queue.qsize()
+        if qsize > 8_000 and not self._backpressure_warned:
+            logger.warning("EventBus queue at {}% capacity ({}/10000) — backpressure risk", qsize // 100, qsize)
+            self._backpressure_warned = True
+        elif qsize < 5_000:
+            self._backpressure_warned = False
         await self._queue.put((event_type, payload))
 
     def publish_nowait(self, event_type: str, payload: Any = None) -> None:
@@ -60,7 +69,8 @@ class EventBus:
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
             else:
-                logger.warning("EventBus queue full — dropping event '{}'", event_type)
+                self._dropped_count += 1
+                logger.warning("EventBus queue full — dropping event '{}' (total dropped: {})", event_type, self._dropped_count)
 
     async def _dispatch(self, event_type: str, payload: Any) -> None:
         """Dispatch an event to its handlers."""

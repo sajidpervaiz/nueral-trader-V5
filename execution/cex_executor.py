@@ -71,11 +71,27 @@ class CEXExecutor:
         if passphrase:
             params["password"] = passphrase
         if cfg.get("testnet"):
-            params["options"] = {"defaultType": cfg.get("type", "future")}
+            # Normalize type: ccxt expects 'future' not 'futures'
+            raw_type = cfg.get("type", "future")
+            if raw_type == "futures":
+                raw_type = "future"
+            params["options"] = {
+                "defaultType": raw_type,
+                # Skip sapi calls (spot auth) — testnet keys only work on futures endpoints
+                "fetchCurrencies": False,
+                "fetchMargins": False,
+                "warnOnFetchOpenOrdersWithoutSymbol": False,
+            }
         try:
             self._client = cls(params)
             if cfg.get("testnet"):
-                self._client.set_sandbox_mode(True)
+                # Proper testnet setup: manually swap only futures URLs
+                # instead of set_sandbox_mode() which triggers ccxt's
+                # deprecation error for Binance futures testnet.
+                testnet_urls = self._client.urls.get("test", {})
+                for key, url in testnet_urls.items():
+                    if key.startswith(("fapi", "dapi")) and key in self._client.urls["api"]:
+                        self._client.urls["api"][key] = url
             await self._client.load_markets()
             # Detect hedge mode (dual position side)
             hedge_mode = bool(cfg.get("hedge_mode", False))
@@ -98,6 +114,7 @@ class CEXExecutor:
             leverage = int(cfg.get("leverage", self.risk_manager._leverage if hasattr(self.risk_manager, '_leverage') else 1))
             margin_mode = str(cfg.get("margin_mode", "isolated")).lower()
             symbols = cfg.get("symbols", [])
+            self._symbols = symbols
             for sym in symbols:
                 try:
                     await self._client.set_margin_mode(margin_mode, sym)
@@ -108,6 +125,11 @@ class CEXExecutor:
                 except Exception as e:
                     logger.debug("{} set_leverage({}, {}): {}", self.exchange_id, leverage, sym, e)
             logger.info("{} CEX client initialized (leverage={}, margin={})", self.exchange_id, leverage, margin_mode)
+            # Pre-warm HTTP connection pool to eliminate cold-start latency
+            try:
+                await self._client.fetch_ticker(symbols[0] if symbols else "BTC/USDT:USDT")
+            except Exception:
+                pass
         except Exception as exc:
             logger.warning("{} client init failed: {}", self.exchange_id, exc)
             self._client = None
@@ -274,6 +296,9 @@ class CEXExecutor:
         order_id = order.get("id", "")
         for attempt in range(max_retries):
             await asyncio.sleep(wait_sec)
+            if self._client is None:
+                logger.warning("{} client gone during fill wait — returning last order state", self.exchange_id)
+                return order
             try:
                 await self._rate_limiter.acquire()
                 fetched = await self._client.fetch_order(order_id, signal.symbol)
@@ -288,6 +313,9 @@ class CEXExecutor:
             logger.debug("{} order {} not filled after {}s, attempt {}/{}",
                          self.exchange_id, order_id, (attempt + 1) * wait_sec, attempt + 1, max_retries)
 
+        if self._client is None:
+            return order
+
         # Cancel the limit order and fall back to market
         try:
             await self._rate_limiter.acquire()
@@ -296,6 +324,9 @@ class CEXExecutor:
                         self.exchange_id, order_id)
         except Exception as exc:
             logger.warning("{} cancel failed (may already be filled): {}", self.exchange_id, exc)
+
+        if self._client is None:
+            return order
 
         # P0: Re-fetch order to check what filled during cancel race
         already_filled = 0.0
@@ -311,6 +342,9 @@ class CEXExecutor:
         remaining = amount - already_filled
         if remaining <= 0:
             return final_state
+
+        if self._client is None:
+            return order
 
         side = "buy" if signal.is_long else "sell"
         await self._rate_limiter.acquire()

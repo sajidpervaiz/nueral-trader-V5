@@ -11,6 +11,7 @@ from execution.bybit_executor import BybitExecutor
 from execution.okx_executor import OKXExecutor
 from execution.kraken_executor import KrakenExecutor
 from execution.risk_manager import RiskManager
+from execution.variational_executor import VariationalExecutor
 
 
 _EXECUTOR_MAP: dict[str, type[CEXExecutor]] = {
@@ -74,3 +75,18 @@ def create_all_executors(
             executors.append(executor)
     logger.info("Created {} CEX executor(s)", len(executors))
     return executors
+
+
+def create_variational_executor(
+    config: Config,
+    event_bus: EventBus,
+    risk_manager: RiskManager,
+) -> VariationalExecutor | None:
+    """Create a Variational DEX executor if enabled in config."""
+    var_cfg = config.get_value("variational") or {}
+    if not var_cfg.get("enabled", False):
+        logger.debug("Variational DEX disabled — skipping executor creation")
+        return None
+    executor = VariationalExecutor(config, event_bus, risk_manager)
+    logger.info("Created Variational DEX executor")
+    return executor

@@ -50,11 +50,14 @@ class DataManager:
             )
         return self._aggregators[key][timeframe]
 
-    def _store_candle(self, exchange: str, symbol: str, timeframe: str, candle: Candle) -> None:
+    def _store_candle(self, exchange: str, symbol: str, timeframe: str, candle: Candle, compute: bool = True) -> None:
         key = f"{exchange}:{symbol}"
         if timeframe not in self._candle_history[key]:
             self._candle_history[key][timeframe] = deque(maxlen=MAX_CANDLES_PER_SERIES)
         self._candle_history[key][timeframe].append(candle)
+
+        if not compute:
+            return
 
         candles = list(self._candle_history[key][timeframe])
         if len(candles) < 5:
@@ -80,13 +83,49 @@ class DataManager:
         self._dataframes[key][timeframe] = df
         self._update_regime(key, timeframe, df)
 
-    def _update_regime(self, key: str, timeframe: str, df: pd.DataFrame) -> None:
+    def recompute_all(self) -> None:
+        """Recompute indicators and regimes for all stored candle series. Call after bulk seeding."""
+        for key, tf_map in self._candle_history.items():
+            for timeframe, candle_deque in tf_map.items():
+                candles = list(candle_deque)
+                if len(candles) < 5:
+                    continue
+                df = pd.DataFrame([{
+                    "timestamp": c.timestamp,
+                    "open": c.open,
+                    "high": c.high,
+                    "low": c.low,
+                    "close": c.close,
+                    "volume": c.volume,
+                } for c in candles])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+                df = df.set_index("timestamp").sort_index()
+                try:
+                    df = self._indicators.compute_all(df)
+                except Exception as exc:
+                    logger.debug("Recompute error for {}/{}: {}", key, timeframe, exc)
+                    continue
+                self._dataframes[key][timeframe] = df
+                self._update_regime(key, timeframe, df, bootstrap=True)
+        logger.info("DataManager: recomputed indicators for {} series",
+                     sum(len(tfs) for tfs in self._candle_history.values()))
+
+    def _update_regime(self, key: str, timeframe: str, df: pd.DataFrame, bootstrap: bool = False) -> None:
         if timeframe != "4h":
             return
         if key not in self._regime_detectors:
             self._regime_detectors[key] = RegimeDetector()
         try:
-            state = self._regime_detectors[key].detect(df)
+            detector = self._regime_detectors[key]
+            if bootstrap and len(df) >= 30:
+                # Bootstrap: feed last N windows to advance the state machine
+                # past the confirmation threshold (default 3 candles).
+                n_boot = min(6, len(df) - 29)  # at least 30 rows per window
+                for i in range(n_boot, 0, -1):
+                    window = df.iloc[:-i] if i > 0 else df
+                    if len(window) >= 30:
+                        detector.detect(window)
+            state = detector.detect(df)
             self._regimes[key] = state
         except Exception as exc:
             logger.debug("Regime detection error for {}/{}: {}", key, timeframe, exc)
@@ -97,6 +136,7 @@ class DataManager:
             agg = self._get_aggregator(tick.exchange, tick.symbol, timeframe)
             candle = agg.add_tick(tick)
             if candle is not None:
+                candle.timeframe = timeframe  # Normalize "900s" → "15m" etc.
                 self._store_candle(tick.exchange, tick.symbol, timeframe, candle)
                 await self.event_bus.publish("CANDLE", candle)
 

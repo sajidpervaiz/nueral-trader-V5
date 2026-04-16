@@ -6,6 +6,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Coroutine
 
+import orjson
 import websockets
 from loguru import logger
 
@@ -91,13 +92,15 @@ class CEXWebSocketManager:
         return list()
 
     async def _handle_message(self, exchange: str, raw: str) -> None:
+        receive_time_us = time.time_ns() // 1000
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
+            data = orjson.loads(raw)
+        except (orjson.JSONDecodeError, ValueError):
             return
 
         ticks = self.normalizer.normalize_tick_batch(exchange, data)
         for tick in ticks:
+            tick.receive_time_us = receive_time_us
             if not self.validator.validate(tick):
                 continue
 
