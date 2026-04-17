@@ -23,7 +23,7 @@ from loguru import logger
 from core.config import Config
 from core.event_bus import EventBus
 from execution.risk_manager import RiskManager, Position
-from execution.exchange_order_placer import ExchangeOrderPlacer
+from execution.exchange_order_placer import ExchangeOrderPlacer, ProtectiveOrderFallbackRequired
 
 
 class ReconciliationResult:
@@ -336,7 +336,11 @@ class StartupReconciler:
     async def _fetch_leverage_settings(self, result: ReconciliationResult) -> None:
         """Fetch and verify leverage/margin settings for positioned symbols."""
         cfg = self.config.get_value("exchanges", "binance") or {}
-        expected_leverage = int(cfg.get("leverage", 1))
+        risk_cfg = self.config.get_value("risk") or {}
+        leverage_value = cfg.get("leverage")
+        if leverage_value in (None, "", 0):
+            leverage_value = risk_cfg.get("default_leverage", 1)
+        expected_leverage = int(float(leverage_value))
         expected_margin = str(cfg.get("margin_mode", "isolated")).lower()
 
         for ep in result.exchange_positions:
@@ -586,6 +590,13 @@ class StartupReconciler:
                             tp_price=pos.take_profit,
                         )
                         result.actions_taken.append(f"placed SL/TP for {symbol}")
+                    except ProtectiveOrderFallbackRequired as exc:
+                        logger.warning(
+                            "Exchange-side SL unsupported for {} during reconciliation — bot-managed exits remain active: {}",
+                            symbol,
+                            exc,
+                        )
+                        result.actions_taken.append(f"local SL/TP fallback for {symbol}")
                     except Exception as exc:
                         logger.critical("FAILED to place SL for {}: {}", symbol, exc)
                         result.mismatches.append(f"sl_placement_failed: {symbol}: {exc}")

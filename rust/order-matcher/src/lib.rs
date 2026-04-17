@@ -143,7 +143,10 @@ impl PriceLevel {
     fn total_quantity(&self) -> f64 {
         self.orders.iter().map(|o| o.remaining).sum()
     }
+}
 
+fn is_self_trade(taker_user_id: Option<u64>, maker_user_id: Option<u64>) -> bool {
+    matches!((taker_user_id, maker_user_id), (Some(taker), Some(maker)) if taker == maker)
 }
 
 #[derive(Debug)]
@@ -217,12 +220,10 @@ impl ShardedOrderBook {
             if let Some(level) = book.get_mut(&key) {
                 let fill_price = key as f64 / 1_000_000.0;
 
-                if self.self_trade_prevention {
-                    if let Some(user_id) = taker.user_id {
-                        if level.orders.iter().any(|o| o.user_id == Some(user_id)) {
-                            continue;
-                        }
-                    }
+                if self.self_trade_prevention
+                    && level.orders.iter().any(|o| is_self_trade(taker.user_id, o.user_id))
+                {
+                    continue;
                 }
 
                 let mut to_remove = false;
@@ -231,7 +232,7 @@ impl ShardedOrderBook {
                         break;
                     }
 
-                    if self.self_trade_prevention && maker.user_id == taker.user_id {
+                    if self.self_trade_prevention && is_self_trade(taker.user_id, maker.user_id) {
                         continue;
                     }
 
@@ -292,7 +293,13 @@ impl ShardedOrderBook {
             &mut self.bids
         };
 
-        let keys: Vec<u64> = if taker.side == Side::Buy {
+        let keys: Vec<u64> = if taker.tif == TimeInForce::IOC {
+            if taker.side == Side::Buy {
+                book.keys().copied().collect()
+            } else {
+                book.keys().rev().copied().collect()
+            }
+        } else if taker.side == Side::Buy {
             book.keys().take_while(|&k| *k <= max_price).copied().collect()
         } else {
             book.keys().rev().take_while(|&k| *k >= min_price).copied().collect()
@@ -306,7 +313,9 @@ impl ShardedOrderBook {
             if let Some(level) = book.get_mut(&key) {
                 let fill_price = key as f64 / 1_000_000.0;
 
-                if self.self_trade_prevention && level.orders.iter().any(|o| o.user_id == taker.user_id) {
+                if self.self_trade_prevention
+                    && level.orders.iter().any(|o| is_self_trade(taker.user_id, o.user_id))
+                {
                     continue;
                 }
 
@@ -316,7 +325,7 @@ impl ShardedOrderBook {
                         break;
                     }
 
-                    if self.self_trade_prevention && maker.user_id == taker.user_id {
+                    if self.self_trade_prevention && is_self_trade(taker.user_id, maker.user_id) {
                         continue;
                     }
 

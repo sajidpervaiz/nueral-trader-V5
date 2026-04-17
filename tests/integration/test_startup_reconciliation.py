@@ -648,6 +648,29 @@ class TestLeverageMarginReconciliation:
         assert result.leverage_settings["BTC/USDT:USDT"]["leverage"] == 10
 
     @pytest.mark.asyncio
+    async def test_leverage_uses_risk_default_when_exchange_setting_missing(self) -> None:
+        """If exchanges.binance.leverage is absent, use risk.default_leverage."""
+        config = _make_config({
+            "risk": {"default_leverage": 5},
+            "exchanges": {"binance": {"leverage": None}},
+        })
+        bus = EventBus()
+        rm = _make_risk_manager(config, bus)
+
+        client = _make_exchange_client(
+            positions=[_make_exchange_position(leverage=3)],
+            orders=[
+                _make_exchange_order("sl-1", "BTC/USDT:USDT", "stop_market", "sell", 0.5, 49000),
+            ],
+        )
+
+        reconciler = StartupReconciler(config, bus, rm, client)
+        result = await reconciler.reconcile()
+
+        client.set_leverage.assert_called_once_with(5, "BTC/USDT:USDT")
+        assert result.leverage_settings["BTC/USDT:USDT"]["expected_leverage"] == 5
+
+    @pytest.mark.asyncio
     async def test_margin_mode_mismatch_triggers_safe_mode(self) -> None:
         """Config says isolated, exchange says cross → mismatch (can't auto-correct)."""
         config = _make_config()

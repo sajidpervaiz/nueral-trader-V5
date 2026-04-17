@@ -72,7 +72,7 @@ impl Default for RiskLimits {
     fn default() -> Self {
         Self {
             max_position_value: 1_000_000.0,
-            max_order_size: 10_000.0,
+            max_order_size: 1_000_000.0,
             max_orders_per_sec: 100,
             max_concentration: 0.3,
             leverage_limit: 10.0,
@@ -118,6 +118,7 @@ pub struct RiskEngine {
     limits: RiskLimits,
     positions: dashmap::DashMap<String, Position>,
     order_counts: dashmap::DashMap<String, CachePadded<AtomicU64>>,
+    order_windows: dashmap::DashMap<String, CachePadded<AtomicU64>>,
     order_books: dashmap::DashMap<String, LockFreeOrderBook>,
     total_exposure: CachePadded<AtomicF64>,
     margin_available: CachePadded<AtomicF64>,
@@ -130,6 +131,7 @@ impl RiskEngine {
             limits,
             positions: dashmap::DashMap::new(),
             order_counts: dashmap::DashMap::new(),
+            order_windows: dashmap::DashMap::new(),
             order_books: dashmap::DashMap::new(),
             total_exposure: CachePadded::new(AtomicF64::new(0.0)),
             margin_available: CachePadded::new(AtomicF64::new(account_balance)),
@@ -140,7 +142,7 @@ impl RiskEngine {
     pub fn pre_trade_check(&self, symbol: &str, side: Side, quantity: f64, price: f64) -> Result<()> {
         let order_value = quantity * price;
 
-        if order_value > self.limits.max_order_size * price {
+        if order_value > self.limits.max_order_size {
             return Err(RiskError::OrderSizeExceeded {
                 size: quantity,
                 max: self.limits.max_order_size,
@@ -157,9 +159,21 @@ impl RiskEngine {
             });
         }
 
+        let now_sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let counter = self.order_counts.entry(symbol.to_string()).or_insert_with(|| {
             CachePadded::new(AtomicU64::new(0))
         });
+        let window = self.order_windows.entry(symbol.to_string()).or_insert_with(|| {
+            CachePadded::new(AtomicU64::new(now_sec))
+        });
+        let last_window = window.value().load(Ordering::Relaxed);
+        if last_window != now_sec {
+            window.value().store(now_sec, Ordering::Relaxed);
+            counter.value().store(0, Ordering::Relaxed);
+        }
         let count = counter.value().fetch_add(1, Ordering::Relaxed);
         if count >= self.limits.max_orders_per_sec {
             return Err(RiskError::VelocityLimitExceeded {
@@ -316,5 +330,23 @@ mod tests {
         let engine = RiskEngine::new(RiskLimits::default(), 100_000.0);
         let result = engine.pre_trade_check("BTC/USDT", Side::Buy, 2.0, 50_000.0);
         assert!(matches!(result, Err(RiskError::ConcentrationRisk { .. })));
+    }
+
+    #[test]
+    fn test_velocity_limit_resets_after_window() {
+        let mut limits = RiskLimits::default();
+        limits.max_orders_per_sec = 2;
+        let engine = RiskEngine::new(limits, 1_000_000.0);
+
+        assert!(engine.pre_trade_check("BTC/USDT", Side::Buy, 0.1, 50_000.0).is_ok());
+        assert!(engine.pre_trade_check("BTC/USDT", Side::Buy, 0.1, 50_000.0).is_ok());
+
+        let blocked = engine.pre_trade_check("BTC/USDT", Side::Buy, 0.1, 50_000.0);
+        assert!(matches!(blocked, Err(RiskError::VelocityLimitExceeded { .. })));
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let recovered = engine.pre_trade_check("BTC/USDT", Side::Buy, 0.1, 50_000.0);
+        assert!(recovered.is_ok());
     }
 }

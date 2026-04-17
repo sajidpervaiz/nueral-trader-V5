@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import os
 import re
 import time
 from collections import defaultdict, deque
@@ -721,16 +722,29 @@ def build_app(
 
     # ── /api/market — watchlist / market data ─────────────────────────────
     @app.get("/api/market")
-    async def api_market(per_page: int = Query(20)) -> dict[str, Any]:
+    async def api_market(per_page: int = Query(100, ge=1, le=250)) -> dict[str, Any]:
         import time as _time
         import aiohttp
 
         now = _time.time()
-        # Return cache if fresh (60s TTL)
-        if _market_cache["coins"] and (now - _market_cache["ts"]) < 60:
-            return {"coins": _market_cache["coins"][:min(per_page, 50)]}
+        requested = min(per_page, 250)
+        cached_coins = _market_cache.get("coins") or []
+
+        # Return cache only if it is both fresh and large enough for this request.
+        if cached_coins and (now - _market_cache["ts"]) < 60 and len(cached_coins) >= requested:
+            return {"coins": cached_coins[:requested]}
 
         coins: list[dict[str, Any]] = []
+        seen_symbols: set[str] = set()
+
+        def _append_coin(coin: dict[str, Any]) -> None:
+            symbol = str(coin.get("symbol", "")).upper()
+            if not symbol or symbol in seen_symbols:
+                return
+            coin["symbol"] = symbol
+            seen_symbols.add(symbol)
+            coins.append(coin)
+
         # Primary: CoinGecko
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
@@ -739,7 +753,7 @@ def build_app(
                     params={
                         "vs_currency": "usd",
                         "order": "market_cap_desc",
-                        "per_page": min(per_page, 50),
+                        "per_page": requested,
                         "page": 1,
                         "sparkline": "false",
                     },
@@ -747,7 +761,7 @@ def build_app(
                     if resp.status == 200:
                         data = await resp.json(content_type=None)
                         for c in data:
-                            coins.append({
+                            _append_coin({
                                 "symbol": str(c.get("symbol", "")).upper(),
                                 "name": c.get("name", ""),
                                 "price": float(c.get("current_price") or 0),
@@ -760,27 +774,23 @@ def build_app(
         except Exception as exc:
             logger.debug("CoinGecko market fetch error: {}", exc)
 
-        # Fallback: Binance 24h ticker for top futures symbols
-        if not coins:
+        # Fallback or backfill: Binance 24h ticker for top futures symbols
+        if len(coins) < requested:
             try:
-                top_symbols = [
-                    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-                    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT",
-                    "LINKUSDT", "LTCUSDT", "UNIUSDT", "ATOMUSDT", "NEARUSDT",
-                    "APTUSDT", "ARBUSDT", "OPUSDT", "SUIUSDT", "PEPEUSDT",
-                ]
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
                     async with sess.get(
                         "https://fapi.binance.com/fapi/v1/ticker/24hr"
                     ) as resp:
                         if resp.status == 200:
                             tickers = await resp.json(content_type=None)
-                            ticker_map = {t["symbol"]: t for t in tickers if isinstance(t, dict)}
-                            for sym in top_symbols[:min(per_page, 50)]:
-                                t = ticker_map.get(sym)
-                                if not t:
-                                    continue
-                                coins.append({
+                            sorted_tickers = sorted(
+                                [t for t in tickers if isinstance(t, dict) and str(t.get("symbol", "")).endswith("USDT")],
+                                key=lambda t: float(t.get("quoteVolume") or 0),
+                                reverse=True,
+                            )
+                            for t in sorted_tickers:
+                                sym = str(t.get("symbol", ""))
+                                _append_coin({
                                     "symbol": sym.replace("USDT", ""),
                                     "name": sym.replace("USDT", ""),
                                     "price": float(t.get("lastPrice") or 0),
@@ -790,17 +800,19 @@ def build_app(
                                     "low_24h": float(t.get("lowPrice") or 0),
                                     "market_cap": 0,
                                 })
+                                if len(coins) >= requested:
+                                    break
             except Exception as exc:
                 logger.debug("Binance ticker fallback error: {}", exc)
 
         if coins:
             _market_cache["coins"] = coins
             _market_cache["ts"] = now
-        elif _market_cache["coins"]:
+        elif cached_coins:
             # Return stale cache rather than empty
-            return {"coins": _market_cache["coins"][:min(per_page, 50)]}
+            return {"coins": cached_coins[:requested]}
 
-        return {"coins": coins}
+        return {"coins": coins[:requested]}
 
     # ── /api/exchange/positions — fetch REAL exchange positions ────────────
     @app.get("/api/exchange/positions")
@@ -1912,11 +1924,32 @@ def build_app(
         enabled = False
         if signal_generator is not None and hasattr(signal_generator, "auto_trading_enabled"):
             enabled = signal_generator.auto_trading_enabled
+
+        exchanges_cfg = config.get_value("exchanges") or {}
+        primary_exchange = "binance"
+        primary_cfg: dict[str, Any] = {}
+        if isinstance(exchanges_cfg, dict):
+            for name, ex_cfg in exchanges_cfg.items():
+                if isinstance(ex_cfg, dict) and ex_cfg.get("enabled"):
+                    primary_exchange = str(name)
+                    primary_cfg = ex_cfg
+                    break
+            if not primary_cfg:
+                maybe_cfg = exchanges_cfg.get(primary_exchange, {})
+                if isinstance(maybe_cfg, dict):
+                    primary_cfg = maybe_cfg
+
+        testnet = bool(primary_cfg.get("testnet", False)) if not config.paper_mode else False
+        label = "PAPER" if config.paper_mode else f"{primary_exchange.upper()} {'DEMO' if testnet else 'LIVE'}"
+
         return {
             "enabled": enabled,
             "mode": "paper" if config.paper_mode else "live",
             "auto_trading_enabled": enabled,
             "paper_mode": config.paper_mode,
+            "exchange": primary_exchange,
+            "testnet": testnet,
+            "label": label,
         }
 
     # ── /api/mode/toggle — switch between paper and live trading ────────
@@ -1926,16 +1959,52 @@ def build_app(
         requested_mode = str(body.get("mode", "")).lower()
         if requested_mode not in ("paper", "live"):
             return {"success": False, "error": "mode must be 'paper' or 'live'"}
+
+        exchanges_cfg = config.get_value("exchanges") or {}
+        enabled_venues = [
+            (str(name), ex_cfg)
+            for name, ex_cfg in exchanges_cfg.items()
+            if isinstance(ex_cfg, dict) and ex_cfg.get("enabled", False)
+        ]
+
         if requested_mode == "live":
-            # P0: Block runtime switch to live — requires full restart with
-            # LIVE_TRADING_CONFIRMED=true for startup validation, clock sync,
-            # balance checks, and reconciliation.
+            if not enabled_venues:
+                return {"success": False, "error": "Enable a demo exchange before switching to live mode."}
+            for venue, ex_cfg in enabled_venues:
+                api_key = str(ex_cfg.get("api_key", "") or "").strip()
+                api_secret = str(ex_cfg.get("api_secret", "") or "").strip()
+                if not api_key or api_key.startswith("${") or not api_secret or api_secret.startswith("${"):
+                    return {"success": False, "error": f"Add the {venue} demo API key and secret first."}
+                if not bool(ex_cfg.get("testnet", False)):
+                    return {"success": False, "error": "Runtime switch is only supported for demo/testnet venues."}
+
+            config.paper_mode = False
+            os.environ["LIVE_TRADING_CONFIRMED"] = "true"
+            try:
+                await _stop_paper_feed_main()
+            except Exception as exc:
+                logger.warning("Paper feed stop error during live switch: {}", exc)
+            try:
+                config.persist_runtime_overrides()
+            except Exception as exc:
+                logger.warning("Failed to persist live mode change: {}", exc)
+            logger.info("Trading mode switched to: live demo")
             return {
-                "success": False,
-                "error": "Cannot switch to live mode at runtime. "
-                         "Restart with LIVE_TRADING_CONFIRMED=true.",
+                "success": True,
+                "mode": "live",
+                "paper_mode": config.paper_mode,
             }
+
         config.paper_mode = True
+        try:
+            if signal_generator is not None and getattr(signal_generator, "auto_trading_enabled", False):
+                await _start_paper_feed_main(event_bus)
+        except Exception as exc:
+            logger.warning("Paper feed start error during paper switch: {}", exc)
+        try:
+            config.persist_runtime_overrides()
+        except Exception as exc:
+            logger.warning("Failed to persist paper mode change: {}", exc)
         logger.info("Trading mode switched to: paper")
         return {
             "success": True,
@@ -2003,25 +2072,42 @@ def build_app(
         dex_cfg = config.get_value("dex") or {}
         notifications_cfg = config.get_value("notifications", "telegram") or {}
         risk_cfg = config.get_value("risk") or {}
+        ai_cfg = config.get_value("ai_agent") or {}
         auto_enabled = False
         if signal_generator and hasattr(signal_generator, "auto_trading_enabled"):
             auto_enabled = signal_generator.auto_trading_enabled
+
+        agent_status: dict[str, Any] = {}
+        if signal_generator and hasattr(signal_generator, "get_agent_status"):
+            try:
+                agent_status = signal_generator.get_agent_status() or {}
+            except Exception:
+                agent_status = {}
 
         # Build connection registry
         registry = []
         for name in ["binance", "bybit", "okx", "kraken"]:
             ex = exchanges.get(name, {})
-            has_key = bool(ex.get("api_key"))
+            has_creds = bool(ex.get("api_key")) and bool(ex.get("api_secret"))
             registry.append({
                 "exchange": name,
                 "venue_type": "CEX",
-                "connected": has_key and ex.get("enabled", False),
-                "status": "connected" if (has_key and ex.get("enabled", False)) else "disconnected",
+                "connected": has_creds and ex.get("enabled", False),
+                "status": "connected" if (has_creds and ex.get("enabled", False)) else "disconnected",
             })
 
         def _mask(val: str) -> str:
             s = str(val or "")
             return "****" if s else ""
+
+        def _get_ai_key(cfg: dict[str, Any]) -> str:
+            provider = str(cfg.get("provider", "local") or "local").strip().lower()
+            env_key = {
+                "claude": "ANTHROPIC_API_KEY",
+                "openai": "OPENAI_API_KEY",
+                "gemini": "GEMINI_API_KEY",
+            }.get(provider, "")
+            return str(cfg.get("api_key", os.getenv(env_key, ""))) if env_key else str(cfg.get("api_key", ""))
 
         binance = exchanges.get("binance", {})
         bybit = exchanges.get("bybit", {})
@@ -2057,6 +2143,13 @@ def build_app(
             "auto_take_profit_enabled": bool(risk_cfg.get("take_profit_pct")),
             "trailing_stops_enabled": bool(risk_cfg.get("trailing_stop", {}).get("enabled")),
             "atr_position_sizing_enabled": bool(risk_cfg.get("atr_stop", {}).get("enabled")),
+            "ai_agent_enabled": bool(agent_status.get("enabled", ai_cfg.get("enabled", True))),
+            "ai_agent_provider": str(agent_status.get("provider", ai_cfg.get("provider", "local"))),
+            "ai_agent_model": str(agent_status.get("model", ai_cfg.get("model", "claude-3-5-sonnet-latest"))),
+            "ai_agent_api_key": _mask(_get_ai_key(ai_cfg)),
+            "ai_agent_timeout_seconds": float(agent_status.get("timeout_seconds", ai_cfg.get("timeout_seconds", 8.0)) or 8.0),
+            "ai_agent_remote_weight": float(ai_cfg.get("remote_weight", 0.35) or 0.35),
+            "ai_agent_remote_enabled": bool(agent_status.get("remote_enabled", False)),
             "connection_registry": registry,
         }
 
@@ -2067,6 +2160,7 @@ def build_app(
 
         # ── Apply CEX API keys to runtime config ──
         exchanges = config._data.setdefault("exchanges", {})
+        changed_venues: set[str] = set()
         for venue, key_field, sec_field in [
             ("binance", "binance_api_key", "binance_secret"),
             ("bybit", "bybit_api_key", "bybit_secret"),
@@ -2079,12 +2173,38 @@ def build_app(
             # Only overwrite if user provided a real value (not masked ****)
             if key_val and key_val != "****":
                 venue_cfg["api_key"] = key_val
+                os.environ[f"{venue.upper()}_API_KEY"] = str(key_val)
+                changed_venues.add(venue)
             if sec_val and sec_val != "****":
                 venue_cfg["api_secret"] = sec_val
+                os.environ[f"{venue.upper()}_API_SECRET"] = str(sec_val)
+                changed_venues.add(venue)
             # Venue enable/disable
             enabled_key = f"{venue}_enabled"
             if enabled_key in body:
                 venue_cfg["enabled"] = bool(body[enabled_key])
+                changed_venues.add(venue)
+
+        if executors:
+            executor_map = {getattr(executor, "exchange_id", ""): executor for executor in executors}
+            for venue in changed_venues:
+                executor = executor_map.get(venue)
+                if executor is None:
+                    continue
+                client = getattr(executor, "_client", None)
+                if client is not None:
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
+                executor._client = None
+                executor._order_placer = None
+                venue_cfg = exchanges.get(venue, {})
+                if venue_cfg.get("enabled", False):
+                    try:
+                        await executor._init_client()
+                    except Exception as exc:
+                        logger.warning("{} client refresh failed after settings update: {}", venue, exc)
 
         # ── DEX config ──
         dex_cfg = config._data.setdefault("dex", {})
@@ -2104,24 +2224,68 @@ def build_app(
         if tg_chat:
             notif["chat_id"] = tg_chat
 
+        # ── AI agent config ──
+        ai_cfg = config._data.setdefault("ai_agent", {})
+        ai_cfg["enabled"] = bool(body.get("ai_agent_enabled", ai_cfg.get("enabled", True)))
+        ai_cfg["provider"] = str(body.get("ai_agent_provider", ai_cfg.get("provider", "local")) or "local")
+        default_model = "gpt-4o-mini" if ai_cfg["provider"] == "openai" else "claude-3-5-sonnet-latest"
+        ai_cfg["model"] = str(body.get("ai_agent_model", ai_cfg.get("model", default_model)) or default_model)
+        key_val = body.get("ai_agent_api_key", "")
+        if key_val and key_val != "****":
+            ai_cfg["api_key"] = key_val
+            env_key = {
+                "claude": "ANTHROPIC_API_KEY",
+                "openai": "OPENAI_API_KEY",
+                "gemini": "GEMINI_API_KEY",
+            }.get(str(ai_cfg["provider"]).strip().lower(), "")
+            if env_key:
+                os.environ[env_key] = str(key_val)
+        ai_cfg["timeout_seconds"] = float(body.get("ai_agent_timeout_seconds", ai_cfg.get("timeout_seconds", 8.0)) or 8.0)
+        ai_cfg["remote_weight"] = float(body.get("ai_agent_remote_weight", ai_cfg.get("remote_weight", 0.35)) or 0.35)
+
         # ── Auto-trading toggle ──
-        if signal_generator and hasattr(signal_generator, "set_auto_trading"):
-            signal_generator.set_auto_trading(bool(body.get("auto_trading_enabled", False)))
+        if signal_generator and hasattr(signal_generator, "set_auto_trading") and "auto_trading_enabled" in body:
+            signal_generator.set_auto_trading(bool(body.get("auto_trading_enabled")))
+        if signal_generator and hasattr(signal_generator, "configure_agent"):
+            signal_generator.configure_agent(payload={
+                "enabled": ai_cfg.get("enabled", True),
+                "provider": ai_cfg.get("provider", "local"),
+                "model": ai_cfg.get("model", "claude-3-5-sonnet-latest"),
+                "api_key": ai_cfg.get("api_key", ""),
+                "timeout_seconds": ai_cfg.get("timeout_seconds", 8.0),
+                "remote_weight": ai_cfg.get("remote_weight", 0.35),
+            })
 
         # ── Build updated connection registry ──
         registry = []
         for name in ["binance", "bybit", "okx", "kraken"]:
             ex = exchanges.get(name, {})
-            has_key = bool(ex.get("api_key"))
+            has_creds = bool(ex.get("api_key")) and bool(ex.get("api_secret"))
             registry.append({
                 "exchange": name,
                 "venue_type": "CEX",
-                "connected": has_key and ex.get("enabled", False),
-                "status": "connected" if (has_key and ex.get("enabled", False)) else "disconnected",
+                "connected": has_creds and ex.get("enabled", False),
+                "status": "connected" if (has_creds and ex.get("enabled", False)) else "disconnected",
             })
 
+        try:
+            config.persist_runtime_overrides()
+        except Exception as exc:
+            logger.warning("Failed to persist runtime settings: {}", exc)
+
         logger.info("Settings saved to runtime config")
-        return {"success": True, "message": "Settings applied to runtime", "connection_registry": registry}
+        return {
+            "success": True,
+            "message": "Settings applied to runtime",
+            "connection_registry": registry,
+            "ai_agent": {
+                "enabled": ai_cfg.get("enabled", True),
+                "provider": ai_cfg.get("provider", "local"),
+                "model": ai_cfg.get("model", "claude-3-5-sonnet-latest"),
+                "remote_weight": ai_cfg.get("remote_weight", 0.35),
+                "api_configured": bool(ai_cfg.get("api_key", "")),
+            },
+        }
 
     # ── /api/config/test — test exchange connections ──────────────────────
     @app.post("/api/config/test")
@@ -2133,17 +2297,17 @@ def build_app(
         for name in ["binance", "bybit", "okx", "kraken"]:
             ex = exchanges_cfg.get(name, {})
             enabled[name] = ex.get("enabled", False)
-            cex_creds[name] = bool(ex.get("api_key"))
+            cex_creds[name] = bool(ex.get("api_key")) and bool(ex.get("api_secret"))
 
         registry = []
         for name in ["binance", "bybit", "okx", "kraken"]:
             ex = exchanges_cfg.get(name, {})
-            has_key = bool(ex.get("api_key"))
+            has_creds = bool(ex.get("api_key")) and bool(ex.get("api_secret"))
             registry.append({
                 "exchange": name,
                 "venue_type": "CEX",
-                "connected": has_key and ex.get("enabled", False),
-                "status": "connected" if (has_key and ex.get("enabled", False)) else "disconnected",
+                "connected": has_creds and ex.get("enabled", False),
+                "status": "connected" if (has_creds and ex.get("enabled", False)) else "disconnected",
             })
 
         return {
@@ -2182,7 +2346,7 @@ def build_app(
         news = (await api_news())
         auto = (await api_auto_status())
         candles = (await api_candles(symbol=symbol, timeframe=timeframe))
-        market = (await api_market(per_page=20))
+        market = (await api_market(per_page=250))
         dex = (await api_dex_pools())
         recon = (await api_reconciliation_status())
         ustream = (await api_user_stream_status())
@@ -2256,13 +2420,56 @@ def build_app(
             {"id": 8, "name": "Signal Quality", "description": "0-100 quality score gate (min 65)"},
             {"id": 9, "name": "Risk Gate", "description": "Position sizing, DD phase, circuit breaker"},
         ]
+        def _score_to_status(score: float | int | None) -> str:
+            try:
+                numeric = float(score if score is not None else 0)
+            except (TypeError, ValueError):
+                return "UNKNOWN"
+            if numeric >= 70:
+                return "PASS"
+            if numeric >= 40:
+                return "WEAK"
+            return "FAIL"
+
         # Populate layer status from signal_generator if available
         if signal_generator is not None:
-            last = getattr(signal_generator, '_last_layer_status', {})
+            last = getattr(signal_generator, '_last_layer_status', {}) or {}
+            quality = getattr(signal_generator, '_last_quality_breakdown', {}) or {}
+            components = quality.get("components", {}) or {}
+            fallback_scores = {
+                "session_filter": 100 if not (quality.get("rejected_at") == "L1_Session") else 0,
+                "htf_trend": components.get("htf_alignment", components.get("htf_trend", 0)),
+                "technical_confluence": components.get("technical_confluence", 0),
+                "smart_money_concepts": components.get("smc_confluence", 0),
+                "volume_flow": components.get("volume_flow", 0),
+                "regime_detection": components.get("regime", 0),
+                "ml_ensemble": components.get("ml_confidence", 0),
+                "signal_quality": quality.get("total", 0),
+            }
             for layer in layers:
                 key = layer["name"].lower().replace(" ", "_")
-                layer["status"] = last.get(key, "unknown")
-                layer["detail"] = last.get(f"{key}_detail", "")
+                raw_status = str(last.get(key, "UNKNOWN") or "UNKNOWN").upper()
+                detail = str(last.get(f"{key}_detail", "") or "")
+
+                if raw_status == "UNKNOWN" and key in fallback_scores:
+                    raw_status = _score_to_status(fallback_scores.get(key))
+                    if not detail:
+                        detail = f"score={fallback_scores.get(key, 0)}"
+
+                if key == "risk_gate" and raw_status == "UNKNOWN":
+                    snap = risk_manager.get_risk_snapshot() if risk_manager is not None else {}
+                    blocked = bool(snap.get("kill_switch_active", False) or snap.get("circuit_breaker_tripped", False))
+                    raw_status = "FAIL" if blocked else "PASS"
+                    if not detail:
+                        detail = "risk controls ready" if not blocked else "risk controls blocking new trades"
+
+                if raw_status == "BLOCKED":
+                    raw_status = "FAIL"
+                if raw_status == "UNKNOWN" and "score=0" in detail:
+                    raw_status = "FAIL"
+
+                layer["status"] = raw_status
+                layer["detail"] = detail or "awaiting evaluation"
         return {"layers": layers, "total": 9}
 
     # ── §5 Spec: Session & killzone status ────────────────────────────────
@@ -2300,6 +2507,101 @@ def build_app(
             "ict_killzones": ict_killzones,
         }
 
+    # ── ML status & training ───────────────────────────────────────────────
+    @app.get("/api/ml/status")
+    async def api_ml_status() -> dict[str, Any]:
+        """Return ML model load/training status for the live signal engine."""
+        if signal_generator is not None and hasattr(signal_generator, "get_ml_status"):
+            return signal_generator.get_ml_status()
+        return {
+            "loaded": False,
+            "model_path": "ml_model.pkl",
+            "model_type": "lightgbm",
+            "feature_count": 0,
+            "last_train_ts": 0.0,
+            "training": {"trained": False, "reason": "signal_generator_unavailable"},
+        }
+
+    @app.post("/api/ml/train")
+    async def api_ml_train() -> dict[str, Any]:
+        """Trigger immediate ML retraining from the currently cached historical data."""
+        if signal_generator is not None and hasattr(signal_generator, "retrain_model_now"):
+            return await signal_generator.retrain_model_now()
+        return {"trained": False, "reason": "signal_generator_unavailable"}
+
+    @app.get("/api/agent/status")
+    async def api_agent_status() -> dict[str, Any]:
+        """Return the attached AI agent mode and recent decision state."""
+        if signal_generator is not None and hasattr(signal_generator, "get_agent_status"):
+            return signal_generator.get_agent_status()
+        return {"attached": False, "enabled": False, "mode": "off"}
+
+    @app.post("/api/agent/config")
+    async def api_agent_config(request: Request) -> dict[str, Any]:
+        """Update AI agent runtime settings."""
+        body = await request.json()
+        if signal_generator is not None and hasattr(signal_generator, "configure_agent"):
+            return signal_generator.configure_agent(body)
+        return {"attached": False, "enabled": False, "mode": "off"}
+
+    @app.post("/api/agent/chat")
+    async def api_agent_chat(request: Request) -> dict[str, Any]:
+        """Chat with the trading agent and trigger safe bot interactions."""
+        body = await request.json()
+        message = str(body.get("message", "") or "").strip()
+        if not message:
+            return {"success": False, "reply": "Please enter a message."}
+        if signal_generator is not None and hasattr(signal_generator, "chat_with_agent"):
+            result = signal_generator.chat_with_agent(message)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result
+        return {"success": True, "provider": "system", "reply": "Agent is unavailable right now."}
+
+    @app.get("/api/strategy/suggest")
+    async def api_strategy_suggest(symbol: str = Query("BTC/USDT:USDT")) -> dict[str, Any]:
+        """Return a live strategy suggestion based on current pipeline state."""
+        if signal_generator is not None and hasattr(signal_generator, "get_strategy_suggestion"):
+            return signal_generator.get_strategy_suggestion(symbol)
+        return {
+            "symbol": symbol,
+            "action": "wait",
+            "strategy": "unavailable",
+            "reason": "signal_generator_unavailable",
+            "suggestions": [],
+        }
+
+    @app.post("/api/quick-action")
+    async def api_quick_action(request: Request) -> dict[str, Any]:
+        """Execute a safe predefined bot action from the dashboard."""
+        body = await request.json()
+        action = str(body.get("action", "") or "").strip().lower()
+        symbol = str(body.get("symbol", "BTC/USDT:USDT") or "BTC/USDT:USDT")
+
+        if signal_generator is None:
+            return {"success": False, "action": action, "reply": "signal_generator_unavailable"}
+
+        if action == "pause_auto" and hasattr(signal_generator, "set_auto_trading"):
+            signal_generator.set_auto_trading(False)
+            return {"success": True, "action": action, "reply": "Auto trading paused."}
+        if action == "resume_auto" and hasattr(signal_generator, "set_auto_trading"):
+            signal_generator.set_auto_trading(True)
+            return {"success": True, "action": action, "reply": "Auto trading resumed."}
+        if action == "train_model" and hasattr(signal_generator, "retrain_model_now"):
+            result = await signal_generator.retrain_model_now()
+            return {"success": bool(result.get("trained", False)), "action": action, "reply": "Model retraining completed." if result.get("trained", False) else f"Training did not complete: {result.get('reason', 'unknown')}", "training": result}
+        if action == "strategy_suggest" and hasattr(signal_generator, "get_strategy_suggestion"):
+            result = signal_generator.get_strategy_suggestion(symbol)
+            return {"success": True, "action": action, "reply": result.get("reason", "Strategy suggestion ready."), "suggestion": result}
+        if action in {"status", "risk"} and hasattr(signal_generator, "chat_with_agent"):
+            result = signal_generator.chat_with_agent(action)
+            if asyncio.iscoroutine(result):
+                result = await result
+            result["action"] = action
+            return result
+
+        return {"success": False, "action": action, "reply": "Unknown quick action."}
+
     # ── §6 Spec: Quality score breakdown ──────────────────────────────────
     @app.get("/api/quality")
     async def api_quality() -> dict[str, Any]:
@@ -2307,7 +2609,40 @@ def build_app(
         if signal_generator is not None:
             last_q = getattr(signal_generator, '_last_quality_breakdown', None)
             if last_q:
-                return last_q
+                payload = dict(last_q)
+                components = dict(payload.get("components") or {})
+                total = int(payload.get("total", 0) or 0)
+                rejected_at = str(payload.get("rejected_at", "") or "")
+                if total <= 0 and components:
+                    stage_keys = [
+                        "htf_trend",
+                        "technical_confluence",
+                        "smc_confluence",
+                        "volume_flow",
+                        "regime",
+                        "ml_confidence",
+                        "liquidity_depth",
+                    ]
+                    cutoff_map = {
+                        "L2": 1,
+                        "L3": 2,
+                        "L4": 3,
+                        "L5": 4,
+                        "L6": 5,
+                        "L7": 6,
+                        "L8": 7,
+                    }
+                    cutoff = next((v for k, v in cutoff_map.items() if rejected_at.startswith(k)), len(stage_keys))
+                    selected = stage_keys[:cutoff]
+                    values = [max(0.0, float(components.get(key, 0) or 0)) for key in selected]
+                    if values and (rejected_at or any(v > 0 for v in values)):
+                        payload["total"] = int(round(sum(values) / len(values)))
+                        payload["partial"] = True
+                if int(payload.get("total", 0) or 0) <= 0 and hasattr(signal_generator, "get_quality_preview"):
+                    preview = signal_generator.get_quality_preview()
+                    if isinstance(preview, dict) and (int(preview.get("total", 0) or 0) > 0 or preview.get("reason")):
+                        payload = {**payload, **preview}
+                return payload
         return {
             "total": 0,
             "components": {

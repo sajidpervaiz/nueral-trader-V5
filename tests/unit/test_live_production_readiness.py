@@ -1203,6 +1203,52 @@ class TestAuditFixes:
         assert "sl_placement_failed" in call_args[0][0]
 
     @pytest.mark.asyncio
+    async def test_testnet_stop_order_fallback_does_not_trip_breaker(self):
+        """Known testnet STOP_MARKET limitations should fall back to bot-managed exits."""
+        from execution.cex_executor import CEXExecutor
+        from execution.exchange_order_placer import ExchangeOrderPlacer, ProtectiveOrderFallbackRequired
+        from engine.signal_generator import TradingSignal
+
+        config = Config.get(path=str(CONFIG_PATH))
+        event_bus = EventBus()
+        risk_mgr = MagicMock()
+        risk_mgr._circuit_breaker = MagicMock()
+        risk_mgr._circuit_breaker._tripped = False
+
+        mock_pos = MagicMock()
+        mock_pos.stop_loss = 49000.0
+        mock_pos.take_profit = 52000.0
+        risk_mgr.open_position = AsyncMock(return_value=mock_pos)
+
+        executor = CEXExecutor(config, event_bus, risk_mgr, "binance")
+        mock_client = AsyncMock()
+        mock_client.create_limit_order.return_value = {
+            "id": "entry_001", "average": 50000.0, "filled": 0.01, "status": "filled",
+        }
+        mock_client.fetch_order.return_value = {
+            "id": "entry_001", "average": 50000.0, "filled": 0.01, "status": "filled",
+        }
+        executor._client = mock_client
+
+        mock_placer = AsyncMock(spec=ExchangeOrderPlacer)
+        mock_placer.place_protective_orders = AsyncMock(
+            side_effect=ProtectiveOrderFallbackRequired("binance algo orders unavailable on testnet")
+        )
+        executor._order_placer = mock_placer
+
+        signal = MagicMock(spec=TradingSignal)
+        signal.symbol = "BTC/USDT:USDT"
+        signal.exchange = "binance"
+        signal.direction = "long"
+        signal.is_long = True
+        signal.price = 50000.0
+        signal.metadata = {}
+
+        result = await executor._live_execute(signal, 500.0)
+        assert result is not None
+        risk_mgr._circuit_breaker.trip.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_reconciliation_reads_sl_tp_from_exchange_orders(self):
         """Reconciliation should read SL/TP prices from existing exchange orders."""
         from execution.reconciliation import StartupReconciler

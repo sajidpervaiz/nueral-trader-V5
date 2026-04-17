@@ -299,7 +299,7 @@ export class UniswapV3Executor {
         };
       }
 
-      return await this.executeSwap({
+      const quote: DEXQuote = {
         dex: "uniswap_v3",
         tokenIn: path[0],
         tokenOut: path[path.length - 1],
@@ -310,7 +310,10 @@ export class UniswapV3Executor {
         route: path,
         timestamp: Math.floor(Date.now() / 1000),
         validUntil: Math.floor(Date.now() / 1000) + 30,
-      });
+      };
+
+      const result = await this.executeSwap(quote);
+      return result ? quote : null;
     } catch (err) {
       logger.error(`Multi-hop swap failed for path ${path.join(' -> ')}:`, err);
       return null;

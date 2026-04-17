@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use rayon::prelude::*;
 
@@ -103,64 +102,49 @@ pub struct TickBatch {
 }
 
 pub struct RingBuffer {
-    buffer: Vec<RawTick>,
-    head: CachePadded<std::sync::atomic::AtomicUsize>,
-    tail: CachePadded<std::sync::atomic::AtomicUsize>,
+    buffer: Vec<Option<RawTick>>,
+    head: usize,
+    tail: usize,
+    len: usize,
     capacity: usize,
 }
 
 impl RingBuffer {
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
-            buffer: vec![RawTick {
-                exchange: String::new(),
-                symbol: String::new(),
-                timestamp_ns: 0,
-                price: 0.0,
-                volume: 0.0,
-                side: String::new(),
-                trade_id: String::new(),
-            }; capacity],
-            head: CachePadded::new(std::sync::atomic::AtomicUsize::new(0)),
-            tail: CachePadded::new(std::sync::atomic::AtomicUsize::new(0)),
+            buffer: vec![None; capacity],
+            head: 0,
+            tail: 0,
+            len: 0,
             capacity,
         }
     }
 
     pub fn push(&mut self, tick: RawTick) -> bool {
-        let head = self.head.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tail = self.tail.load(std::sync::atomic::Ordering::Acquire);
-
-        if head - tail >= self.capacity {
-            self.head.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if self.len >= self.capacity {
             return false;
         }
 
-        unsafe {
-            let ptr = self.buffer.as_mut_ptr().add(head % self.capacity);
-            std::ptr::write(ptr, tick);
-        }
+        self.buffer[self.head] = Some(tick);
+        self.head = (self.head + 1) % self.capacity;
+        self.len += 1;
         true
     }
 
-    pub fn drain(&self) -> Vec<RawTick> {
-        let tail = self.tail.load(std::sync::atomic::Ordering::Acquire);
-        let head = self.head.fetch_and(!0, std::sync::atomic::Ordering::Acquire);
-
-        let len = head - tail;
-        if len == 0 {
+    pub fn drain(&mut self) -> Vec<RawTick> {
+        if self.len == 0 {
             return Vec::new();
         }
 
-        let mut result = Vec::with_capacity(len);
-        for i in 0..len {
-            unsafe {
-                let ptr = self.buffer.as_ptr().add((tail + i) % self.capacity);
-                result.push(std::ptr::read(ptr));
+        let mut result = Vec::with_capacity(self.len);
+        while self.len > 0 {
+            if let Some(tick) = self.buffer[self.tail].take() {
+                result.push(tick);
             }
+            self.tail = (self.tail + 1) % self.capacity;
+            self.len -= 1;
         }
-
-        self.tail.store(head, std::sync::atomic::Ordering::Release);
         result
     }
 }
@@ -188,12 +172,17 @@ impl TickParser {
     }
 
     pub fn with_timeframe_ns(timeframe_ns: i64) -> Self {
-        Self::new(timeframe_ns / 1_000_000_000, 10000, 1000)
-    }
+        let normalized_timeframe_ns = if timeframe_ns <= 0 {
+            1_000_000_000
+        } else if timeframe_ns < 1_000_000_000 {
+            timeframe_ns * 1_000_000_000
+        } else {
+            timeframe_ns
+        };
 
-    fn bucket_for(&self, timestamp_ns: i64) -> (i64, i64) {
-        let bucket = (timestamp_ns / self.timeframe_ns) * self.timeframe_ns;
-        (bucket, bucket + self.timeframe_ns)
+        let mut parser = Self::new(1, 10000, 1000);
+        parser.timeframe_ns = normalized_timeframe_ns;
+        parser
     }
 
     pub fn add_tick(
@@ -205,10 +194,9 @@ impl TickParser {
         volume: f64,
     ) -> Option<Candle> {
         let key = format!("{}:{}", exchange, symbol);
-        let (start_ns, _end_ns) = self.bucket_for(timestamp_ns);
 
         match self.accumulators.get_mut(&key) {
-            Some(mut acc) if acc.start_time_ns == start_ns => {
+            Some(mut acc) if timestamp_ns < acc.end_time_ns => {
                 acc.update(price, volume);
                 None
             }
@@ -217,13 +205,17 @@ impl TickParser {
                 let mut completed = acc.finalize(timeframe_name);
                 completed.exchange = exchange.to_string();
                 completed.symbol = symbol.to_string();
-                *acc = CandleAccumulator::new(start_ns, self.timeframe_ns, price, volume);
+
+                let elapsed = timestamp_ns.saturating_sub(acc.start_time_ns);
+                let step_count = (elapsed / self.timeframe_ns).max(1);
+                let new_start_ns = acc.start_time_ns + (step_count * self.timeframe_ns);
+                *acc = CandleAccumulator::new(new_start_ns, self.timeframe_ns, price, volume);
                 Some(completed)
             }
             None => {
                 self.accumulators.insert(
                     key,
-                    CandleAccumulator::new(start_ns, self.timeframe_ns, price, volume),
+                    CandleAccumulator::new(timestamp_ns, self.timeframe_ns, price, volume),
                 );
                 None
             }
@@ -411,8 +403,8 @@ impl TickNormalizer {
         }
     }
 
-    pub fn set_exchange_offset(&mut self, exchange: String, offset_ms: i64) {
-        self.exchange_offsets.insert(exchange, offset_ms * 1_000_000);
+    pub fn set_exchange_offset(&mut self, exchange: String, offset_us: i64) {
+        self.exchange_offsets.insert(exchange, offset_us * 1_000);
     }
 
     pub fn normalize_timestamp(&self, exchange: &str, timestamp_ns: i64) -> i64 {

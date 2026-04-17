@@ -99,3 +99,4 @@ secrets/
 
 # Generated runtime config
 config/settings.live.yaml
+config/*.runtime.yaml

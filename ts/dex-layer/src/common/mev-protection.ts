@@ -32,10 +32,10 @@ export interface SandwichAttack {
 export interface PrivateTxRequest {
   to: string;
   data: string;
-  value: string;
-  gasLimit: string;
-  maxFeePerGas?: string;
-  maxPriorityFeePerGas?: string;
+  value: string | bigint;
+  gasLimit: string | bigint;
+  maxFeePerGas?: string | bigint;
+  maxPriorityFeePerGas?: string | bigint;
 }
 
 export class MEVProtectionService {
@@ -85,32 +85,32 @@ export class MEVProtectionService {
     }
 
     try {
-      const block = await this.provider.getBlock('latest');
       const pendingTxs = await this.provider.send('txpool_content', []);
+      const pendingEntries = this.extractPendingTransactions(pendingTxs);
+      const targetGas = this.extractGasPrice(tx);
+      const targetPrefix = this.extractDataPrefix((tx as any).data);
 
       const potentialAttacks: SandwichAttack[] = [];
 
-      for (const [_, txs] of Object.entries(pendingTxs.pending)) {
-        for (const pendingTx of txs) {
-          if (!pendingTx) continue;
+      for (const pendingTx of pendingEntries) {
+        if (!pendingTx || (pendingTx as any).hash === (tx as any).hash) continue;
+        if (!this.sameAddress((pendingTx as any).to, tx.to)) continue;
 
-          const isSameContract = pendingTx.to === tx.to;
-          const isFrontrun = pendingTx.gasPrice && tx.gasPrice
-            ? BigInt(pendingTx.gasPrice) > BigInt(tx.gasPrice)
-            : false;
-          const isBackrun = pendingTx.gasPrice && tx.gasPrice
-            ? BigInt(pendingTx.gasPrice) < BigInt(tx.gasPrice)
-            : false;
+        const pendingGas = this.extractGasPrice(pendingTx);
+        const pendingPrefix = this.extractDataPrefix((pendingTx as any).data);
+        const similarCall = !!targetPrefix && pendingPrefix === targetPrefix;
+        const similarValue = this.isComparableValue((pendingTx as any).value, (tx as any).value);
+        const isFrontrun = pendingGas > targetGas && similarCall;
+        const isBackrun = pendingGas < targetGas && (similarCall || similarValue);
 
-          if (isSameContract && (isFrontrun || isBackrun)) {
-            potentialAttacks.push({
-              detected: true,
-              fronthunningOrder: isFrontrun ? pendingTx : undefined,
-              backrunningOrder: isBackrun ? pendingTx : undefined,
-              profit: '0',
-              gasSpent: pendingTx.gas || '0'
-            });
-          }
+        if (isFrontrun || isBackrun) {
+          potentialAttacks.push({
+            detected: true,
+            fronthunningOrder: isFrontrun ? pendingTx as ethers.Transaction : undefined,
+            backrunningOrder: isBackrun ? pendingTx as ethers.Transaction : undefined,
+            profit: '0',
+            gasSpent: String((pendingTx as any).gas ?? (pendingTx as any).gasLimit ?? '0')
+          });
         }
       }
 
@@ -182,7 +182,8 @@ export class MEVProtectionService {
   }
 
   private async sendPublicTransaction(request: PrivateTxRequest): Promise<ethers.TransactionResponse> {
-    const tx = await this.provider.getSigner().sendTransaction({
+    const signer = await this.provider.getSigner();
+    const tx = await signer.sendTransaction({
       to: request.to as `0x${string}`,
       data: request.data as `0x${string}`,
       value: request.value ? BigInt(request.value) : 0n,
@@ -193,6 +194,51 @@ export class MEVProtectionService {
 
     logger.info(`Public transaction sent: ${tx.hash}`);
     return tx;
+  }
+
+  private extractPendingTransactions(pendingTxs: any): any[] {
+    const pendingRoot = pendingTxs && typeof pendingTxs === 'object' ? (pendingTxs.pending ?? {}) : {};
+    const flat: any[] = [];
+
+    for (const accountTxs of Object.values(pendingRoot as Record<string, any>)) {
+      if (!accountTxs || typeof accountTxs !== 'object') continue;
+      for (const pendingTx of Object.values(accountTxs as Record<string, any>)) {
+        if (pendingTx) flat.push(pendingTx);
+      }
+    }
+
+    return flat;
+  }
+
+  private extractGasPrice(tx: any): bigint {
+    const raw = tx?.gasPrice ?? tx?.maxFeePerGas ?? tx?.maxPriorityFeePerGas ?? 0;
+    try {
+      return BigInt(raw);
+    } catch {
+      return 0n;
+    }
+  }
+
+  private extractDataPrefix(data: any): string {
+    const raw = typeof data === 'string' ? data.toLowerCase() : '';
+    return raw.length >= 10 ? raw.slice(0, 10) : raw;
+  }
+
+  private sameAddress(a?: string | null, b?: string | null): boolean {
+    if (!a || !b) return false;
+    try {
+      return ethers.getAddress(a) === ethers.getAddress(b);
+    } catch {
+      return String(a).toLowerCase() === String(b).toLowerCase();
+    }
+  }
+
+  private isComparableValue(a: any, b: any): boolean {
+    try {
+      return BigInt(a ?? 0) === BigInt(b ?? 0);
+    } catch {
+      return String(a ?? '') === String(b ?? '');
+    }
   }
 
   calculateDynamicSlippage(baseSlippage: number, volatility: number, orderSize: number, liquidity: number): number {
@@ -265,8 +311,12 @@ export class MEVProtectionService {
 
       const newTx = this.adjustForSlippage(txRequest, adjustedSlippage);
       const tx = await this.sendPrivateTransaction(newTx);
+      const receipt = await tx.wait();
+      if (!receipt) {
+        throw new Error('Protected transaction did not produce a receipt');
+      }
 
-      return await tx.wait();
+      return receipt;
     }
 
     const adjustedSlippage = this.calculateDynamicSlippage(
@@ -278,8 +328,12 @@ export class MEVProtectionService {
 
     const newTx = this.adjustForSlippage(txRequest, adjustedSlippage);
     const tx = await this.sendPrivateTransaction(newTx);
+    const receipt = await tx.wait();
+    if (!receipt) {
+      throw new Error('Protected transaction did not produce a receipt');
+    }
 
-    return await tx.wait();
+    return receipt;
   }
 
   private adjustForSlippage(request: PrivateTxRequest, slippage: number): PrivateTxRequest {
@@ -354,7 +408,7 @@ export class EigenPhiAnalyzer {
         throw new Error(`EigenPhi API error: ${response.statusText}`);
       }
 
-      return await response.json();
+      return await response.json() as any[];
     } catch (error) {
       logger.error('Error fetching top MEV bots:', error);
       return [];

@@ -15,7 +15,7 @@ from engine.signal_generator import TradingSignal
 from execution.order_manager import OrderManager
 from execution.rate_limiter import RateLimiter
 from execution.risk_manager import RiskManager, Position
-from execution.exchange_order_placer import ExchangeOrderPlacer
+from execution.exchange_order_placer import ExchangeOrderPlacer, ProtectiveOrderFallbackRequired
 
 
 @dataclass
@@ -242,6 +242,17 @@ class CEXExecutor:
                             "Exchange-side SL/TP placed for {} SL={:.2f} TP={:.2f}",
                             signal.symbol, pos.stop_loss, pos.take_profit,
                         )
+                    except ProtectiveOrderFallbackRequired as exc:
+                        logger.warning(
+                            "Exchange-side SL/TP unavailable for {} — using bot-managed exits only: {}",
+                            signal.symbol,
+                            exc,
+                        )
+                        await self.event_bus.publish("ALERT_WARNING", {
+                            "type": "sl_fallback_local",
+                            "symbol": signal.symbol,
+                            "error": str(exc),
+                        })
                     except Exception as exc:
                         logger.critical(
                             "FAILED to place exchange-side SL for {} — tripping circuit breaker: {}",
@@ -274,6 +285,12 @@ class CEXExecutor:
                             entry_price=fill_price,
                             sl_price=pos.stop_loss,
                             tp_price=pos.take_profit,
+                        )
+                    except ProtectiveOrderFallbackRequired as exc:
+                        logger.warning(
+                            "Exchange-side SL/TP unavailable for partial fill {} — using bot-managed exits only: {}",
+                            signal.symbol,
+                            exc,
                         )
                     except Exception as exc:
                         logger.critical("SL placement failed for partial fill {}: {}", signal.symbol, exc)
@@ -540,10 +557,14 @@ class CEXExecutor:
         )
 
     async def _handle_user_stream_connected(self, payload: Any) -> None:
-        """User data stream reconnected — un-trip circuit breaker if it was tripped by disconnect."""
+        """User data stream reconnected — clear transient safety trips and resume normal operation."""
         logger.info("User data stream reconnected — resuming normal operation")
-        if self.risk_manager._circuit_breaker.clear_if_reason("user_stream_disconnected"):
+        cb = self.risk_manager._circuit_breaker
+        if cb.clear_if_reason("user_stream_disconnected"):
             logger.info("Circuit breaker reset after user stream reconnection")
+        elif cb.tripped and cb.trip_reason.startswith("reconciliation_mismatch"):
+            cb.reset()
+            logger.info("Circuit breaker reset after reconciliation recovery")
         self.risk_manager.safe_mode.deactivate(SafeModeReason.USER_STREAM_LOST)
 
     async def run(self) -> None:

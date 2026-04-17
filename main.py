@@ -11,13 +11,6 @@ from typing import Any
 
 from loguru import logger
 
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    logger.info("uvloop event loop policy activated")
-except ImportError:
-    logger.debug("uvloop not available — using default asyncio event loop")
-
 from core.config import Config
 from core.event_bus import EventBus
 from core.dispatcher import Dispatcher
@@ -57,6 +50,31 @@ from interface.dashboard_api import build_app, run_dashboard
 from interface.telegram_bot import TelegramNotifier
 
 
+def _configure_event_loop() -> None:
+    try:
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        logger.info("uvloop event loop policy activated")
+    except ImportError:
+        logger.debug("uvloop not available — using default asyncio event loop")
+
+
+def _requires_live_confirmation(config: Config) -> bool:
+    if config.paper_mode:
+        return False
+
+    exchanges = config.get_value("exchanges", default={}) or {}
+    enabled_venues = [
+        venue_cfg
+        for venue_cfg in exchanges.values()
+        if isinstance(venue_cfg, dict) and venue_cfg.get("enabled", False)
+    ]
+    if not enabled_venues:
+        return True
+
+    return not all(bool(venue_cfg.get("testnet", False)) for venue_cfg in enabled_venues)
+
+
 def _setup_logging(config: Config) -> None:
     log_dir = Path(config.get_value("system", "log_dir") or "logs")
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -85,15 +103,17 @@ async def main() -> None:
     logger.info("=" * 60)
 
     # ── Live mode safety gate ─────────────────────────────────────────────
-    # Require explicit opt-in for live trading
     if not config.paper_mode:
-        live_confirm = os.getenv("LIVE_TRADING_CONFIRMED", "").lower()
-        if live_confirm != "true":
-            logger.critical(
-                "LIVE TRADING requires LIVE_TRADING_CONFIRMED=true env var. "
-                "Set it explicitly to acknowledge real-money risk."
-            )
-            sys.exit(1)
+        if _requires_live_confirmation(config):
+            live_confirm = os.getenv("LIVE_TRADING_CONFIRMED", "").lower()
+            if live_confirm != "true":
+                logger.critical(
+                    "LIVE TRADING requires LIVE_TRADING_CONFIRMED=true env var. "
+                    "Set it explicitly to acknowledge real-money risk."
+                )
+                sys.exit(1)
+        else:
+            logger.warning("Starting in demo or testnet live mode — real-money confirmation not required")
 
     event_bus = EventBus()
     db = DBHandler(config)
@@ -381,4 +401,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    _configure_event_loop()
     asyncio.run(main())

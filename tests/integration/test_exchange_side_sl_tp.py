@@ -106,6 +106,24 @@ class TestPrecisionRounding:
         assert placer.round_quantity("BTC/USDT:USDT", 0.12345) == 0.123
         assert placer.round_quantity("ETH/USDT:USDT", 1.999) == 1.99
 
+    def test_placer_round_quantity_handles_decimal_precision_digits(self) -> None:
+        client = AsyncMock()
+        client.markets = {
+            "ETH/USDT:USDT": {
+                "id": "ETHUSDT",
+                "symbol": "ETH/USDT:USDT",
+                "precision": {
+                    "price": 2,
+                    "amount": 3,
+                },
+                "limits": {
+                    "amount": {"min": 0.001},
+                },
+            },
+        }
+        placer = ExchangeOrderPlacer(client=client)
+        assert placer.round_quantity("ETH/USDT:USDT", 0.3183) == 0.318
+
     def test_unknown_symbol_returns_raw_value(self) -> None:
         client = _mock_client_with_markets()
         placer = ExchangeOrderPlacer(client=client)
@@ -136,6 +154,7 @@ class TestOneWayModeReduceOnly:
         params = sl_call.kwargs.get("params", sl_call[1].get("params", {}))
         assert params.get("reduceOnly") is True
         assert "positionSide" not in params
+        assert "type" not in params
 
     @pytest.mark.asyncio
     async def test_tp_has_reduce_only_true(self) -> None:
