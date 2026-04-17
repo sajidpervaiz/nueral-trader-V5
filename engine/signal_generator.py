@@ -19,6 +19,8 @@ from analysis.data_manager import DataManager
 from analysis.regime import MarketRegime, RegimeState
 from analysis.smart_money import SmartMoneyAnalyzer, SMCState
 from analysis.volume_profile import VolumeProfileAnalyzer, VolumeFlowState
+from engine.ai_agent import TradingAIAgent
+from engine.model_trainer import ModelTrainer
 from engine.strategy_modules import StrategySelector, StrategySignal
 
 
@@ -556,28 +558,64 @@ class NewsScorer:
 
 
 class OrderbookScorer:
-    """Computes a directional score from orderbook bid/ask imbalance.
+    """Computes directional and liquidity signals from orderbook snapshots.
 
     Positive = buy-side dominance (bullish), negative = sell pressure.
     """
 
     def __init__(self) -> None:
         self._last_imbalance: float = 0.0
+        self._last_imbalance_by_symbol: dict[str, float] = {}
+        self._last_depth_ratio_by_symbol: dict[str, float] = {}
 
-    def update(self, bids: list[tuple[float, float]], asks: list[tuple[float, float]]) -> float:
+    def update(
+        self,
+        bids: list[tuple[float, float]],
+        asks: list[tuple[float, float]],
+        *,
+        symbol: str | None = None,
+        min_depth_usd: float = 0.0,
+    ) -> float:
         """Accept orderbook levels as [(price, qty), …] for bids and asks."""
         bid_volume = sum(qty for _, qty in bids) if bids else 0.0
         ask_volume = sum(qty for _, qty in asks) if asks else 0.0
         total = bid_volume + ask_volume
         if total == 0:
-            self._last_imbalance = 0.0
+            imbalance = 0.0
         else:
-            # Imbalance ratio: +1 = 100% bids, -1 = 100% asks, 0 = balanced
-            self._last_imbalance = float(np.clip((bid_volume - ask_volume) / total, -1.0, 1.0))
+            imbalance = float(np.clip((bid_volume - ask_volume) / total, -1.0, 1.0))
+
+        self._last_imbalance = imbalance
+        if symbol:
+            self._last_imbalance_by_symbol[symbol] = imbalance
+            if min_depth_usd > 0:
+                total_notional = (
+                    sum(price * qty for price, qty in bids) +
+                    sum(price * qty for price, qty in asks)
+                )
+                self._last_depth_ratio_by_symbol[symbol] = total_notional / min_depth_usd
+
+        return imbalance
+
+    def score(self, symbol: str | None = None) -> float:
+        if symbol is not None:
+            return self._last_imbalance_by_symbol.get(symbol, self._last_imbalance)
         return self._last_imbalance
 
-    def score(self) -> float:
-        return self._last_imbalance
+    def depth_ratio(self, symbol: str | None = None) -> float:
+        if symbol is None:
+            if not self._last_depth_ratio_by_symbol:
+                return 0.0
+            return list(self._last_depth_ratio_by_symbol.values())[-1]
+        return self._last_depth_ratio_by_symbol.get(symbol, 0.0)
+
+    def depth_score(self, symbol: str | None = None) -> int:
+        ratio = self.depth_ratio(symbol)
+        if ratio >= 5.0:
+            return 100
+        if ratio >= 2.0:
+            return 50
+        return 0
 
 
 class SignalGenerator:
@@ -591,7 +629,6 @@ class SignalGenerator:
         self.event_bus = event_bus
         self.data_manager = data_manager
         self._technical_scorer = TechnicalScorer()
-        self._ml_scorer = MLScorer()
         self._news_scorer = NewsScorer()
         self._orderbook_scorer = OrderbookScorer()
         self._strategy_selector = StrategySelector()
@@ -644,9 +681,41 @@ class SignalGenerator:
         self._primary_tf = signals_cfg.get("primary_timeframe", "15m")
         self._confirmation_tfs: list[str] = list(signals_cfg.get("confirmation_timeframes", ["1h", "4h"]))
         self._htf_threshold = float(signals_cfg.get("htf_threshold", 3.0))
+        self._ml_model_path = str(signals_cfg.get("model_path", "ml_model.pkl"))
+        self._ml_model_type = str(signals_cfg.get("ml_model_type", "lightgbm"))
+        self._ml_bootstrap_min_rows = int(signals_cfg.get("ml_bootstrap_min_rows", 120))
+        self._ml_bootstrap_retry_seconds = float(signals_cfg.get("ml_bootstrap_retry_seconds", 15.0))
+        self._ml_retrain_interval_seconds = float(signals_cfg.get("ml_retrain_interval_seconds", 21600.0))
+        self._model_trainer = ModelTrainer(model_type=self._ml_model_type)
+        self._ml_scorer = MLScorer(model_path=self._ml_model_path)
+        self._ml_bootstrap_task: asyncio.Task | None = None
+        self._last_ml_train_ts: float = 0.0
+        risk_cfg = config.get_value("risk") or {}
+        self._min_orderbook_depth_usd = float(
+            risk_cfg.get("min_orderbook_depth_usd", risk_cfg.get("min_liquidity_usd", 0.0)) or 0.0
+        )
 
         # ── Pipeline status tracking for dashboard API ────────────────────
-        self._last_layer_status: dict[str, str] = {}
+        self._last_layer_status: dict[str, str] = {
+            "session_filter": "PENDING",
+            "session_filter_detail": "waiting for first evaluation",
+            "htf_trend": "PENDING",
+            "htf_trend_detail": "waiting for first evaluation",
+            "technical_confluence": "PENDING",
+            "technical_confluence_detail": "waiting for first evaluation",
+            "smart_money_concepts": "PENDING",
+            "smart_money_concepts_detail": "waiting for first evaluation",
+            "volume_flow": "PENDING",
+            "volume_flow_detail": "waiting for first evaluation",
+            "regime_detection": "PENDING",
+            "regime_detection_detail": "waiting for first evaluation",
+            "ml_ensemble": "PENDING",
+            "ml_ensemble_detail": "waiting for first evaluation",
+            "signal_quality": "PENDING",
+            "signal_quality_detail": "waiting for first evaluation",
+            "risk_gate": "PENDING",
+            "risk_gate_detail": "waiting for first evaluation",
+        }
         self._last_quality_breakdown: dict[str, Any] = {
             "total": 0,
             "components": {
@@ -656,6 +725,28 @@ class SignalGenerator:
                 "sentiment_alignment": 0, "onchain_health": 0,
             },
         }
+        self._ml_training_summary: dict[str, Any] = {
+            "trained": bool(self._ml_scorer._model_loaded),
+            "model_path": self._ml_model_path,
+            "rows": 0,
+            "feature_count": len(self._ml_scorer._feature_names or []),
+            "last_train_ts": 0.0,
+            "reason": "loaded_from_disk" if self._ml_scorer._model_loaded else "model_missing",
+        }
+
+        ai_cfg = config.get_value("ai_agent") or {}
+        self._ai_agent = TradingAIAgent(
+            enabled=bool(ai_cfg.get("enabled", True)),
+            mode=str(ai_cfg.get("mode", "full")),
+            min_confidence=float(ai_cfg.get("min_confidence", 0.55)),
+            min_quality_score=int(ai_cfg.get("min_quality_score", self._get_quality_threshold())),
+            min_risk_reward=float(ai_cfg.get("min_risk_reward", 1.0)),
+            provider=str(ai_cfg.get("provider", "local")),
+            model=str(ai_cfg.get("model", "claude-3-5-sonnet-latest")),
+            api_key=str(ai_cfg.get("api_key", "")),
+            timeout_seconds=float(ai_cfg.get("timeout_seconds", 8.0)),
+            remote_weight=float(ai_cfg.get("remote_weight", 0.35)),
+        )
 
     # ── Advanced helpers ──────────────────────────────────────────────────
 
@@ -686,13 +777,386 @@ class SignalGenerator:
                         self._last_layer_status[dashboard_name] = "PASS"
                     elif val >= 40:
                         self._last_layer_status[dashboard_name] = "WEAK"
-                    elif val > 0:
-                        self._last_layer_status[dashboard_name] = "FAIL"
                     else:
-                        self._last_layer_status[dashboard_name] = "UNKNOWN"
+                        self._last_layer_status[dashboard_name] = "FAIL"
                 else:
                     self._last_layer_status[dashboard_name] = str(val)
                 self._last_layer_status[f"{dashboard_name}_detail"] = f"score={val}"
+
+    def _is_paper_mode(self) -> bool:
+        """Return whether the current runtime is in paper/demo mode."""
+        return bool(self.config.get_value("system", "paper_mode", default=getattr(self.config, "paper_mode", True)))
+
+    def _get_quality_threshold(self) -> int:
+        """Return the active quality gate for the current runtime mode."""
+        return 30 if self._is_paper_mode() else 65
+
+    def _get_technical_threshold(self) -> int:
+        """Return the technical confluence threshold for the active mode."""
+        return 30 if self._is_paper_mode() else 65
+
+    def _get_volume_threshold(self) -> int:
+        """Return the volume-flow threshold for the active mode."""
+        return 20 if self._is_paper_mode() else 60
+
+    def _get_smc_threshold(self) -> int:
+        """Return the minimum SMC confluence for the active mode."""
+        return 10 if self._is_paper_mode() else 20
+
+    def get_ml_status(self) -> dict[str, Any]:
+        """Return current ML model status and latest training summary."""
+        return {
+            "loaded": bool(self._ml_scorer._model_loaded),
+            "model_path": self._ml_model_path,
+            "model_type": self._ml_model_type,
+            "feature_count": len(self._ml_scorer._feature_names or []),
+            "last_train_ts": float(self._last_ml_train_ts),
+            "training": dict(self._ml_training_summary),
+        }
+
+    def get_agent_status(self) -> dict[str, Any]:
+        """Return status for the attached supervisory AI agent."""
+        if self._ai_agent is None:
+            return {"attached": False, "enabled": False, "mode": "off"}
+        status = self._ai_agent.get_status()
+        status["auto_trading_enabled"] = bool(self._auto_trading_enabled)
+        return status
+
+    def configure_agent(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Update AI agent runtime settings and return the new status."""
+        payload = payload or {}
+        if self._ai_agent is None:
+            return {"attached": False, "enabled": False, "mode": "off"}
+        self._ai_agent.configure(
+            enabled=payload.get("enabled"),
+            mode=payload.get("mode"),
+            min_confidence=payload.get("min_confidence"),
+            min_quality_score=payload.get("min_quality_score"),
+            min_risk_reward=payload.get("min_risk_reward"),
+            provider=payload.get("provider"),
+            model=payload.get("model"),
+            api_key=payload.get("api_key"),
+            timeout_seconds=payload.get("timeout_seconds"),
+            remote_weight=payload.get("remote_weight"),
+        )
+        return self.get_agent_status()
+
+    def get_strategy_suggestion(self, symbol: str | None = None) -> dict[str, Any]:
+        """Return a simple strategy recommendation from the current pipeline state."""
+        target_symbol = str(symbol or "BTC/USDT:USDT")
+        quality_total = int(self._last_quality_breakdown.get("total", 0) or 0)
+        rejected_at = str(self._last_quality_breakdown.get("rejected_at", "") or "")
+        layers = dict(self._last_layer_status)
+        ml_loaded = bool(self._ml_scorer._model_loaded)
+
+        strategy = "trend_following"
+        action = "wait"
+        reason = "Pipeline is still below execution quality thresholds."
+        suggestions = [
+            "Prefer high-quality setups above the live quality threshold.",
+            "Keep auto trading aligned with the risk gate and session filter.",
+        ]
+
+        if quality_total >= self._get_quality_threshold() and layers.get("risk_gate") == "PASS":
+            action = "consider_entry"
+            reason = "Quality and risk conditions are aligned for a potential trade."
+            suggestions = [
+                "Use the trend-following path with strict stop loss.",
+                "Let the AI supervisor confirm before full-size entries.",
+            ]
+        elif "Technical" in rejected_at or layers.get("technical_confluence") == "FAIL":
+            strategy = "mean_reversion_watch"
+            reason = "Technical confluence is weak, so patience is favored over entry."
+            suggestions = [
+                "Wait for RSI, EMA, and momentum alignment.",
+                "Avoid forcing entries during weak confluence.",
+            ]
+        elif layers.get("volume_flow") == "FAIL":
+            strategy = "liquidity_wait"
+            reason = "Volume participation is too weak for a strong breakout trade."
+            suggestions = [
+                "Wait for stronger volume expansion.",
+                "Reduce position size if a trade is still taken.",
+            ]
+
+        return {
+            "symbol": target_symbol,
+            "action": action,
+            "strategy": strategy,
+            "reason": reason,
+            "quality_score": quality_total,
+            "ml_loaded": ml_loaded,
+            "auto_trading_enabled": bool(self._auto_trading_enabled),
+            "suggestions": suggestions,
+        }
+
+    def get_quality_preview(self, symbol: str | None = None) -> dict[str, Any]:
+        """Build a non-trading quality preview from the latest available market snapshot."""
+        exchange_cfg = self.config.get_value("exchanges", "binance") or {}
+        configured_symbols = list(exchange_cfg.get("symbols", []))
+        target_symbol = str(symbol or (configured_symbols[0] if configured_symbols else "BTC/USDT:USDT"))
+
+        try:
+            df = self.data_manager.get_dataframe("binance", target_symbol, self._primary_tf)
+        except TypeError:
+            df = self.data_manager.get_dataframe("binance", target_symbol)
+        except Exception:
+            df = None
+
+        if df is None or len(df) < 30:
+            return {
+                "total": 0,
+                "components": {
+                    "htf_trend": 0,
+                    "technical_confluence": 0,
+                    "smc_confluence": 0,
+                    "volume_flow": 0,
+                    "regime": 0,
+                    "ml_confidence": 0,
+                    "liquidity_depth": 0,
+                },
+                "preview": True,
+                "symbol": target_symbol,
+                "reason": "Waiting for enough live candles to evaluate the pipeline.",
+            }
+
+        now = time.time()
+        session_rule = self._get_session_rule()
+        regime_state = self.data_manager.get_regime("binance", target_symbol)
+        sentiment = self._sentiment_score if (now - self._sentiment_ts) < self._score_ttl else 0.0
+
+        smc_state = self._smc_analyzer.analyze(df)
+        tech_score, _ = self._technical_scorer.score(df)
+        ml_score = self._ml_scorer.score(df)
+        vol_flow = self._volume_analyzer.analyze(df)
+
+        last_row = df.iloc[-1]
+        vol_ratio = float(last_row.get("volume_ratio", 1.0) or 1.0)
+        orderbook_depth_ratio = self._orderbook_scorer.depth_ratio(target_symbol)
+        liquidity_depth_score = self._orderbook_scorer.depth_score(target_symbol)
+
+        direction_bias = 0.40 * tech_score + 0.30 * smc_state.smc_score + 0.15 * ml_score + 0.15 * vol_flow.flow_score
+        direction = "long" if direction_bias >= 0 else "short"
+
+        htf_ok, _, htf_weighted_score, _ = self._check_higher_timeframe_trend("binance", target_symbol, direction)
+        if not htf_ok:
+            alt_direction = "short" if direction == "long" else "long"
+            alt_ok, _, alt_ws, _ = self._check_higher_timeframe_trend("binance", target_symbol, alt_direction)
+            if alt_ok or abs(alt_ws) > abs(htf_weighted_score):
+                direction = alt_direction
+                htf_weighted_score = alt_ws
+
+        htf_score_100 = int((htf_weighted_score + 1.0) / 2.0 * 100) if direction == "long" else int((1.0 - htf_weighted_score) / 2.0 * 100)
+        tech_score_100 = int(max(0, min(100, (tech_score + 1.0) / 2.0 * 100)))
+        smc_score_100 = int(max(0, min(100, (smc_state.smc_score + 1.0) / 2.0 * 100)))
+        volume_score_100 = int(max(0, min(100, (vol_flow.flow_score + 1.0) / 2.0 * 100)))
+        ml_confidence = int(max(0, min(100, (ml_score + 1.0) / 2.0 * 100)))
+        regime_allows = bool(getattr(regime_state, "tradeable", True)) if regime_state is not None else True
+        regime_score = 100 if regime_allows else 0
+        signal_type = self._classify_signal_type(smc_state, df)
+
+        total = self._compute_quality_score(
+            htf_score=htf_weighted_score,
+            signal_type=signal_type,
+            vol_ratio=vol_ratio,
+            smc_state=smc_state,
+            vol_flow=vol_flow,
+            session_rule=session_rule,
+            sentiment=sentiment,
+            regime_state=regime_state,
+            direction=direction,
+            tech_score_100=float(tech_score_100),
+            smc_points=float(smc_score_100),
+            volume_score_100=float(volume_score_100),
+            regime_allows=regime_allows,
+            ml_confidence=float(ml_confidence),
+            orderbook_depth_ratio=orderbook_depth_ratio,
+        )
+
+        return {
+            "total": int(total),
+            "components": {
+                "htf_trend": int(htf_score_100),
+                "technical_confluence": int(tech_score_100),
+                "smc_confluence": int(smc_score_100),
+                "volume_flow": int(volume_score_100),
+                "regime": int(regime_score),
+                "ml_confidence": int(ml_confidence),
+                "liquidity_depth": int(liquidity_depth_score),
+            },
+            "preview": True,
+            "symbol": target_symbol,
+            "signal_type": signal_type.value,
+            "reason": "Live preview from the latest market snapshot.",
+        }
+
+    async def chat_with_agent(self, message: str) -> dict[str, Any]:
+        """Interactive assistant endpoint for the dashboard AI panel."""
+        prompt = str(message or "").strip()
+        if not prompt:
+            return {"success": False, "reply": "Please enter a message."}
+
+        lower = prompt.lower()
+        if any(key in lower for key in ["train model", "retrain", "start learning", "learn now"]):
+            result = await self.retrain_model_now()
+            trained = bool(result.get("trained", False))
+            if trained:
+                reply = (
+                    f"Training completed using {result.get('rows', 0)} rows across {len(result.get('symbols', []))} symbols. "
+                    f"Model features: {result.get('feature_count', 0)}."
+                )
+            else:
+                reply = f"Training did not complete: {result.get('reason', 'unknown')}"
+            return {"success": trained, "provider": "system", "reply": reply, "training": result}
+
+        if any(key in lower for key in ["turn on auto", "enable auto", "start auto", "resume trading"]):
+            self.set_auto_trading(True)
+            return {"success": True, "provider": "system", "reply": "Auto trading is now ON."}
+
+        if any(key in lower for key in ["turn off auto", "disable auto", "stop trading", "pause trading"]):
+            self.set_auto_trading(False)
+            return {"success": True, "provider": "system", "reply": "Auto trading is now OFF."}
+
+        risk_positions = 0
+        if self._risk_manager is not None:
+            risk_positions = len(getattr(self._risk_manager, "positions", {}))
+
+        context = {
+            "auto_trading_enabled": bool(self._auto_trading_enabled),
+            "open_positions": risk_positions,
+            "ml_loaded": bool(self._ml_scorer._model_loaded),
+            "ml_training": dict(self._ml_training_summary),
+            "quality": dict(self._last_quality_breakdown),
+            "layers": dict(self._last_layer_status),
+        }
+        if self._ai_agent is None:
+            return {"success": True, "provider": "system", "reply": "AI agent is not attached."}
+        return self._ai_agent.chat(prompt, context=context)
+
+    def _collect_training_dataframe(self) -> tuple[pd.DataFrame, list[str]]:
+        """Collect numeric historical features for ML training."""
+        exchange_cfg = self.config.get_value("exchanges", "binance") or {}
+        symbols = list(exchange_cfg.get("symbols", []))
+        frames: list[pd.DataFrame] = []
+        used_symbols: list[str] = []
+
+        for idx, symbol in enumerate(symbols):
+            try:
+                df = self.data_manager.get_dataframe("binance", symbol, self._primary_tf)
+            except TypeError:
+                df = self.data_manager.get_dataframe("binance", symbol)
+            except Exception:
+                df = None
+
+            if df is None or len(df) < self._ml_bootstrap_min_rows:
+                continue
+
+            frame = df.copy()
+            frame["symbol_id"] = float(idx)
+            numeric = frame.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan)
+            required_cols = {"open", "high", "low", "close", "volume", "symbol_id"}
+            min_non_null = max(50, int(len(numeric) * 0.60))
+            keep_cols = [
+                col for col in numeric.columns
+                if col in required_cols or int(numeric[col].notna().sum()) >= min_non_null
+            ]
+            if "close" not in keep_cols:
+                continue
+
+            frame = numeric[keep_cols].ffill().dropna()
+            if len(frame) < self._ml_bootstrap_min_rows:
+                continue
+
+            frames.append(frame)
+            used_symbols.append(symbol)
+
+        if not frames:
+            return pd.DataFrame(), []
+        return pd.concat(frames, ignore_index=True), used_symbols
+
+    def _bootstrap_ml_model(self, model_path: str | None = None) -> dict[str, Any]:
+        """Train and load an ML model from the currently available history."""
+        model_path = model_path or self._ml_model_path
+        dataset, used_symbols = self._collect_training_dataframe()
+        rows = int(len(dataset))
+
+        if dataset.empty or rows < self._ml_bootstrap_min_rows:
+            result = {
+                "trained": False,
+                "model_path": model_path,
+                "rows": rows,
+                "feature_count": 0,
+                "symbols": used_symbols,
+                "reason": "insufficient_data",
+                "last_train_ts": float(self._last_ml_train_ts),
+            }
+            self._ml_training_summary = result
+            return result
+
+        try:
+            model_id = f"live_bootstrap_{int(time.time())}"
+            trained = self._model_trainer.train_model(
+                dataset,
+                target_col="returns",
+                perform_cv=True,
+                model_id=model_id,
+            )
+            if not self._model_trainer.save_model(model_id, model_path):
+                raise RuntimeError("model_save_failed")
+
+            self._ml_scorer = MLScorer(model_path=model_path)
+            self._last_ml_train_ts = time.time()
+            result = {
+                "trained": bool(self._ml_scorer._model_loaded),
+                "model_path": model_path,
+                "rows": rows,
+                "feature_count": len(trained.feature_names),
+                "symbols": used_symbols,
+                "metrics": {
+                    "accuracy": float(trained.metrics.accuracy),
+                    "precision": float(trained.metrics.precision),
+                    "recall": float(trained.metrics.recall),
+                    "f1": float(trained.metrics.f1),
+                },
+                "last_train_ts": float(self._last_ml_train_ts),
+                "reason": "trained_from_history",
+            }
+            self._ml_training_summary = result
+            logger.info(
+                "ML bootstrap completed: rows={} features={} f1={:.3f}",
+                rows,
+                len(trained.feature_names),
+                float(trained.metrics.f1),
+            )
+            return result
+        except Exception as exc:
+            logger.error("ML bootstrap training failed: {}", exc)
+            result = {
+                "trained": False,
+                "model_path": model_path,
+                "rows": rows,
+                "feature_count": 0,
+                "symbols": used_symbols,
+                "reason": str(exc),
+                "last_train_ts": float(self._last_ml_train_ts),
+            }
+            self._ml_training_summary = result
+            return result
+
+    async def retrain_model_now(self) -> dict[str, Any]:
+        """Trigger model retraining in a worker thread."""
+        return await asyncio.to_thread(self._bootstrap_ml_model)
+
+    async def _bootstrap_ml_model_loop(self) -> None:
+        """Background loop that trains a model once enough history is available."""
+        if self._ml_scorer._model_loaded:
+            return
+
+        while self._running:
+            result = await asyncio.to_thread(self._bootstrap_ml_model)
+            if result.get("trained"):
+                return
+            await asyncio.sleep(self._ml_bootstrap_retry_seconds)
 
     def _get_regime_weights(self, regime: MarketRegime | None) -> dict[str, float]:
         """Return factor weights adapted to current market regime.
@@ -828,10 +1292,12 @@ class SignalGenerator:
         max_score = 7.0
         agreement_count = 0
         detail_parts: list[str] = []
+        htf_frames_available = 0
 
         # ── Daily (3 points): Close > EMA50 + BOS ────────────────────────
         daily_df = self.data_manager.get_dataframe(exchange, symbol, "1d")
         if daily_df is not None and len(daily_df) >= 50:
+            htf_frames_available += 1
             daily_last = daily_df.iloc[-1]
             daily_close = float(daily_last.get("close", 0))
             ema50 = float(daily_last.get("ema_50", 0))
@@ -873,6 +1339,7 @@ class SignalGenerator:
         # ── 4H (2 points): SuperTrend ────────────────────────────────────
         four_h_df = self.data_manager.get_dataframe(exchange, symbol, "4h")
         if four_h_df is not None and len(four_h_df) >= 20:
+            htf_frames_available += 1
             st_dir = float(four_h_df.iloc[-1].get("supertrend_dir", 0))
             if st_dir == 1:
                 weighted_sum += 2.0
@@ -892,6 +1359,7 @@ class SignalGenerator:
         # ── 1H (1 point): Price > VWAP ───────────────────────────────────
         one_h_df = self.data_manager.get_dataframe(exchange, symbol, "1h")
         if one_h_df is not None and len(one_h_df) >= 20:
+            htf_frames_available += 1
             last_1h = one_h_df.iloc[-1]
             close_1h = float(last_1h.get("close", 0))
             vwap_1h = float(last_1h.get("vwap", 0))
@@ -949,6 +1417,15 @@ class SignalGenerator:
         normalized_score = weighted_sum / max_score
 
         detail_str = f"weighted={weighted_sum:.1f}/7 [{', '.join(detail_parts)}]"
+
+        if htf_frames_available == 0:
+            logger.warning(
+                "HTF confirmation bypassed for {}/{} — no higher timeframe data available ({})",
+                exchange,
+                symbol,
+                detail_str,
+            )
+            return True, f"HTF_bypass_no_data {detail_str}", normalized_score, agreement_count
 
         # Spec: For long, require weighted_sum >= threshold; for short, <= -threshold
         htf_thresh = self._htf_threshold
@@ -1211,7 +1688,7 @@ class SignalGenerator:
         # ═══════════════════════════════════════════════════════════════════
         tech_score, tech_reasons = self._technical_scorer.score(df)
         ml_score = self._ml_scorer.score(df)
-        ob_score = self._orderbook_scorer.score()
+        ob_score = self._orderbook_scorer.score(candle.symbol)
 
         # TTL: zero out stale macro scores
         macro = self._macro_score if (now - self._macro_ts) < self._score_ttl else 0.0
@@ -1226,6 +1703,8 @@ class SignalGenerator:
         ml_norm = (ml_score + 1) / 2 * 100  # [-1,1] → [0,100]
         tech_norm = (tech_score + 1) / 2 * 100
         vol_ratio = float(df.iloc[-1].get("volume_ratio", 1.0))
+        orderbook_depth_ratio = self._orderbook_scorer.depth_ratio(candle.symbol)
+        liquidity_depth_score = self._orderbook_scorer.depth_score(candle.symbol)
 
         # ═══════════════════════════════════════════════════════════════════
         # V6.0 SPEC-COMPLIANT 9-LAYER SEQUENTIAL HARD-GATE PIPELINE
@@ -1392,17 +1871,17 @@ class SignalGenerator:
         l3_tech_score = int(trend_avg * 0.35 + momentum_avg * 0.35 + volatility_avg * 0.30)
         l3_tech_score = max(0, min(100, l3_tech_score))
 
-        # HARD GATE: Technical confluence >= 30 (relaxed from spec 65 for paper mode)
-        if l3_tech_score < 30:
-            logger.info("DIAG {}: L3 Technical HARD GATE FAIL: score={} < 30 "
+        technical_threshold = self._get_technical_threshold()
+        if l3_tech_score < technical_threshold:
+            logger.info("DIAG {}: L3 Technical HARD GATE FAIL: score={} < {} "
                         "(trend={:.0f} mom={:.0f} vol={:.0f})",
-                        key, l3_tech_score, trend_avg, momentum_avg, volatility_avg)
+                        key, l3_tech_score, technical_threshold, trend_avg, momentum_avg, volatility_avg)
             self._update_layer_status(
                 l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=0,
                 l4=0, l5=0, l6=0, l7=0,
             )
             self._last_layer_status["technical_confluence"] = "FAIL"
-            self._last_layer_status["technical_confluence_detail"] = f"score={l3_tech_score}<65"
+            self._last_layer_status["technical_confluence_detail"] = f"score={l3_tech_score}<{technical_threshold}"
             self._last_quality_breakdown = {
                 "total": 0,
                 "components": {
@@ -1502,15 +1981,33 @@ class SignalGenerator:
 
         l4_smc_score = int(min(100, l4_smc_points))
 
-        # SOFT GATE: SMC confluence — log warning but don't block (paper mode)
-        if l4_smc_points < 10.0:
-            logger.info("DIAG {}: L4 SMC LOW: points={:.0f} < 10 "
-                        "(FVGs={} OBs={} breakers={} grabs={}) — continuing with penalty",
-                        key, l4_smc_points,
+        smc_threshold = float(self._get_smc_threshold())
+        if l4_smc_points < smc_threshold:
+            logger.info("DIAG {}: L4 SMC LOW: points={:.0f} < {:.0f} "
+                        "(FVGs={} OBs={} breakers={} grabs={})",
+                        key, l4_smc_points, smc_threshold,
                         len(smc_state.active_fvgs), len(smc_state.active_order_blocks),
                         len(smc_state.active_breaker_blocks), len(smc_state.liquidity_grabs))
-            self._last_layer_status["smart_money_concepts"] = "WARN"
-            self._last_layer_status["smart_money_concepts_detail"] = f"points={l4_smc_points:.0f}<10"
+            if self._is_paper_mode():
+                self._last_layer_status["smart_money_concepts"] = "WARN"
+                self._last_layer_status["smart_money_concepts_detail"] = f"points={l4_smc_points:.0f}<{smc_threshold:.0f}"
+            else:
+                self._update_layer_status(
+                    l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=l4_smc_score,
+                    l4=0, l5=0, l6=0, l7=0,
+                )
+                self._last_layer_status["smart_money_concepts"] = "FAIL"
+                self._last_layer_status["smart_money_concepts_detail"] = f"points={l4_smc_points:.0f}<{smc_threshold:.0f}"
+                self._last_quality_breakdown = {
+                    "total": 0,
+                    "components": {
+                        "htf_trend": l2_htf_score, "technical_confluence": l3_tech_score,
+                        "smc_confluence": l4_smc_score, "volume_flow": 0,
+                        "regime": 0, "ml_confidence": 0, "liquidity_depth": 0,
+                    },
+                    "rejected_at": "L4_SMC",
+                }
+                return
 
         # ── L5: VOLUME FLOW (HARD GATE: ≥ 60/100) ───────────────────────
         # Spec: VPFR LVN (25), Volume Delta (25), VWAP (20), CMF (15), OBV (15)
@@ -1551,11 +2048,11 @@ class SignalGenerator:
 
         l5_vol_score = int(min(100, l5_vol_points))
 
-        # HARD GATE: Volume flow >= 20 (relaxed from spec 60 for paper mode)
-        if l5_vol_points < 20.0:
-            logger.info("DIAG {}: L5 Volume HARD GATE FAIL: points={:.0f} < 20 "
+        volume_threshold = float(self._get_volume_threshold())
+        if l5_vol_points < volume_threshold:
+            logger.info("DIAG {}: L5 Volume HARD GATE FAIL: points={:.0f} < {:.0f} "
                         "(delta={} vwap={} cmf={:.3f} obv={} lvn={})",
-                        key, l5_vol_points, vol_flow.delta_trend,
+                        key, l5_vol_points, volume_threshold, vol_flow.delta_trend,
                         vol_flow.vwap_slope, cmf, vol_flow.obv_divergence,
                         len(vol_flow.lvn_levels))
             self._update_layer_status(
@@ -1563,7 +2060,7 @@ class SignalGenerator:
                 l4=l5_vol_score, l5=0, l6=0, l7=0,
             )
             self._last_layer_status["volume_flow"] = "FAIL"
-            self._last_layer_status["volume_flow_detail"] = f"points={l5_vol_points:.0f}<60"
+            self._last_layer_status["volume_flow_detail"] = f"points={l5_vol_points:.0f}<{volume_threshold:.0f}"
             self._last_quality_breakdown = {
                 "total": 0,
                 "components": {
@@ -1605,8 +2102,8 @@ class SignalGenerator:
 
         # HARD GATE: Choppy regime blocks all signals
         if regime_class == "CHOPPY":
-            # Allow through if existing regime detector says tradeable (graceful degradation)
-            if not (regime_state and regime_state.tradeable):
+            # In live mode, always block choppy setups. Only paper mode may degrade gracefully.
+            if (not self._is_paper_mode()) or not (regime_state and regime_state.tradeable):
                 logger.info("DIAG {}: L6 Regime HARD GATE FAIL: CHOPPY "
                             "(ADX={:.1f} ATR_exp={:.2f} BB={:.4f})",
                             key, adx_val, atr_expansion, bb_width)
@@ -1670,7 +2167,7 @@ class SignalGenerator:
             volume_score_100=float(l5_vol_score),
             regime_allows=(regime_class != "CHOPPY"),
             ml_confidence=float(l7_ml_score),
-            orderbook_depth_ratio=0.0,  # Not available in paper mode
+            orderbook_depth_ratio=orderbook_depth_ratio,
         )
 
         # Update all layer statuses for dashboard
@@ -1688,7 +2185,7 @@ class SignalGenerator:
                 "volume_flow": l5_vol_score,
                 "regime": l6_regime_score,
                 "ml_confidence": l7_ml_score,
-                "liquidity_depth": 0,
+                "liquidity_depth": liquidity_depth_score,
             },
             "session": session_rule.name if session_rule else "none",
             "regime_class": regime_class,
@@ -1696,7 +2193,7 @@ class SignalGenerator:
         }
 
         # HARD GATE: Quality score >= 65 (spec), relaxed to 30 for paper mode
-        quality_threshold = 30
+        quality_threshold = self._get_quality_threshold()
         if quality_score < quality_threshold:
             logger.info(
                 "DIAG {}: L8 Quality HARD GATE FAIL: score={} < {} | "
@@ -1979,6 +2476,28 @@ class SignalGenerator:
             },
         )
 
+        agent_decision = self._ai_agent.review_signal(signal) if self._ai_agent is not None else None
+        if agent_decision is not None:
+            signal.metadata["ai_agent"] = agent_decision.to_dict()
+            if not agent_decision.approved:
+                self._last_layer_status["risk_gate"] = "FAIL"
+                self._last_layer_status["risk_gate_detail"] = (
+                    f"AI rejected {candle.symbol}: {agent_decision.reason} conf={agent_decision.confidence:.2f}"
+                )
+                logger.info(
+                    "AI_AGENT rejected {}/{} {} conf={:.2f} reason={}",
+                    candle.exchange,
+                    candle.symbol,
+                    direction.upper(),
+                    agent_decision.confidence,
+                    agent_decision.reason,
+                )
+                return
+            if agent_decision.size_multiplier and agent_decision.size_multiplier != 1.0:
+                signal.size_multiplier = max(0.10, signal.size_multiplier * agent_decision.size_multiplier)
+                signal.metadata["effective_size_mult"] = signal.size_multiplier
+                signal.metadata["ai_adjusted_size_mult"] = agent_decision.size_multiplier
+
         self._last_signal_time[key] = now
         self._open_directions[candle.symbol] = direction
         # Update risk gate status (signal passed all gates)
@@ -2030,15 +2549,23 @@ class SignalGenerator:
 
     async def _handle_orderbook_update(self, payload: Any) -> None:
         """Consume ORDERBOOK_UPDATE events — {bids: [(p,q),...], asks: [(p,q),...]}."""
+        symbol = None
         if isinstance(payload, dict):
+            symbol = payload.get("symbol")
             bids = [(float(b[0]), float(b[1])) for b in payload.get("bids", [])]
             asks = [(float(a[0]), float(a[1])) for a in payload.get("asks", [])]
         elif hasattr(payload, "bids") and hasattr(payload, "asks"):
+            symbol = getattr(payload, "symbol", None)
             bids = [(float(b[0]), float(b[1])) for b in payload.bids]
             asks = [(float(a[0]), float(a[1])) for a in payload.asks]
         else:
             return
-        self._orderbook_scorer.update(bids, asks)
+        self._orderbook_scorer.update(
+            bids,
+            asks,
+            symbol=symbol,
+            min_depth_usd=self._min_orderbook_depth_usd,
+        )
 
     async def run(self) -> None:
         self._running = True
@@ -2047,6 +2574,8 @@ class SignalGenerator:
         self.event_bus.subscribe("FUNDING_RATE", self._handle_funding)
         self.event_bus.subscribe("NEWS_SENTIMENT", self._handle_news_sentiment)
         self.event_bus.subscribe("ORDERBOOK_UPDATE", self._handle_orderbook_update)
+        if self._ml_bootstrap_task is None or self._ml_bootstrap_task.done():
+            self._ml_bootstrap_task = asyncio.create_task(self._bootstrap_ml_model_loop())
         logger.info(
             "SignalGenerator started (primary_tf={}, auto_trading={}, "
             "weights: tech={:.0%} ml={:.0%} sent={:.0%} macro={:.0%} news={:.0%} ob={:.0%}, "
@@ -2061,6 +2590,8 @@ class SignalGenerator:
 
     async def stop(self) -> None:
         self._running = False
+        if self._ml_bootstrap_task and not self._ml_bootstrap_task.done():
+            self._ml_bootstrap_task.cancel()
         self.event_bus.unsubscribe("CANDLE", self._handle_candle)
         self.event_bus.unsubscribe("SENTIMENT", self._handle_sentiment)
         self.event_bus.unsubscribe("FUNDING_RATE", self._handle_funding)

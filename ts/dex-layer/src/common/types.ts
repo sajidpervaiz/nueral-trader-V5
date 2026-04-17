@@ -56,6 +56,16 @@ export interface DEXConfig {
   network: NetworkConfig;
   maxSlippageBps: number;
   walletPrivateKey?: string;
+  mevProtection?: {
+    enableFlashbots?: boolean;
+    enablePrivateMempool?: boolean;
+    maxSlippage?: number;
+    minPriorityFee?: string;
+    blockTolerance?: number;
+    sandwichDetection?: boolean;
+    dynamicSlippage?: boolean;
+    maxGasPrice?: string;
+  };
 }
 
 export type LogLevel = "debug" | "info" | "warn" | "error";

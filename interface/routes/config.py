@@ -23,10 +23,12 @@ def configure_config_routes(
     risk_manager: Optional[RiskManager] = None,
     order_manager: Optional[OrderManager] = None,
 ) -> None:
-    global _CONFIG, _RISK_MANAGER, _ORDER_MANAGER
+    global _CONFIG, _RISK_MANAGER, _ORDER_MANAGER, _TRADING_MODE
     _CONFIG = config
     _RISK_MANAGER = risk_manager
     _ORDER_MANAGER = order_manager
+    if _CONFIG is not None:
+        _TRADING_MODE = TradingMode.PAPER if bool(getattr(_CONFIG, "paper_mode", True)) else TradingMode.LIVE
 
 
 class TradingMode(str, Enum):
@@ -88,16 +90,41 @@ def _effective_venues() -> dict[str, dict[str, Any]]:
             "enabled": enabled,
             "api_key_configured": bool(venue_cfg.get("api_key")),
             "api_secret_configured": bool(venue_cfg.get("api_secret")),
+            "testnet": bool(venue_cfg.get("testnet", False)),
         }
     return out
+
+
+def _runtime_mode() -> TradingMode:
+    global _TRADING_MODE
+    if _CONFIG is not None:
+        _TRADING_MODE = TradingMode.PAPER if bool(getattr(_CONFIG, "paper_mode", True)) else TradingMode.LIVE
+    return _TRADING_MODE
+
+
+def _validate_live_switch() -> Optional[str]:
+    venues = _effective_venues()
+    enabled = [name for name, data in venues.items() if data.get("enabled")]
+    if not enabled:
+        return "Enable a demo exchange before switching to live mode."
+
+    for venue in enabled:
+        data = venues.get(venue, {})
+        if not data.get("api_key_configured") or not data.get("api_secret_configured"):
+            return f"Add the {venue} demo API key and secret first."
+        if not data.get("testnet", False):
+            return "Runtime switching is only supported for demo or testnet venues."
+
+    return None
 
 
 @router.get("/trading-mode")
 async def get_trading_mode():
     """Get current trading mode."""
     try:
+        mode = _runtime_mode()
         return {
-            "mode": _TRADING_MODE.value,
+            "mode": mode.value,
             "reason": "Runtime mode state",
             "paper_mode": bool(_CONFIG.paper_mode) if _CONFIG else True,
         }
@@ -121,13 +148,30 @@ async def set_trading_mode(
                 detail="Confirmation required for live trading"
             )
 
-        _TRADING_MODE = mode
-        _record_change("trading_mode", {"mode": mode.value, "confirmation": confirmation})
+        if mode == TradingMode.LIVE:
+            validation_error = _validate_live_switch()
+            if validation_error:
+                raise HTTPException(status_code=400, detail=validation_error)
+            if _CONFIG is not None:
+                _CONFIG.paper_mode = False
+        else:
+            if _CONFIG is not None:
+                _CONFIG.paper_mode = True
+
+        _TRADING_MODE = _runtime_mode() if mode != TradingMode.SIMULATION else mode
+        if _CONFIG is not None:
+            try:
+                _CONFIG.persist_runtime_overrides()
+            except Exception as exc:
+                logger.warning(f"Failed to persist trading mode override: {exc}")
+        _record_change("trading_mode", {"mode": _TRADING_MODE.value, "confirmation": confirmation})
 
         return {
-            "mode": mode.value,
+            "success": True,
+            "mode": _TRADING_MODE.value,
+            "paper_mode": bool(_CONFIG.paper_mode) if _CONFIG else (_TRADING_MODE != TradingMode.LIVE),
             "status": "updated",
-            "message": f"Trading mode set to {mode.value}",
+            "message": f"Trading mode set to {_TRADING_MODE.value}",
         }
 
     except HTTPException:

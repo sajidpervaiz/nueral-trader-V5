@@ -20,6 +20,10 @@ from typing import Any
 from loguru import logger
 
 
+class ProtectiveOrderFallbackRequired(RuntimeError):
+    """Exchange-side protective orders are unavailable; use bot-managed exits."""
+
+
 @dataclass
 class ProtectiveOrders:
     """Tracks exchange-side SL and TP for a position."""
@@ -86,21 +90,29 @@ class ExchangeOrderPlacer:
         return markets.get(symbol)
 
     def round_price(self, symbol: str, price: float) -> float:
-        """Round a price to the symbol's tick size (price precision)."""
+        """Round a price to the symbol's tick size or decimal precision."""
         market = self._get_market(symbol)
         if market:
             precision = market.get("precision", {})
-            tick = precision.get("price")
+            limits = market.get("limits", {})
+            tick = _normalize_step_size(
+                precision.get("price"),
+                ((limits.get("price") or {}).get("min")),
+            )
             if tick is not None and tick > 0:
                 return _round_to_precision(price, tick)
         return price
 
     def round_quantity(self, symbol: str, qty: float) -> float:
-        """Round a quantity to the symbol's step size (amount precision)."""
+        """Round a quantity to the symbol's step size or decimal precision."""
         market = self._get_market(symbol)
         if market:
             precision = market.get("precision", {})
-            step = precision.get("amount")
+            limits = market.get("limits", {})
+            step = _normalize_step_size(
+                precision.get("amount"),
+                ((limits.get("amount") or {}).get("min")),
+            )
             if step is not None and step > 0:
                 return _round_to_precision(qty, step)
         return qty
@@ -165,6 +177,14 @@ class ExchangeOrderPlacer:
                     symbol, prot.close_side, quantity, sl_price, prot.sl_order_id,
                 )
             except Exception as exc:
+                if _is_unsupported_protective_order_error(exc):
+                    logger.warning(
+                        "Exchange-side SL unsupported for {} on this runtime — falling back to bot-managed exits: {}",
+                        symbol,
+                        exc,
+                    )
+                    self._protective[symbol] = prot
+                    raise ProtectiveOrderFallbackRequired(str(exc)) from exc
                 logger.critical(
                     "FAILED to place SL for {} — POSITION UNPROTECTED: {}",
                     symbol, exc,
@@ -318,7 +338,6 @@ class ExchangeOrderPlacer:
         params: dict[str, Any] = {
             "stopPrice": stop_price,
             "workingType": self._working_type,
-            "type": "STOP_MARKET",
         }
         if self._hedge_mode:
             params.update(self._position_side_param(direction))
@@ -346,7 +365,6 @@ class ExchangeOrderPlacer:
         params: dict[str, Any] = {
             "stopPrice": stop_price,
             "workingType": self._working_type,
-            "type": "TAKE_PROFIT_MARKET",
         }
         if self._hedge_mode:
             params.update(self._position_side_param(direction))
@@ -365,6 +383,56 @@ class ExchangeOrderPlacer:
 
 
 # ── Module-level helper ──────────────────────────────────────────────────────
+
+def _is_unsupported_protective_order_error(exc: Exception) -> bool:
+    """Detect venue/runtime combinations that do not support exchange-native stop orders."""
+    msg = str(exc).lower()
+    return (
+        "code\":-4120" in msg
+        or "order type not supported for this endpoint" in msg
+        or "algo order api endpoints" in msg
+    )
+
+
+def _normalize_step_size(precision: float | int | None, min_value: float | int | None = None) -> float | None:
+    """Convert CCXT precision metadata into a concrete step size.
+
+    CCXT markets may expose precision either as:
+    - a literal step size like 0.001, or
+    - a number of decimal places like 3.
+    """
+    if precision is None:
+        try:
+            min_float = float(min_value) if min_value is not None else None
+        except (TypeError, ValueError):
+            min_float = None
+        return min_float if min_float and min_float > 0 else None
+
+    try:
+        prec = float(precision)
+    except (TypeError, ValueError):
+        return None
+
+    if prec <= 0:
+        return None
+    if prec < 1:
+        return prec
+
+    min_float: float | None = None
+    try:
+        min_float = float(min_value) if min_value is not None else None
+    except (TypeError, ValueError):
+        min_float = None
+
+    if min_float is not None and min_float > 0:
+        if min_float < 1 or float(min_float).is_integer():
+            return min_float
+
+    if float(prec).is_integer() and prec <= 18:
+        return 10 ** (-int(prec))
+
+    return prec
+
 
 def _round_to_precision(value: float, precision: float) -> float:
     """Round *value* down to the nearest multiple of *precision*.

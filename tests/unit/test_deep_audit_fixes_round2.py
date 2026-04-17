@@ -5,6 +5,7 @@ import asyncio
 import math
 import re
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -144,9 +145,59 @@ class TestWALReplayLogsErrors:
         assert "except Exception:" not in source or "logger" in source
 
 
+class TestConfigRuntimePersistence:
+    def test_runtime_overrides_persist_after_reload(self, tmp_path, monkeypatch):
+        src = Path(__file__).resolve().parents[2] / "config" / "settings.yaml"
+        cfg_path = tmp_path / "settings.yaml"
+        cfg_path.write_text(src.read_text())
+        override_path = tmp_path / "settings.runtime.yaml"
+        monkeypatch.setenv("NT_RUNTIME_CONFIG_PATH", str(override_path))
+
+        cfg = Config(path=cfg_path)
+        cfg.paper_mode = False
+        cfg._data.setdefault("exchanges", {}).setdefault("binance", {}).update({
+            "enabled": True,
+            "api_key": "demo-key",
+            "api_secret": "demo-secret",
+            "testnet": True,
+        })
+
+        cfg.persist_runtime_overrides()
+
+        reloaded = Config(path=cfg_path)
+        assert reloaded.paper_mode is False
+        assert reloaded.get_value("exchanges", "binance", "enabled") is True
+        assert reloaded.get_value("exchanges", "binance", "api_key") == "demo-key"
+        assert reloaded.get_value("exchanges", "binance", "api_secret") == "demo-secret"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # FIX 3: dashboard_api input validation
 # ═══════════════════════════════════════════════════════════════════════════
+
+class TestDemoModeStartupSafety:
+    def test_testnet_live_mode_does_not_require_confirmation(self):
+        from main import _requires_live_confirmation
+
+        cfg = MagicMock(spec=Config)
+        cfg.paper_mode = False
+        cfg.get_value.side_effect = lambda *keys, default=None: {
+            "binance": {"enabled": True, "testnet": True}
+        } if keys == ("exchanges",) else default
+
+        assert _requires_live_confirmation(cfg) is False
+
+    def test_mainnet_live_mode_still_requires_confirmation(self):
+        from main import _requires_live_confirmation
+
+        cfg = MagicMock(spec=Config)
+        cfg.paper_mode = False
+        cfg.get_value.side_effect = lambda *keys, default=None: {
+            "binance": {"enabled": True, "testnet": False}
+        } if keys == ("exchanges",) else default
+
+        assert _requires_live_confirmation(cfg) is True
+
 
 class TestDashboardApiInputValidation:
     def test_valid_symbols_accepted(self):
@@ -317,9 +368,270 @@ class TestSmartOrderRouterRefresh:
         assert source.count("self._last_score_refresh") >= 3  # read, set inside lock, read again
 
 
+class TestLiveSignalQualityThreshold:
+    def test_live_mode_uses_stricter_quality_gate(self):
+        from engine.signal_generator import SignalGenerator
+
+        cfg = MagicMock(spec=Config)
+        cfg.paper_mode = False
+
+        def _get_value(*args, default=None):
+            if args == ("signals",):
+                return {
+                    "primary_timeframe": "15m",
+                    "confirmation_timeframes": ["1h", "4h"],
+                    "min_score_threshold": 0.35,
+                    "min_contributing_factors": 2,
+                }
+            if args == ("system", "paper_mode"):
+                return False
+            return default if default is not None else {}
+
+        cfg.get_value.side_effect = _get_value
+        sg = SignalGenerator(cfg, EventBus(), MagicMock())
+
+        assert sg._get_quality_threshold() == 65
+        assert sg._get_technical_threshold() == 65
+        assert sg._get_volume_threshold() == 60
+
+
+class TestMLBootstrap:
+    def _make_cfg(self):
+        cfg = MagicMock(spec=Config)
+        cfg.paper_mode = False
+
+        def _get_value(*args, default=None):
+            if args == ("signals",):
+                return {
+                    "primary_timeframe": "15m",
+                    "confirmation_timeframes": ["1h", "4h"],
+                    "min_score_threshold": 0.35,
+                    "min_contributing_factors": 2,
+                }
+            if args == ("risk",):
+                return {"min_orderbook_depth_usd": 10000, "default_leverage": 5}
+            if args == ("exchanges", "binance"):
+                return {"symbols": ["BTC/USDT:USDT"]}
+            if args == ("system", "paper_mode"):
+                return False
+            return default if default is not None else {}
+
+        cfg.get_value.side_effect = _get_value
+        return cfg
+
+    def _make_df(self):
+        import pandas as pd
+        import numpy as np
+
+        n = 240
+        closes = np.linspace(100, 140, n) + np.sin(np.arange(n) / 3)
+        return pd.DataFrame({
+            "open": closes - 0.5,
+            "high": closes + 1.0,
+            "low": closes - 1.0,
+            "close": closes,
+            "volume": np.linspace(1000, 1500, n),
+            "ema_12": pd.Series(closes).ewm(span=12, adjust=False).mean(),
+            "ema_26": pd.Series(closes).ewm(span=26, adjust=False).mean(),
+            "rsi_14": np.clip(50 + np.sin(np.arange(n) / 8) * 15, 20, 80),
+            "returns_5": pd.Series(closes).pct_change(5).fillna(0.0),
+            "vol_20": pd.Series(closes).pct_change().rolling(20).std().fillna(0.01),
+            "volume_ratio": np.linspace(0.9, 1.6, n),
+            "adx": np.linspace(18, 35, n),
+        })
+
+    def test_signal_generator_can_bootstrap_ml_model(self, tmp_path):
+        from engine.signal_generator import SignalGenerator
+
+        dm = MagicMock()
+        sg = SignalGenerator(self._make_cfg(), EventBus(), dm)
+        dm.get_dataframe.return_value = self._make_df()
+
+        model_path = tmp_path / "ml_bootstrap.pkl"
+        result = sg._bootstrap_ml_model(model_path=str(model_path))
+
+        assert result["trained"] is True
+        assert model_path.exists()
+        assert sg._ml_scorer._model_loaded is True
+        assert result["rows"] >= 200
+
+    def test_bootstrap_ignores_sparse_indicator_columns(self, tmp_path):
+        from engine.signal_generator import SignalGenerator
+        import numpy as np
+
+        dm = MagicMock()
+        sg = SignalGenerator(self._make_cfg(), EventBus(), dm)
+        df = self._make_df()
+        df["ema_200"] = np.nan
+        df.loc[df.index[-21:], "ema_200"] = np.linspace(110, 120, 21)
+        dm.get_dataframe.return_value = df
+
+        model_path = tmp_path / "ml_bootstrap_sparse.pkl"
+        result = sg._bootstrap_ml_model(model_path=str(model_path))
+
+        assert result["trained"] is True
+        assert result["rows"] >= 150
+
+
+class TestAIAgentAttachment:
+    def test_signal_generator_exposes_agent_status(self):
+        from engine.signal_generator import SignalGenerator
+
+        cfg = MagicMock(spec=Config)
+        cfg.paper_mode = False
+
+        def _get_value(*args, default=None):
+            if args == ("signals",):
+                return {
+                    "primary_timeframe": "15m",
+                    "confirmation_timeframes": ["1h", "4h"],
+                    "min_score_threshold": 0.35,
+                    "min_contributing_factors": 2,
+                }
+            if args == ("risk",):
+                return {"min_orderbook_depth_usd": 10000, "default_leverage": 5}
+            if args == ("ai_agent",):
+                return {"enabled": True, "mode": "full", "min_confidence": 0.55}
+            if args == ("system", "paper_mode"):
+                return False
+            return default if default is not None else {}
+
+        cfg.get_value.side_effect = _get_value
+        sg = SignalGenerator(cfg, EventBus(), MagicMock())
+
+        status = sg.get_agent_status()
+        assert status["attached"] is True
+        assert status["enabled"] is True
+        assert status["mode"] == "full"
+
+    def test_ai_agent_rejects_weak_signal(self):
+        from engine.ai_agent import TradingAIAgent
+
+        agent = TradingAIAgent(enabled=True, mode="full", min_confidence=0.55)
+        signal = _make_signal(score=0.42)
+        signal.quality_score = 45
+        signal.technical_score = 0.10
+        signal.ml_score = 0.05
+        signal.metadata = {"risk_reward": 0.8, "volume_flow_score": 10, "smc_score": 5}
+
+        decision = agent.review_signal(signal)
+
+        assert decision.action == "reject"
+        assert decision.approved is False
+
+    def test_ai_agent_exposes_claude_provider_status(self):
+        from engine.ai_agent import TradingAIAgent
+
+        agent = TradingAIAgent(
+            enabled=True,
+            mode="full",
+            provider="claude",
+            model="claude-3-5-sonnet-latest",
+            api_key="test-key",
+        )
+
+        status = agent.get_status()
+
+        assert status["provider"] == "claude"
+        assert status["model"] == "claude-3-5-sonnet-latest"
+        assert status["api_configured"] is True
+        assert status["remote_enabled"] is True
+
+    def test_ai_agent_supports_openai_provider_status(self):
+        from engine.ai_agent import TradingAIAgent
+
+        agent = TradingAIAgent(
+            enabled=True,
+            mode="full",
+            provider="openai",
+            model="gpt-4o-mini",
+            api_key="test-key",
+        )
+
+        status = agent.get_status()
+
+        assert status["provider"] == "openai"
+        assert status["model"] == "gpt-4o-mini"
+        assert status["api_configured"] is True
+        assert status["remote_enabled"] is True
+
+    def test_ai_agent_claude_falls_back_to_local_on_error(self):
+        from engine.ai_agent import TradingAIAgent
+
+        agent = TradingAIAgent(
+            enabled=True,
+            mode="full",
+            provider="claude",
+            api_key="test-key",
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("anthropic unavailable")
+
+        agent._review_with_claude = _boom
+
+        signal = _make_signal(score=0.42)
+        signal.quality_score = 45
+        signal.technical_score = 0.10
+        signal.ml_score = 0.05
+        signal.metadata = {"risk_reward": 0.8, "volume_flow_score": 10, "smc_score": 5}
+
+        decision = agent.review_signal(signal)
+        status = agent.get_status()
+
+        assert decision.approved is False
+        assert status["last_decision_source"] == "local"
+
+    def test_ai_agent_chat_local_response(self):
+        from engine.ai_agent import TradingAIAgent
+
+        agent = TradingAIAgent(enabled=True, mode="full", provider="local")
+
+        result = agent.chat("should I keep auto trading on?", context={"auto_trading_enabled": True, "open_positions": 1})
+
+        assert result["success"] is True
+        assert result["provider"] == "local"
+        assert isinstance(result["reply"], str)
+        assert len(result["reply"]) > 0
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Regression tests
 # ═══════════════════════════════════════════════════════════════════════════
+
+class TestPipelineStatusRegression:
+    def test_zero_layer_scores_mark_fail_not_unknown(self):
+        from engine.signal_generator import SignalGenerator
+
+        cfg = MagicMock(spec=Config)
+        cfg.paper_mode = False
+
+        def _get_value(*args, default=None):
+            if args == ("signals",):
+                return {
+                    "primary_timeframe": "15m",
+                    "confirmation_timeframes": ["1h", "4h"],
+                    "min_score_threshold": 0.35,
+                    "min_contributing_factors": 2,
+                }
+            if args == ("risk",):
+                return {"min_orderbook_depth_usd": 10000, "default_leverage": 5}
+            if args == ("ai_agent",):
+                return {"enabled": True, "mode": "full"}
+            if args == ("system", "paper_mode"):
+                return False
+            return default if default is not None else {}
+
+        cfg.get_value.side_effect = _get_value
+        sg = SignalGenerator(cfg, EventBus(), MagicMock())
+        sg._update_layer_status(l3=0, l4=0, l5=0, l6=0, l7=0)
+
+        assert sg._last_layer_status["smart_money_concepts"] == "FAIL"
+        assert sg._last_layer_status["volume_flow"] == "FAIL"
+        assert sg._last_layer_status["regime_detection"] == "FAIL"
+        assert sg._last_layer_status["ml_ensemble"] == "FAIL"
+        assert sg._last_layer_status["signal_quality"] == "FAIL"
+
 
 class TestRound2Regressions:
     @pytest.mark.asyncio

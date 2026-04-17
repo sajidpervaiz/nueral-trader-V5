@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,15 @@ def _interpolate(value: Any) -> Any:
     return value
 
 
+def _deep_merge(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            merged[key] = _deep_merge(merged[key], value) if key in merged else value
+        return merged
+    return override
+
+
 class Config:
     _instance: Config | None = None
 
@@ -43,8 +53,22 @@ class Config:
             path = config_path
         if path is None:
             path = Path(__file__).parent.parent / "config" / "settings.yaml"
-        with open(path, "r") as fh:
-            raw = yaml.safe_load(fh)
+
+        self._path = Path(path)
+        self._runtime_override_path = self._resolve_runtime_override_path()
+
+        with open(self._path, "r") as fh:
+            raw = yaml.safe_load(fh) or {}
+
+        if self._runtime_override_path.exists():
+            try:
+                with open(self._runtime_override_path, "r") as fh:
+                    override_raw = yaml.safe_load(fh) or {}
+                raw = _deep_merge(raw, override_raw)
+                logger.debug("Applied runtime overrides from {}", self._runtime_override_path)
+            except Exception as exc:
+                logger.warning("Failed to load runtime overrides from {}: {}", self._runtime_override_path, exc)
+
         self._data: dict[str, Any] = _interpolate(raw)
 
         # Pydantic validation — fail fast on bad config
@@ -54,7 +78,7 @@ class Config:
             logger.error("Config validation FAILED: {}", exc)
             raise SystemExit(f"FATAL: Invalid configuration — {exc}") from exc
 
-        logger.debug("Configuration loaded and validated from {}", path)
+        logger.debug("Configuration loaded and validated from {}", self._path)
 
     @classmethod
     def get(cls, path: str | Path | None = None) -> "Config":
@@ -78,6 +102,79 @@ class Config:
             return self.section(*keys)
         except (KeyError, TypeError):
             return default
+
+    def _resolve_runtime_override_path(self) -> Path:
+        env_path = os.getenv("NT_RUNTIME_CONFIG_PATH", "").strip()
+        if env_path:
+            return Path(env_path)
+        return self._path.with_name(f"{self._path.stem}.runtime.yaml")
+
+    def persist_runtime_overrides(self) -> Path:
+        payload: dict[str, Any] = {
+            "system": {
+                "paper_mode": self.paper_mode,
+            }
+        }
+
+        exchanges = self._data.get("exchanges", {})
+        if isinstance(exchanges, dict):
+            payload["exchanges"] = {}
+            for venue, venue_cfg in exchanges.items():
+                if not isinstance(venue_cfg, dict):
+                    continue
+                persisted: dict[str, Any] = {}
+                for key in ("enabled", "api_key", "api_secret", "passphrase", "testnet", "type"):
+                    if key in venue_cfg:
+                        persisted[key] = venue_cfg.get(key)
+                if "symbols" in venue_cfg:
+                    persisted["symbols"] = deepcopy(venue_cfg.get("symbols"))
+                if persisted:
+                    payload["exchanges"][venue] = persisted
+
+        dex_cfg = self._data.get("dex", {})
+        if isinstance(dex_cfg, dict):
+            dex_payload: dict[str, Any] = {}
+            for key in ("enabled", "rpc_url", "private_key"):
+                if key in dex_cfg:
+                    dex_payload[key] = dex_cfg.get(key)
+            for venue in ("uniswap", "sushiswap", "dydx"):
+                venue_cfg = dex_cfg.get(venue)
+                if isinstance(venue_cfg, dict) and "enabled" in venue_cfg:
+                    dex_payload[venue] = {"enabled": bool(venue_cfg.get("enabled", False))}
+            if dex_payload:
+                payload["dex"] = dex_payload
+
+        notifications = self._data.get("notifications", {})
+        if isinstance(notifications, dict):
+            telegram_cfg = notifications.get("telegram", {})
+            if isinstance(telegram_cfg, dict):
+                payload["notifications"] = {
+                    "telegram": {
+                        "bot_token": telegram_cfg.get("bot_token", ""),
+                        "chat_id": telegram_cfg.get("chat_id", ""),
+                    }
+                }
+
+        ai_cfg = self._data.get("ai_agent", {})
+        if isinstance(ai_cfg, dict):
+            payload["ai_agent"] = {
+                "enabled": bool(ai_cfg.get("enabled", True)),
+                "provider": ai_cfg.get("provider", "local"),
+                "model": ai_cfg.get("model", "claude-3-5-sonnet-latest"),
+                "api_key": ai_cfg.get("api_key", ""),
+                "timeout_seconds": float(ai_cfg.get("timeout_seconds", 8.0) or 8.0),
+                "remote_weight": float(ai_cfg.get("remote_weight", 0.35) or 0.35),
+            }
+
+        self._runtime_override_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._runtime_override_path, "w") as fh:
+            yaml.safe_dump(payload, fh, sort_keys=False)
+        try:
+            os.chmod(self._runtime_override_path, 0o600)
+        except OSError:
+            pass
+        logger.info("Persisted runtime overrides to {}", self._runtime_override_path)
+        return self._runtime_override_path
 
     @property
     def paper_mode(self) -> bool:

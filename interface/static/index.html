@@ -21,9 +21,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
 
 /* ── Layout ── */
-.app{display:grid;grid-template-rows:auto auto 1fr;height:100vh}
-.header{display:flex;align-items:center;padding:0 16px;background:var(--bg1);border-bottom:1px solid var(--border);gap:12px;z-index:10}
-.body{display:grid;grid-template-columns:1fr 320px;overflow:hidden;background:var(--bg0)}
+.app{display:grid;grid-template-rows:auto auto 1fr;height:100vh;background:#0f131b}
+.header{display:flex;align-items:center;padding:0 16px;background:#131722;border-bottom:1px solid var(--border);gap:12px;z-index:10;box-shadow:0 1px 0 rgba(255,255,255,.03)}
+.body{display:grid;grid-template-columns:minmax(0,1fr) 360px;overflow:hidden;background:#0f131b}
 
 /* ── Header ── */
 .logo{font:800 15px 'JetBrains Mono';background:linear-gradient(135deg,#6366f1,#a855f7);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
@@ -47,19 +47,41 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .hdr-btn.danger.active{background:var(--red);color:#fff;border-color:var(--red)}
 
 /* ── Main area ── */
-.main{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border)}
-.tabs{display:flex;padding:6px 12px;gap:4px;background:var(--bg1);border-bottom:1px solid var(--border);flex-shrink:0}
-.tab{background:transparent;border:none;color:var(--text3);padding:6px 12px;border-radius:6px;cursor:pointer;font:500 11px;transition:all .15s}
-.tab:hover{color:var(--text2);background:var(--bg3)}.tab.active{background:var(--blue);color:#fff}
-.tf-group{display:flex;gap:2px;margin-left:auto;background:var(--bg2);border-radius:6px;padding:2px}
-.tf-btn{background:transparent;border:none;color:var(--text3);padding:4px 8px;border-radius:4px;cursor:pointer;font:500 9px 'JetBrains Mono'}.tf-btn.active{background:var(--blue);color:#fff}
+.main{display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--border);background:#0f131b}
+.tabs{display:flex;padding:8px 12px;gap:6px;background:#131722;border-bottom:1px solid var(--border);flex-shrink:0;align-items:center}
+.tab{background:transparent;border:1px solid transparent;color:var(--text3);padding:6px 12px;border-radius:8px;cursor:pointer;font:500 11px;transition:all .15s}
+.tab:hover{color:var(--text2);background:var(--bg3);border-color:var(--border2)}.tab.active{background:#1f6feb;color:#fff;border-color:#1f6feb}
+.tf-group{display:flex;gap:3px;margin-left:auto;background:#0f131b;border-radius:8px;padding:3px;border:1px solid var(--border)}
+.tf-btn{background:transparent;border:none;color:var(--text3);padding:5px 9px;border-radius:6px;cursor:pointer;font:600 9px 'JetBrains Mono'}.tf-btn.active{background:#1f6feb;color:#fff}
+.workspace-hud{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 12px;background:#131722;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.workspace-left,.workspace-right{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.tv-chip{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;background:var(--bg2);border:1px solid var(--border);color:var(--text2);font:600 9px 'JetBrains Mono';letter-spacing:.2px}
+.tv-chip.primary{background:rgba(56,139,255,.12);border-color:rgba(56,139,255,.35);color:#8cbcff}
+.tv-chip.live{background:rgba(0,210,106,.12);border-color:rgba(0,210,106,.35);color:var(--green)}
+.tv-actionbar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 12px;background:#0f131b;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.tv-action-group{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.tv-action-btn{background:transparent;border:1px solid var(--border);color:var(--text2);padding:5px 9px;border-radius:6px;cursor:pointer;font:600 9px 'JetBrains Mono'}
+.tv-action-btn:hover{background:var(--bg3);color:var(--text)}
+.tv-action-btn.active{background:#1f6feb;color:#fff;border-color:#1f6feb}
+.tv-chip.clickable{cursor:pointer}
+.tv-chip.clickable:hover{background:var(--bg3);color:var(--text)}
 
 /* Tab content */
 .tab-content{flex:1;overflow:hidden;display:none}.tab-content.active{display:flex;flex-direction:column}
-.chart-wrap{flex:1;position:relative;min-height:200px}
-#chart{position:absolute;top:0;left:0;right:0;bottom:0}
-.chart-overlay{position:absolute;top:8px;left:10px;z-index:5;pointer-events:none;font:500 10px 'JetBrains Mono';color:var(--text2)}
-.chart-ohlc{display:flex;gap:8px}.chart-lbl{color:var(--text3)}
+.chart-wrap{flex:1;position:relative;min-height:240px;background:#131722;border-top:1px solid rgba(255,255,255,.02)}
+#chart{position:absolute;top:0;left:44px;right:0;bottom:24px}
+.chart-overlay{position:absolute;top:8px;left:54px;z-index:5;pointer-events:none;font:500 10px 'JetBrains Mono';color:var(--text2);background:rgba(15,19,27,.78);padding:4px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.03)}
+.chart-ohlc{display:flex;gap:8px;flex-wrap:wrap}.chart-lbl{color:var(--text3)}
+.chart-tools{position:absolute;left:8px;top:10px;bottom:30px;width:28px;display:flex;flex-direction:column;gap:6px;z-index:6}
+.chart-tool{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:6px;border:1px solid var(--border);background:rgba(15,19,27,.92);color:var(--text2);font:600 11px 'JetBrains Mono';cursor:pointer}
+.chart-tool:hover{background:var(--bg3);color:var(--text)}
+.chart-tool.active{background:#1f6feb;color:#fff;border-color:#1f6feb}
+.chart-statusbar{position:absolute;left:0;right:0;bottom:0;height:24px;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 52px;background:#0f131b;border-top:1px solid var(--border);font:500 9px 'JetBrains Mono';color:var(--text3)}
+.tv-embed{position:absolute;top:0;left:44px;right:0;bottom:24px;display:none;background:#131722}
+.tv-embed.active{display:block}
+.tv-embed .tradingview-widget-container,.tv-embed .tradingview-widget-container__widget{width:100%;height:100%}
+.tradingview-widget-copyright{padding:4px 8px;font:500 9px 'Inter';color:var(--text3);background:#131722;border-top:1px solid var(--border)}
+.tradingview-widget-copyright a{color:#8cbcff;text-decoration:none}
 
 /* ── Panels / cards ── */
 .panel{display:flex;flex-direction:column;overflow:hidden}
@@ -71,7 +93,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .panel-body{flex:1;overflow-y:auto;padding:8px 10px}
 
 /* ── Right sidebar ── */
-.sidebar{display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;background:var(--bg1);scrollbar-gutter:stable}
+.sidebar{display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;background:#11161f;scrollbar-gutter:stable;box-shadow:inset 1px 0 0 rgba(255,255,255,.03)}
 .sidebar-section{border-bottom:1px solid var(--border);flex-shrink:0}
 .sidebar-section.panel{overflow:visible}
 .sidebar-section .panel-hdr{cursor:pointer;user-select:none}
@@ -286,7 +308,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
   <div class="header">
     <div class="logo">◈ NEURALTRADER</div>
     <div class="sep"></div>
-    <div class="sym-box">
+    <div class="sym-box" onclick="openSymbolSearch()" title="Search / change symbol">
       <div><span class="sym-name" id="symName">BTC</span><br><span class="sym-pair" id="symPair">BTC/USDT</span></div>
       <span class="sym-px" id="symPx">$0</span>
       <span class="sym-chg up" id="symChg">0.00%</span>
@@ -299,7 +321,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
     </div>
     <div class="sep"></div>
     <span class="mode-badge" id="modeBadge">PAPER</span>
-    <div class="conn"><div class="conn-dot" id="connDot"></div><span id="connText">LIVE</span></div>
+    <div class="conn"><div class="conn-dot" id="connDot"></div><span id="connText">CONNECTING</span></div>
     <span class="clock" id="clock">--:--:--</span>
     <button class="hdr-btn" id="autoBtn" onclick="toggleAuto()">🤖 Auto</button>
     <button class="hdr-btn danger" id="killBtn" onclick="toggleKill()">⚡ Kill</button>
@@ -329,11 +351,48 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
       <!-- Tab: Chart -->
       <div class="tab-content active" id="tc-chart">
+        <div class="workspace-hud">
+          <div class="workspace-left">
+            <span class="tv-chip primary" id="tvSymbolState">BTC/USDT · 1M</span>
+            <span class="tv-chip live" id="tvVenueChip">CONNECTING</span>
+            <span class="tv-chip">PERP · USDⓈ-M</span>
+          </div>
+          <div class="workspace-right">
+            <button class="tv-chip clickable" onclick="runTvAction('indicators')">Indicators</button>
+            <button class="tv-chip clickable" onclick="runTvAction('depth')">Depth</button>
+            <button class="tv-chip clickable" onclick="runTvAction('positions')">Positions</button>
+          </div>
+        </div>
+        <div class="tv-actionbar">
+          <div class="tv-action-group">
+            <button class="tv-action-btn active" data-tv-action="price" onclick="runTvAction('price', this)">Price</button>
+            <button class="tv-action-btn" data-tv-action="tvwidget" onclick="runTvAction('tvwidget', this)">TV Widget</button>
+            <button class="tv-action-btn" data-tv-action="indicators" onclick="runTvAction('indicators', this)">Indicators</button>
+            <button class="tv-action-btn" data-tv-action="compare" onclick="runTvAction('compare', this)">Compare</button>
+            <button class="tv-action-btn" data-tv-action="replay" onclick="runTvAction('replay', this)">Replay</button>
+            <button class="tv-action-btn" data-tv-action="fullscreen" onclick="runTvAction('fullscreen', this)">Fullscreen</button>
+          </div>
+          <div class="tv-action-group">
+            <span class="tv-chip" id="tvQualityChip">QUALITY --</span>
+            <span class="tv-chip" id="tvAgentChip">AI AGENT</span>
+          </div>
+        </div>
         <div class="chart-wrap">
+          <div class="chart-tools">
+            <button class="chart-tool" title="Zoom in" onclick="runChartTool('zoom-in', this)">＋</button>
+            <button class="chart-tool" title="Zoom out" onclick="runChartTool('zoom-out', this)">－</button>
+            <button class="chart-tool" title="Fit content" onclick="runChartTool('fit', this)">≈</button>
+            <button class="chart-tool" title="Open pipeline" onclick="runChartTool('pipeline', this)">⊕</button>
+            <button class="chart-tool" title="Go live" onclick="runChartTool('live', this)">⌖</button>
+          </div>
           <div id="chart"></div>
+          <div id="tvWidgetHost" class="tv-embed">
+            <div class="tradingview-widget-container" id="tradingview-widget-container"></div>
+          </div>
           <div class="chart-overlay">
             <div class="chart-ohlc"><span class="chart-lbl">O</span><span id="chO">--</span> <span class="chart-lbl">H</span><span id="chH">--</span> <span class="chart-lbl">L</span><span id="chL">--</span> <span class="chart-lbl">C</span><span id="chC">--</span> <span class="chart-lbl">Vol</span><span id="chV">--</span></div>
           </div>
+          <div class="chart-statusbar"><span id="tvFooterState">Loading workspace…</span><span id="tvHintBar">Search / · 1-6 TF · F Fullscreen · V TV Toggle</span></div>
         </div>
       <div class="pos-resize" id="posResize"></div>
       <div class="panel" id="posPanel" style="height:220px;min-height:36px;max-height:60vh;flex-shrink:0">
@@ -377,7 +436,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
       <div class="sidebar-section panel" id="sec-markets">
         <div class="panel-hdr" onclick="toggleSection('sec-markets')"><span class="panel-title">Markets <span class="panel-badge" id="wlCount">0</span></span><span class="chevron">▼</span></div>
         <div style="padding:4px 8px;background:var(--bg2)"><input class="trade-input" type="text" placeholder="Search..." id="searchInput" oninput="filterWL()"></div>
-        <div class="panel-body" id="watchlist" style="padding:0;max-height:180px"></div>
+        <div class="panel-body" id="watchlist" style="padding:0;max-height:260px"></div>
       </div>
 
       <!-- Order Book -->
@@ -413,7 +472,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
       <!-- Available Pairs / Currencies -->
       <div class="sidebar-section panel" id="sec-currencies">
         <div class="panel-hdr" onclick="toggleSection('sec-currencies');loadCurrencies()"><span class="panel-title">Exchange Pairs <span class="panel-badge" id="currCount">0</span></span><span class="chevron">▼</span></div>
-        <div class="panel-body" id="currenciesBody" style="padding:0;max-height:200px;overflow-y:auto">
+        <div class="panel-body" id="currenciesBody" style="padding:0;max-height:420px;overflow-y:auto">
           <div style="color:var(--text3);font-size:10px;padding:8px">Click to load available pairs...</div>
         </div>
       </div>
@@ -453,6 +512,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
       <div class="sidebar-section" id="sec-regime">
         <div class="panel-hdr" onclick="toggleSection('sec-regime')"><span class="panel-title">Regime</span><span class="chevron">▼</span></div>
         <div style="padding:8px 10px" id="regimePanel"><div style="color:var(--text3);font-size:10px">Loading...</div></div>
+      </div>
+
+      <!-- AI Agent -->
+      <div class="sidebar-section" id="sec-agent">
+        <div class="panel-hdr" onclick="toggleSection('sec-agent')"><span class="panel-title">AI Agent</span><span class="chevron">▼</span></div>
+        <div style="padding:8px 10px" id="agentPanel"><div style="color:var(--text3);font-size:10px">Loading...</div></div>
       </div>
 
       <!-- Guardrails -->
@@ -500,6 +565,20 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
       <label><input type="checkbox" id="cfgAutoTP"> Auto TP</label>
       <label><input type="checkbox" id="cfgTrail"> Trailing</label>
     </div>
+    <div class="modal-section">AI Trade Agent</div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px">
+      <label><input type="checkbox" id="cfgAiEnabled"> Enable AI Agent</label>
+      <label>Provider
+        <select id="cfgAiProvider" onchange="updateAgentProviderUI()" style="margin-left:6px;background:var(--bg0);color:var(--text1);border:1px solid var(--border);border-radius:6px;padding:4px 8px;font:11px 'JetBrains Mono'">
+          <option value="local">LOCAL</option>
+          <option value="claude">CLAUDE</option>
+          <option value="openai">OPENAI</option>
+        </select>
+      </label>
+    </div>
+    <div class="modal-row"><input class="modal-input" id="cfgAiModel" placeholder="Model, e.g. claude-3-5-sonnet-latest"><input class="modal-input" id="cfgAiKey" placeholder="API Key"></div>
+    <div class="modal-row"><input class="modal-input" id="cfgAiTimeout" placeholder="Timeout seconds"><input class="modal-input" id="cfgAiWeight" placeholder="Remote weight 0.0 - 1.0"></div>
+    <div id="cfgAiHint" style="font:10px 'JetBrains Mono';color:var(--text3)">Choose local, Claude, or OpenAI for live trade review.</div>
     <div class="modal-section">Trading Mode</div>
     <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
       <select id="cfgTradingMode" onchange="updateModeWarning()" style="background:var(--bg0);color:var(--text1);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font:11px 'JetBrains Mono';flex:1;max-width:200px">
@@ -525,18 +604,97 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 let chart, candleSeries, volumeSeries;
 let symbol = 'BTC', tf = '1m';
 let autoTrading = false, killActive = false;
+let currentBarSpacing = 6;
+let chartMode = 'native';
+let lastTvWidgetKey = '';
 let watchlistData = [];
 let streamSource = null;
 let lastSnap = 0;
 let isLiveMode = false;
+let activeVenue = 'paper';
+let isTestnetMode = false;
 let exchangePositions = [];
 let exchangeOrders = [];
 let exchangeCurrencies = [];
+let agentChatHistory = [{sender:'Assistant', msg:'Ask for status, risk, learning, or say retrain model.'}];
 
 /* ── Helpers ── */
 function esc(v) { return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function $(id) { return document.getElementById(id); }
 function fmt$(n) { return '$' + Number(n||0).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:2}); }
+function getConnectionLabel(state='') {
+  const venue = String(activeVenue || (isLiveMode ? 'binance' : 'paper')).toUpperCase();
+  if (!isLiveMode) return state ? 'PAPER · ' + state : 'PAPER';
+  const network = isTestnetMode ? 'DEMO' : 'LIVE';
+  return state ? venue + ' ' + network + ' · ' + state : venue + ' ' + network;
+}
+function refreshWorkspaceHud() {
+  if ($('tvSymbolState')) $('tvSymbolState').textContent = symbol + '/USDT · ' + String(tf || '1m').toUpperCase();
+  if ($('tvVenueChip')) $('tvVenueChip').textContent = getConnectionLabel();
+  if ($('tvFooterState')) $('tvFooterState').textContent = getConnectionLabel(autoTrading ? 'AUTO ON' : 'AUTO OFF');
+  if (chartMode === 'tv') initTradingViewWidget();
+}
+function getTradingViewSymbol() {
+  const base = String(symbol || 'BTC').toUpperCase().split('/')[0].split(':')[0].replace(/[^A-Z0-9]/g, '');
+  return 'BINANCE:' + (base || 'BTC') + 'USDT';
+}
+function getTradingViewInterval() {
+  const map = { '1m':'1', '5m':'5', '15m':'15', '1h':'60', '4h':'240', '1d':'D' };
+  return map[String(tf || '1m')] || '15';
+}
+function showNativeChart() {
+  chartMode = 'native';
+  if ($('chart')) $('chart').style.display = 'block';
+  if ($('tvWidgetHost')) $('tvWidgetHost').classList.remove('active');
+  const overlay = document.querySelector('.chart-overlay');
+  if (overlay) overlay.style.display = '';
+  const tools = document.querySelector('.chart-tools');
+  if (tools) tools.style.display = '';
+  setTimeout(resizeChart, 50);
+}
+function initTradingViewWidget(force=false) {
+  const host = $('tradingview-widget-container');
+  if (!host) return;
+  const widgetKey = getTradingViewSymbol() + '|' + getTradingViewInterval();
+  if (!force && lastTvWidgetKey === widgetKey && host.dataset.ready === '1') return;
+  lastTvWidgetKey = widgetKey;
+  host.dataset.ready = '1';
+  host.innerHTML = '';
+  const widget = document.createElement('div');
+  widget.className = 'tradingview-widget-container__widget';
+  host.appendChild(widget);
+  const copyright = document.createElement('div');
+  copyright.className = 'tradingview-widget-copyright';
+  copyright.innerHTML = '<a href="https://www.tradingview.com/" target="_blank" rel="noopener nofollow">Official TradingView chart widget</a>';
+  host.appendChild(copyright);
+  const script = document.createElement('script');
+  script.type = 'text/javascript';
+  script.async = true;
+  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  script.text = JSON.stringify({
+    autosize: true,
+    symbol: getTradingViewSymbol(),
+    interval: getTradingViewInterval(),
+    timezone: 'Etc/UTC',
+    theme: 'dark',
+    style: '1',
+    locale: 'en',
+    allow_symbol_change: true,
+    calendar: false,
+    support_host: 'https://www.tradingview.com'
+  });
+  host.appendChild(script);
+}
+function showTradingViewWidget() {
+  chartMode = 'tv';
+  if ($('chart')) $('chart').style.display = 'none';
+  if ($('tvWidgetHost')) $('tvWidgetHost').classList.add('active');
+  const overlay = document.querySelector('.chart-overlay');
+  if (overlay) overlay.style.display = 'none';
+  const tools = document.querySelector('.chart-tools');
+  if (tools) tools.style.display = 'none';
+  initTradingViewWidget(true);
+}
 
 /* ── Init ── */
 document.addEventListener('DOMContentLoaded', () => {
@@ -551,6 +709,8 @@ document.addEventListener('DOMContentLoaded', () => {
   setInterval(() => { if (Date.now() - lastSnap > 8000) pollSnapshot(); }, 4000);
   setInterval(() => $('clock').textContent = new Date().toLocaleTimeString('en-GB'), 1000);
   $('tradeType').onchange = e => $('priceRow').style.display = e.target.value === 'limit' ? '' : 'none';
+  document.addEventListener('keydown', handleHotkeys);
+  refreshWorkspaceHud();
 });
 
 /* ── Tabs ── */
@@ -573,6 +733,7 @@ function bindTf() {
     document.querySelectorAll('.tf-btn').forEach(x => x.classList.remove('active'));
     b.classList.add('active');
     tf = b.dataset.tf;
+    refreshWorkspaceHud();
     loadCandles();
     startStream();
   });
@@ -585,6 +746,192 @@ function bindBtmTabs() {
     const panel = document.querySelector('[data-panel="'+t.dataset.btm+'"]');
     if (panel) panel.classList.add('active');
   });
+}
+function activateTopTab(tabName) {
+  const btn = document.querySelector('.tab[data-tab="'+tabName+'"]');
+  if (btn) btn.click();
+}
+function focusMarketSearch() {
+  const input = $('searchInput');
+  if (input) {
+    ensureSectionOpen('sec-markets');
+    input.focus();
+    input.select();
+  }
+}
+function openSymbolSearch() {
+  const current = symbol || 'BTC';
+  const typed = window.prompt('Enter symbol, for example BTC, ETH, SOL or XRP', current);
+  if (!typed) return;
+  const query = String(typed).trim().toUpperCase().replace('/USDT','').replace(':USDT','');
+  if (!query) return;
+  const pool = [...watchlistData, ...exchangeCurrencies];
+  const found = pool.find(item => String(item.symbol || '').toUpperCase().includes(query));
+  if (found && found.symbol) {
+    selectSym(String(found.symbol).replace('/USDT:USDT','').replace('/USDT',''));
+    toast('info', 'Loaded ' + String(found.symbol));
+    return;
+  }
+  selectSym(query);
+  toast('info', 'Loaded ' + query);
+}
+function handleHotkeys(e) {
+  const tag = String((e.target && e.target.tagName) || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+  const key = String(e.key || '').toLowerCase();
+  const tfMap = { '1':'1m', '2':'5m', '3':'15m', '4':'1h', '5':'4h', '6':'1d' };
+  if (key === '/') {
+    e.preventDefault();
+    focusMarketSearch();
+    return;
+  }
+  if (key === 's') {
+    openSymbolSearch();
+    return;
+  }
+  if (key === 'f') {
+    e.preventDefault();
+    toggleChartFullscreen();
+    return;
+  }
+  if (key === 'v') {
+    runTvAction('tvwidget');
+    return;
+  }
+  if (key === 'p') {
+    activateTopTab('pipeline');
+    return;
+  }
+  if (key === 'r') {
+    runTvAction('replay');
+    return;
+  }
+  if (key === 'm') {
+    ensureSectionOpen('sec-markets');
+    return;
+  }
+  if (tfMap[key]) {
+    const btn = document.querySelector('.tf-btn[data-tf="'+tfMap[key]+'"]');
+    if (btn) btn.click();
+  }
+}
+function activateBottomPanel(panelName) {
+  const btn = document.querySelector('.btm-tab[data-btm="'+panelName+'"]');
+  if (btn) btn.click();
+}
+function ensureSectionOpen(id) {
+  const sec = $(id);
+  if (sec && sec.classList.contains('collapsed')) toggleSection(id);
+}
+function cycleCompareSymbol() {
+  if (!watchlistData.length) return;
+  const idx = Math.max(0, watchlistData.findIndex(c => c.symbol === symbol));
+  const next = watchlistData[(idx + 1) % watchlistData.length];
+  if (next && next.symbol) {
+    selectSym(next.symbol);
+    toast('info', 'Compare switched to ' + next.symbol);
+  }
+}
+function toggleChartFullscreen() {
+  const target = document.querySelector('.chart-wrap');
+  if (!target || !target.requestFullscreen) return;
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    target.requestFullscreen().catch(() => {});
+  }
+}
+function setActiveTvActionButton(action) {
+  document.querySelectorAll('.tv-action-btn').forEach(btn => btn.classList.remove('active'));
+  const btn = document.querySelector('.tv-action-btn[data-tv-action="' + action + '"]');
+  if (btn) btn.classList.add('active');
+}
+function runTvAction(action, el) {
+  if (action === 'price') {
+    setActiveTvActionButton('price');
+    activateTopTab('chart');
+    showNativeChart();
+    loadCandles();
+    toast('info', 'Native chart active');
+    return;
+  }
+  if (action === 'tvwidget') {
+    activateTopTab('chart');
+    if (chartMode === 'tv') {
+      showNativeChart();
+      setActiveTvActionButton('price');
+      toast('info', 'TradingView widget turned off');
+    } else {
+      setActiveTvActionButton('tvwidget');
+      showTradingViewWidget();
+      toast('info', 'Official TradingView widget loaded');
+    }
+    return;
+  }
+  if (el && el.parentElement) {
+    el.parentElement.querySelectorAll('.tv-action-btn').forEach(btn => btn.classList.remove('active'));
+    el.classList.add('active');
+  }
+  if (action === 'indicators') {
+    activateTopTab('chart');
+    ensureSectionOpen('sec-tech');
+    loadTech();
+    toast('info', 'Indicators panel opened');
+    return;
+  }
+  if (action === 'depth') {
+    activateTopTab('chart');
+    ensureSectionOpen('sec-ob');
+    loadOB();
+    toast('info', 'Order book opened');
+    return;
+  }
+  if (action === 'positions') {
+    activateTopTab('chart');
+    activateBottomPanel('positions');
+    toast('info', 'Positions panel opened');
+    return;
+  }
+  if (action === 'compare') {
+    cycleCompareSymbol();
+    return;
+  }
+  if (action === 'replay') {
+    loadCandles();
+    startStream();
+    toast('info', 'Chart refreshed');
+    return;
+  }
+  if (action === 'fullscreen') {
+    toggleChartFullscreen();
+  }
+}
+function runChartTool(tool, el) {
+  document.querySelectorAll('.chart-tool').forEach(btn => btn.classList.remove('active'));
+  if (el) el.classList.add('active');
+  if (!chart) return;
+  if (tool === 'zoom-in') {
+    currentBarSpacing = Math.min(30, currentBarSpacing + 2);
+    chart.applyOptions({ timeScale: { barSpacing: currentBarSpacing, borderColor: '#2a2f42' } });
+    return;
+  }
+  if (tool === 'zoom-out') {
+    currentBarSpacing = Math.max(2, currentBarSpacing - 2);
+    chart.applyOptions({ timeScale: { barSpacing: currentBarSpacing, borderColor: '#2a2f42' } });
+    return;
+  }
+  if (tool === 'fit') {
+    chart.timeScale().fitContent();
+    return;
+  }
+  if (tool === 'pipeline') {
+    activateTopTab('pipeline');
+    return;
+  }
+  if (tool === 'live') {
+    activateTopTab('chart');
+    chart.timeScale().scrollToRealTime();
+  }
 }
 
 /* ── Chart ── */
@@ -601,10 +948,11 @@ function initChart() {
   const w = el.clientWidth || 800, h = el.clientHeight || 500;
   chart = LightweightCharts.createChart(el, {
     width: w, height: h,
-    layout: { background: { color: '#0b0d11' }, textColor: '#555c74' },
-    grid: { vertLines: { color: '#1a1d2a' }, horzLines: { color: '#1a1d2a' } },
+    layout: { background: { color: '#131722' }, textColor: '#8b92a8' },
+    grid: { vertLines: { color: '#1e2430' }, horzLines: { color: '#1e2430' } },
     crosshair: { mode: 1 },
-    timeScale: { timeVisible: true, secondsVisible: false }
+    rightPriceScale: { borderColor: '#2a2f42' },
+    timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#2a2f42' }
   });
   candleSeries = chart.addCandlestickSeries({ upColor:'#00d26a', downColor:'#ff3860', borderUpColor:'#00d26a', borderDownColor:'#ff3860', wickUpColor:'#00d26a', wickDownColor:'#ff3860' });
   volumeSeries = chart.addHistogramSeries({ color:'#388bff', priceFormat:{type:'volume'}, priceScaleId:'', scaleMargins:{top:0.85,bottom:0} });
@@ -660,17 +1008,17 @@ function initPosResize() {
 function startStream() {
   if (streamSource) streamSource.close();
   streamSource = new EventSource('/api/realtime/stream?symbol=' + encodeURIComponent(symbol+'/USDT') + '&timeframe=' + encodeURIComponent(tf));
-  $('connText').textContent = 'CONNECTING';
+  $('connText').textContent = getConnectionLabel('CONNECTING');
   streamSource.addEventListener('snapshot', e => {
-    try { applySnapshot(JSON.parse(e.data)); $('connDot').classList.remove('off'); $('connText').textContent='LIVE'; lastSnap=Date.now(); } catch(_){}
+    try { applySnapshot(JSON.parse(e.data)); $('connDot').classList.remove('off'); $('connText').textContent=getConnectionLabel('STREAM'); lastSnap=Date.now(); } catch(_){}
   });
-  streamSource.onerror = () => { $('connDot').classList.add('off'); $('connText').textContent='DEGRADED'; };
+  streamSource.onerror = () => { $('connDot').classList.add('off'); $('connText').textContent=getConnectionLabel('DEGRADED'); };
 }
 async function pollSnapshot() {
   try {
     const r = await fetch('/api/realtime/snapshot?symbol=' + encodeURIComponent(symbol+'/USDT') + '&timeframe=' + encodeURIComponent(tf));
     applySnapshot(await r.json()); lastSnap = Date.now();
-    $('connDot').classList.remove('off'); $('connText').textContent='POLLING';
+    $('connDot').classList.remove('off'); $('connText').textContent=getConnectionLabel('POLLING');
   } catch(_){}
 }
 function applySnapshot(s) {
@@ -680,13 +1028,20 @@ function applySnapshot(s) {
   if (s.feargreed) applyFG(s.feargreed);
   if (s.orderbook) applyOB(s.orderbook);
   if (s.indicators) applyTech(s.indicators);
-  if (s.auto) { autoTrading=!!s.auto.enabled; $('autoBtn').classList.toggle('active',autoTrading); $('modeBadge').textContent=String(s.auto.mode||'paper').toUpperCase(); }
+  if (s.auto) {
+    autoTrading=!!s.auto.enabled;
+    activeVenue = String(s.auto.exchange || (isLiveMode ? 'binance' : 'paper'));
+    isTestnetMode = !!s.auto.testnet;
+    $('autoBtn').classList.toggle('active',autoTrading);
+    $('modeBadge').textContent=String(s.auto.label || s.auto.mode || 'paper').toUpperCase();
+    $('connText').textContent = getConnectionLabel();
+  }
   if (s.candles && s.candles.candles && s.candles.candles.length) setCandles(s.candles.candles);
 }
 
 /* ── Loaders ── */
 async function loadAll() {
-  await Promise.all([loadStatus(), loadMarket(), loadFG(), loadOB(), loadTech(), loadCandles(), loadAutoStatus(), loadSession(), loadRegime(), loadGuardrails(), loadVariational()]);
+  await Promise.all([loadStatus(), loadMarket(), loadFG(), loadOB(), loadTech(), loadCandles(), loadAutoStatus(), loadAgentStatus(), loadSession(), loadRegime(), loadGuardrails(), loadVariational()]);
   // Mode-specific loaders
   if (isLiveMode) {
     await Promise.all([loadExchangePositions(), loadExchangeOrders(), loadTradeHistory()]);
@@ -762,7 +1117,7 @@ function applyStatus(d) {
   el.innerHTML = h;
 }
 
-async function loadMarket() { try { applyMarket(await (await fetch('/api/market?per_page=20')).json()); } catch(_){} }
+async function loadMarket() { try { applyMarket(await (await fetch('/api/market?per_page=250')).json()); } catch(_){} }
 function applyMarket(d) {
   watchlistData = d.coins||[];
   $('wlCount').textContent = watchlistData.length;
@@ -776,6 +1131,7 @@ function applyMarket(d) {
     $('symChg').textContent = (up?'+':'')+Number(cur.change_24h).toFixed(2)+'%';
     $('hVol').textContent = '$'+(Number(cur.volume_24h)/1e9).toFixed(1)+'B';
   }
+  refreshWorkspaceHud();
 }
 function renderWL() {
   const q = ($('searchInput').value||'').toLowerCase();
@@ -785,7 +1141,7 @@ function renderWL() {
   }).join('');
 }
 function filterWL() { renderWL(); }
-function selectSym(s) { symbol=s; $('tradeSym').value=s+'/USDT'; loadCandles(); loadTech(); loadOB(); startStream(); }
+function selectSym(s) { symbol=s; $('tradeSym').value=s+'/USDT'; refreshWorkspaceHud(); loadCandles(); loadTech(); loadOB(); startStream(); }
 
 async function loadFG() { try { applyFG(await (await fetch('/api/feargreed')).json()); } catch(_){} }
 function applyFG(d) {
@@ -842,14 +1198,151 @@ async function loadAutoStatus() {
     const d=await(await fetch('/api/auto/status')).json();
     autoTrading=!!d.enabled;
     isLiveMode = d.mode === 'live';
+    activeVenue = String(d.exchange || (isLiveMode ? 'binance' : 'paper'));
+    isTestnetMode = !!d.testnet;
     $('autoBtn').classList.toggle('active',autoTrading);
-    $('modeBadge').textContent=String(d.mode||'paper').toUpperCase();
+    $('modeBadge').textContent=String(d.label || d.mode || 'paper').toUpperCase();
+    $('connText').textContent = getConnectionLabel();
     if (isLiveMode) {
-      $('modeBadge').style.background='linear-gradient(135deg,#ff3b30,#ff2d55)';
-      // Update trade form default to futures format
+      $('modeBadge').style.background = isTestnetMode
+        ? 'linear-gradient(135deg,#00c853,#00acc1)'
+        : 'linear-gradient(135deg,#ff3b30,#ff2d55)';
       if ($('tradeSym') && $('tradeSym').value === 'BTC/USDT') $('tradeSym').value = 'BTC/USDT:USDT';
+    } else {
+      $('modeBadge').style.background='linear-gradient(135deg,#ff9500,#ff5e3a)';
     }
+    refreshWorkspaceHud();
   } catch(_){}
+}
+
+async function loadAgentStatus() {
+  try {
+    const d = await (await fetch('/api/agent/status')).json();
+    renderAgentStatus(d);
+  } catch(_) {}
+}
+
+function renderAgentStatus(d) {
+  const el = $('agentPanel');
+  if (!el) return;
+  if (!d || d.attached === false) {
+    if ($('tvAgentChip')) $('tvAgentChip').textContent = 'AI OFFLINE';
+    el.innerHTML = '<div style="color:var(--text3);font-size:10px">AI agent unavailable</div>';
+    return;
+  }
+  const providerLabel = esc(String(d.provider || 'local').toUpperCase());
+  const remote = d.remote_enabled ? (providerLabel + ' LIVE') : 'LOCAL ONLY';
+  const remoteColor = d.remote_enabled ? 'var(--green)' : 'var(--yellow)';
+  const enabled = d.enabled ? 'ENABLED' : 'DISABLED';
+  const enabledColor = d.enabled ? 'var(--green)' : 'var(--red)';
+  const provider = esc(String(d.provider || 'local').toUpperCase());
+  const model = esc(String(d.model || '-'));
+  const source = esc(String(d.last_decision_source || 'local'));
+  const lastSummary = esc(String((d.last_decision || {}).summary || 'No decisions yet'));
+  const remoteReason = esc(String(d.remote_reason || ''));
+  const historyHtml = agentChatHistory.slice(-12).map(item => '<div style="margin-bottom:6px"><b>'+esc(item.sender)+':</b> '+esc(item.msg)+'</div>').join('');
+  if ($('tvAgentChip')) $('tvAgentChip').textContent = provider + ' · ' + (d.remote_enabled ? 'LIVE' : 'LOCAL');
+  el.innerHTML = ''+
+    '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Status</span><span style="color:'+enabledColor+'">'+enabled+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Provider</span><span>'+provider+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Mode</span><span>'+esc(String(d.mode || 'full').toUpperCase())+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Remote</span><span style="color:'+remoteColor+'">'+remote+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Model</span><span style="max-width:150px;text-align:right">'+model+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Decisions</span><span>'+Number(d.decision_count||0)+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between;padding:3px 0"><span>Source</span><span>'+source.toUpperCase()+'</span></div>'+
+    '<div class="agent-note">'+remoteReason+'</div>'+
+    '<div style="margin-top:6px;color:var(--text3);font-size:10px">'+lastSummary+'</div>'+
+    '<div id="agentChatLog" style="margin-top:8px;max-height:140px;overflow:auto;background:var(--bg0);border:1px solid var(--border);border-radius:6px;padding:6px;font-size:10px;color:var(--text2)">'+historyHtml+'</div>'+
+    '<div class="agent-row">'
+      + '<input id="agentChatInput" class="modal-input agent-chat-input" placeholder="Ask the bot...">'
+      + '<button class="btn btn-ghost agent-send-btn" onclick="sendAgentChat()">Send</button></div>'+
+    '<div class="agent-actions">'
+      + '<button class="btn btn-ghost" onclick="runQuickAction(\'train_model\')">Train Now</button>'
+      + '<button class="btn btn-ghost" onclick="runQuickAction(\'status\')">Status</button>'
+      + '<button class="btn btn-ghost" onclick="runQuickAction(\'strategy_suggest\')">Suggest</button></div>'+
+    '<div class="agent-actions">'
+      + '<button class="btn btn-ghost" onclick="runQuickAction(\'risk\')">Risk</button>'
+      + '<button class="btn btn-ghost" onclick="runQuickAction(\'pause_auto\')">Pause Auto</button>'
+      + '<button class="btn btn-ghost" onclick="runQuickAction(\'resume_auto\')">Resume Auto</button></div>';
+
+  const input = $('agentChatInput');
+  if (input && !input.dataset.bound) {
+    input.dataset.bound = '1';
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') sendAgentChat();
+    });
+  }
+}
+
+async function sendAgentChat() {
+  const input = $('agentChatInput');
+  if (!input) return;
+  const msg = String(input.value || '').trim();
+  if (!msg) return;
+  input.value = '';
+  appendAgentChat('You', msg);
+  try {
+    const d = await (await fetch('/api/agent/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message: msg})})).json();
+    appendAgentChat('Assistant', d.reply || 'No reply');
+    loadAgentStatus();
+  } catch(_) {
+    appendAgentChat('Assistant', 'Connection error while contacting the bot assistant.');
+  }
+}
+
+function sendQuickAgentPrompt(msg) {
+  const input = $('agentChatInput');
+  if (input) input.value = msg;
+  sendAgentChat();
+}
+
+function appendAgentChat(sender, msg) {
+  agentChatHistory.push({sender, msg});
+  if (agentChatHistory.length > 20) agentChatHistory = agentChatHistory.slice(-20);
+  const el = $('agentChatLog');
+  if (!el) return;
+  const row = document.createElement('div');
+  row.style.marginBottom = '6px';
+  row.innerHTML = '<b>' + esc(sender) + ':</b> ' + esc(msg);
+  el.appendChild(row);
+  el.scrollTop = el.scrollHeight;
+}
+
+async function runQuickAction(action) {
+  appendAgentChat('You', 'Quick action: ' + action);
+  try {
+    const d = await (await fetch('/api/quick-action', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action, symbol: symbol + '/USDT'})
+    })).json();
+    appendAgentChat('Assistant', d.reply || 'Action processed.');
+    if (d.suggestion) {
+      appendAgentChat('Assistant', 'Suggested strategy: ' + (d.suggestion.strategy || 'n/a') + ' · ' + (d.suggestion.reason || ''));
+    }
+    loadAgentStatus();
+    loadAll();
+  } catch(_) {
+    appendAgentChat('Assistant', 'Quick action failed.');
+  }
+}
+
+async function triggerModelTrain() {
+  return runQuickAction('train_model');
+}
+
+function updateAgentProviderUI() {
+  const provider = $('cfgAiProvider') ? $('cfgAiProvider').value : 'local';
+  const keyInput = $('cfgAiKey');
+  const modelInput = $('cfgAiModel');
+  const hint = $('cfgAiHint');
+  if (keyInput) keyInput.placeholder = provider === 'claude' ? 'Anthropic API Key' : (provider === 'openai' ? 'OpenAI API Key' : 'Not required for local mode');
+  if (modelInput && !modelInput.value) modelInput.placeholder = provider === 'openai' ? 'Model, e.g. gpt-4o-mini' : 'Model, e.g. claude-3-5-sonnet-latest';
+  if (hint) hint.textContent = provider === 'claude'
+    ? 'Paste your Anthropic API key here to enable live Claude trade review.'
+    : (provider === 'openai'
+      ? 'Paste your OpenAI API key here to enable live OpenAI trade review.'
+      : 'Local mode keeps supervision on-device without a remote API call.');
 }
 
 /* ── Exchange Positions (live mode) ── */
@@ -1022,7 +1515,7 @@ let currenciesLoaded = false;
 async function loadCurrencies() {
   if (currenciesLoaded) return;
   try {
-    const d = await (await fetch('/api/exchange/currencies?quote=USDT&type=swap&limit=100')).json();
+    const d = await (await fetch('/api/exchange/currencies?quote=USDT&type=swap&limit=500')).json();
     const allPairs = [];
     for (const [ex, syms] of Object.entries(d.exchanges || {})) {
       for (const s of syms) allPairs.push({...s, exchange: ex});
@@ -1041,7 +1534,7 @@ function renderCurrencies() {
     return;
   }
   let h = '';
-  for (const c of exchangeCurrencies.slice(0, 50)) {
+  for (const c of exchangeCurrencies) {
     const sym = c.symbol || '';
     const base = c.base || '';
     h += '<div class="wl-item" onclick="selectCurrency(\'' + esc(sym) + '\')" style="cursor:pointer">';
@@ -1228,12 +1721,14 @@ function renderPipeline(layers, quality, session) {
   html+='<div>';
   html+='<div style="font:700 13px sans-serif;color:var(--text1);margin-bottom:10px">9-Layer Confirmation Pipeline</div>';
   (layers.layers||[]).forEach(l => {
-    const st = l.status||'unknown';
-    const color = st==='pass'?'var(--green)':st==='fail'?'var(--red)':st==='skip'?'var(--yellow)':'var(--text3)';
-    html+='<div style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid var(--border)">';
-    html+='<div style="width:24px;height:24px;border-radius:50%;background:'+color+';display:flex;align-items:center;justify-content:center;font:700 11px sans-serif;color:#000">'+l.id+'</div>';
-    html+='<div style="flex:1"><div style="font:600 11px sans-serif;color:var(--text1)">'+esc(l.name)+'</div><div style="font:10px sans-serif;color:var(--text3)">'+esc(l.description)+'</div></div>';
-    html+='<div style="font:600 10px \'JetBrains Mono\';color:'+color+'">'+esc(st.toUpperCase())+'</div>';
+    const stRaw = String(l.status||'UNKNOWN');
+    const st = stRaw.toLowerCase();
+    const detail = String(l.detail || '');
+    const color = st==='pass'?'var(--green)':(st==='fail'||st==='blocked')?'var(--red)':(st==='weak'||st==='skip')?'var(--yellow)':(st==='pending'?'var(--cyan)':'var(--text3)');
+    html+='<div style="display:flex;align-items:flex-start;gap:8px;padding:6px 8px;border-bottom:1px solid var(--border)">';
+    html+='<div style="width:24px;height:24px;border-radius:50%;background:'+color+';display:flex;align-items:center;justify-content:center;font:700 11px sans-serif;color:#000;flex-shrink:0">'+l.id+'</div>';
+    html+='<div style="flex:1"><div style="font:600 11px sans-serif;color:var(--text1)">'+esc(l.name)+'</div><div style="font:10px sans-serif;color:var(--text3)">'+esc(l.description)+'</div>'+(detail?'<div style="font:10px \'JetBrains Mono\';color:var(--text2);margin-top:2px">'+esc(detail)+'</div>':'')+'</div>';
+    html+='<div style="font:600 10px \'JetBrains Mono\';color:'+color+'">'+esc(stRaw.toUpperCase())+'</div>';
     html+='</div>';
   });
   html+='</div>';
@@ -1241,9 +1736,18 @@ function renderPipeline(layers, quality, session) {
   html+='<div>';
   // Quality Score
   html+='<div style="font:700 13px sans-serif;color:var(--text1);margin-bottom:10px">Quality Score</div>';
-  const total = quality.total||0;
-  const qColor = total>=90?'var(--green)':total>=65?'var(--yellow)':'var(--red)';
+  const total = Number(quality.total||0);
+  const partial = !!quality.partial;
+  const qColor = total>=90?'var(--green)':total>=65?'var(--yellow)':(total>0?'var(--orange)':'var(--red)');
+  const preview = !!quality.preview;
+  if ($('tvQualityChip')) {
+    $('tvQualityChip').textContent = 'QUALITY ' + total + '/100' + (partial ? ' PARTIAL' : preview ? ' PREVIEW' : '');
+    $('tvQualityChip').style.color = qColor;
+    $('tvQualityChip').style.borderColor = qColor;
+  }
   html+='<div style="text-align:center;margin-bottom:12px"><span style="font:700 36px \'JetBrains Mono\';color:'+qColor+'">'+total+'</span><span style="font:11px sans-serif;color:var(--text3)"> / 100</span></div>';
+  if (preview) html+='<div style="text-align:center;font:600 10px sans-serif;color:var(--cyan);margin:-6px 0 10px 0">Live preview from the latest market snapshot</div>';
+  else if (partial) html+='<div style="text-align:center;font:600 10px sans-serif;color:var(--yellow);margin:-6px 0 10px 0">Partial score from current evaluated layers</div>';
   const comps = quality.components||{};
   for(const[k,v] of Object.entries(comps)) {
     const pct = Math.min(100, Math.max(0, v));
@@ -1469,6 +1973,13 @@ async function loadCfg(){
     $('cfgOkxOn').checked=!!d.okx_enabled;$('cfgKrakenOn').checked=!!d.kraken_enabled;
     $('cfgAutoOn').checked=!!d.auto_trading_enabled;$('cfgAutoSL').checked=!!d.auto_stop_loss_enabled;
     $('cfgAutoTP').checked=!!d.auto_take_profit_enabled;$('cfgTrail').checked=!!d.trailing_stops_enabled;
+    $('cfgAiEnabled').checked=!!d.ai_agent_enabled;
+    $('cfgAiProvider').value=d.ai_agent_provider||'local';
+    $('cfgAiModel').value=d.ai_agent_model||'claude-3-5-sonnet-latest';
+    $('cfgAiKey').value=d.ai_agent_api_key||'';
+    $('cfgAiTimeout').value=String(d.ai_agent_timeout_seconds||8);
+    $('cfgAiWeight').value=String(d.ai_agent_remote_weight||0.35);
+    updateAgentProviderUI();
     renderReg(d.connection_registry);
     // Load trading mode
     try{
@@ -1491,16 +2002,32 @@ function renderReg(recs){
 }
 async function saveSettings(){
   try{
-    const body={binance_api_key:$('cfgBinKey').value,binance_secret:$('cfgBinSec').value,bybit_api_key:$('cfgBybitKey').value,bybit_secret:$('cfgBybitSec').value,okx_api_key:$('cfgOkxKey').value,okx_secret:$('cfgOkxSec').value,kraken_api_key:$('cfgKrakenKey').value,kraken_secret:$('cfgKrakenSec').value,dex_rpc_url:$('cfgRpc').value,dex_private_key:$('cfgWallet').value,telegram_bot_token:$('cfgTgToken').value,telegram_chat_id:$('cfgTgChat').value,binance_enabled:$('cfgBinOn').checked,bybit_enabled:$('cfgBybitOn').checked,okx_enabled:$('cfgOkxOn').checked,kraken_enabled:$('cfgKrakenOn').checked,auto_trading_enabled:$('cfgAutoOn').checked};
+    const body={binance_api_key:$('cfgBinKey').value,binance_secret:$('cfgBinSec').value,bybit_api_key:$('cfgBybitKey').value,bybit_secret:$('cfgBybitSec').value,okx_api_key:$('cfgOkxKey').value,okx_secret:$('cfgOkxSec').value,kraken_api_key:$('cfgKrakenKey').value,kraken_secret:$('cfgKrakenSec').value,dex_rpc_url:$('cfgRpc').value,dex_private_key:$('cfgWallet').value,telegram_bot_token:$('cfgTgToken').value,telegram_chat_id:$('cfgTgChat').value,binance_enabled:$('cfgBinOn').checked,bybit_enabled:$('cfgBybitOn').checked,okx_enabled:$('cfgOkxOn').checked,kraken_enabled:$('cfgKrakenOn').checked,auto_trading_enabled:$('cfgAutoOn').checked,ai_agent_enabled:$('cfgAiEnabled').checked,ai_agent_provider:$('cfgAiProvider').value,ai_agent_model:$('cfgAiModel').value,ai_agent_api_key:$('cfgAiKey').value,ai_agent_timeout_seconds:parseFloat($('cfgAiTimeout').value||'8'),ai_agent_remote_weight:parseFloat($('cfgAiWeight').value||'0.35')};
     const d=await(await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
-    if(d.success){renderReg(d.connection_registry);}else{toast('error',d.error||'Save failed');return;}
+    if(d.success){
+      renderReg(d.connection_registry);
+      if (d.ai_agent) {
+        const p = String(d.ai_agent.provider || 'local').toUpperCase();
+        if (d.ai_agent.provider === 'local') toast('info','Local AI supervision enabled');
+        else toast('info', d.ai_agent.api_configured ? (p + ' connected for bot interaction') : (p + ' selected; add API key to enable remote review'));
+      }
+    }else{toast('error',d.error||'Save failed');return;}
     // Save trading mode
     const mode=$('cfgTradingMode').value;
     if(mode==='live'&&!confirm('Switch to LIVE trading? This uses REAL MONEY. Are you sure?')){$('cfgTradingMode').value='paper';updateModeWarning();toast('info','Kept paper mode');return;}
+    let modeResp={success:true,mode:mode};
     try{
-      await fetch('/api/config/trading-mode?confirmation='+(mode==='live'?'true':'false'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(mode)});
-    }catch(_){}
+      modeResp=await(await fetch('/api/mode/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})})).json();
+    }catch(_){modeResp={success:false,error:'Could not update trading mode'};}
+    if(!modeResp.success){
+      $('cfgTradingMode').value='paper';
+      updateModeWarning();
+      toast('error',modeResp.error||'Could not switch trading mode');
+      return;
+    }
+    $('cfgTradingMode').value=modeResp.mode||mode;
     updateModeWarning();
+    loadAutoStatus();
     toast('success','Settings saved');
   }catch(_){toast('error','Save failed');}
 }
