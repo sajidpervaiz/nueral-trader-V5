@@ -348,7 +348,8 @@ class SmartOrderRouter:
             else:
                 return snapshot.bids[0].price if snapshot.bids else 0.0
 
-        except Exception:
+        except Exception as exc:
+            logger.debug("Orderbook snapshot failed for price estimate: {}", exc)
             return 0.0
 
     def _calculate_estimated_cost(self, score: VenueScore, quantity: float, expected_price: float) -> float:

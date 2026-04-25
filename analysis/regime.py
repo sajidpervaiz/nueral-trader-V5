@@ -180,7 +180,8 @@ class RegimeDetector:
         try:
             poly = np.polyfit(np.log(list(lags)), np.log(tau), 1)
             return float(poly[0])
-        except Exception:
+        except Exception as exc:
+            logger.debug("Hurst exponent polyfit failed, returning default: {}", exc)
             return 0.5
 
     def _calc_realized_vol(self, close: pd.Series, periods: int = 20) -> float:

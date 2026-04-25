@@ -51,14 +51,14 @@ class FaultInjector:
         """Simulate market data WebSocket going down.
         The bot should activate safe mode and refuse new trades."""
         self._record("websocket_disconnect", "Market data stream lost")
-        self.safe_mode.activate(
+        await self.safe_mode.activate(
             SafeModeReason.WEBSOCKET_DISCONNECT,
             detail="chaos_test: simulated WS disconnect",
         )
 
     async def simulate_websocket_reconnect(self) -> None:
         self._record("websocket_reconnect", "Market data stream restored")
-        self.safe_mode.deactivate(SafeModeReason.WEBSOCKET_DISCONNECT)
+        await self.safe_mode.deactivate(SafeModeReason.WEBSOCKET_DISCONNECT)
 
     # ── 2. USER_DATA stream failure ───────────────────────────────────────
     async def simulate_user_stream_failure(self) -> None:
@@ -79,14 +79,14 @@ class FaultInjector:
         """Simulate exchange API returning timeout errors.
         If cex_executor has a client, replace it with a timeout-raising mock."""
         self._record("exchange_api_timeout", f"duration={duration}s")
-        self.safe_mode.activate(
+        await self.safe_mode.activate(
             SafeModeReason.EXCHANGE_API_TIMEOUT,
             detail="chaos_test: API unreachable",
         )
 
     async def simulate_exchange_api_recovery(self) -> None:
         self._record("exchange_api_recovery", "API restored")
-        self.safe_mode.deactivate(SafeModeReason.EXCHANGE_API_TIMEOUT)
+        await self.safe_mode.deactivate(SafeModeReason.EXCHANGE_API_TIMEOUT)
 
     # ── 4. Partial fills (stuck order) ────────────────────────────────────
     async def simulate_partial_fill(self, symbol: str, filled_pct: float = 0.3) -> None:
@@ -123,7 +123,7 @@ class FaultInjector:
                 "reason": "insufficient_margin",
             })
         if count >= 3:
-            self.safe_mode.activate(
+            await self.safe_mode.activate(
                 SafeModeReason.ORDER_REJECTION_BURST,
                 detail=f"{count} rejections for {symbol}",
             )
@@ -132,14 +132,14 @@ class FaultInjector:
     async def simulate_db_outage(self) -> None:
         """Simulate database becoming unreachable."""
         self._record("db_outage", "Database connection lost")
-        self.safe_mode.activate(
+        await self.safe_mode.activate(
             SafeModeReason.DB_OUTAGE,
             detail="chaos_test: DB unreachable",
         )
 
     async def simulate_db_recovery(self) -> None:
         self._record("db_recovery", "Database restored")
-        self.safe_mode.deactivate(SafeModeReason.DB_OUTAGE)
+        await self.safe_mode.deactivate(SafeModeReason.DB_OUTAGE)
 
     # ── 7. Sudden volatility spike ────────────────────────────────────────
     async def simulate_volatility_spike(
@@ -148,7 +148,7 @@ class FaultInjector:
         """Simulate a sudden price crash — e.g. flash crash of 10%.
         Fires rapid TICK events with plummeting prices."""
         self._record("volatility_spike", f"{symbol} drop={price_drop_pct:.0%}")
-        self.safe_mode.activate(
+        await self.safe_mode.activate(
             SafeModeReason.EXTREME_VOLATILITY,
             detail=f"chaos_test: {symbol} flash crash {price_drop_pct:.0%}",
         )
@@ -170,14 +170,14 @@ class FaultInjector:
     async def simulate_spread_widening(self) -> None:
         """Simulate extreme spread — the risk manager should reject new trades."""
         self._record("spread_widening", "Spread > 100 bps")
-        self.safe_mode.activate(
+        await self.safe_mode.activate(
             SafeModeReason.EXTREME_SPREAD,
             detail="chaos_test: spread > 100 bps",
         )
 
     async def simulate_spread_recovery(self) -> None:
         self._record("spread_recovery", "Spread normalised")
-        self.safe_mode.deactivate(SafeModeReason.EXTREME_SPREAD)
+        await self.safe_mode.deactivate(SafeModeReason.EXTREME_SPREAD)
 
     # ── 9. Bot crash mid-position ─────────────────────────────────────────
     async def simulate_bot_crash_mid_position(self) -> None:

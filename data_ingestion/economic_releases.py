@@ -3,9 +3,9 @@ Economic Releases with BLS API for CPI/PPI/NFP, consensus deviation scoring.
 """
 
 import asyncio
-from typing import Dict, List, Optional
+from typing import Optional
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from loguru import logger
 
@@ -13,7 +13,7 @@ try:
     import aiohttp
     _AIOHTTP = True
 except ImportError:
-    aiohttp = None
+    aiohttp = None  # type: ignore[assignment]
     _AIOHTTP = False
 
 
@@ -42,24 +42,31 @@ class EconomicRelease:
     source: str = "BLS"
 
 
+_BLS_SERIES_MAP: dict[str, IndicatorType] = {
+    "CUUR0000SA0": IndicatorType.CPI,
+    "WPSFD49207": IndicatorType.PPI,
+    "CES0000000001": IndicatorType.NFP,
+}
+
+
 class EconomicReleases:
     """
-    Economic releases manager with:
-    - BLS API integration
-    - Consensus deviation calculation
-    - Historical tracking
-    - Impact scoring
+    Economic releases manager with BLS API integration,
+    consensus deviation calculation, and historical tracking.
     """
+
+    BLS_API_URL = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
 
     def __init__(self, enable_paper_mode: bool = True):
         self.paper_mode = enable_paper_mode
-        self.releases: List[EconomicRelease] = []
-        self._http_session: Optional[aiohttp.ClientSession] = None
+        self.releases: list[EconomicRelease] = []
+        self._http_session: aiohttp.ClientSession | None = None
 
     async def initialize(self) -> None:
-        """Initialize Economic Releases."""
         if _AIOHTTP:
-            self._http_session = aiohttp.ClientSession()
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15),
+            )
         elif not self.paper_mode:
             logger.warning("aiohttp not installed — falling back to paper mode for EconomicReleases")
             self.paper_mode = True
@@ -67,71 +74,84 @@ class EconomicReleases:
         await self._load_historical_releases()
         await self._load_scheduled_releases()
 
-        logger.info(f"Loaded {len(self.releases)} economic releases")
+        logger.info("Loaded {} economic releases (paper_mode={})", len(self.releases), self.paper_mode)
 
     async def _load_historical_releases(self) -> None:
-        """Load historical economic data."""
         if self.paper_mode:
-            now = datetime.now()
-
-            self.releases.extend([
-                EconomicRelease(
-                    release_id=f"cpi_{i}",
-                    indicator_type=IndicatorType.CPI,
-                    title=f"Consumer Price Index {i}",
-                    release_date=now - timedelta(days=30 * i),
-                    actual=3.0 + (i % 3) * 0.1,
-                    consensus=3.1,
-                    previous=3.0 + ((i - 1) % 3) * 0.1,
-                    importance=5,
-                    source="BLS",
-                )
-                for i in range(1, 7)
-            ])
-
+            self._seed_paper_releases()
             return
 
         try:
-            url = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
-            series_ids = ["CUUR0000SA0", "WPSFD49207", "CES0000000001"]
+            now = datetime.now(tz=timezone.utc)
+            series_ids = list(_BLS_SERIES_MAP.keys())
+            payload = {
+                "seriesid": series_ids,
+                "startyear": str(now.year - 2),
+                "endyear": str(now.year),
+            }
+            async with self._http_session.post(self.BLS_API_URL, json=payload) as response:
+                if response.status != 200:
+                    logger.warning("BLS API returned status {} — using paper fallback", response.status)
+                    self._seed_paper_releases()
+                    return
+                data = await response.json(content_type=None)
+                if not isinstance(data, dict):
+                    logger.warning("BLS API returned unexpected data type — using paper fallback")
+                    self._seed_paper_releases()
+                    return
+                self._process_bls_data(data)
+                if not self.releases:
+                    logger.warning("BLS API returned no usable data — using paper fallback")
+                    self._seed_paper_releases()
 
-            async with self._http_session.post(
-                url,
-                json={"seriesid": series_ids, "startyear": "2018", "endyear": "2024"}
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    self._process_bls_data(data)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.warning("BLS API unreachable ({}), using paper fallback", exc)
+            self._seed_paper_releases()
+        except Exception as exc:
+            logger.error("Unexpected error loading economic releases: {}", exc)
+            self._seed_paper_releases()
 
-        except Exception as e:
-            logger.error(f"Error loading historical releases: {e}")
+    def _seed_paper_releases(self) -> None:
+        now = datetime.now(tz=timezone.utc)
+        self.releases.extend([
+            EconomicRelease(
+                release_id=f"cpi_{i}",
+                indicator_type=IndicatorType.CPI,
+                title=f"Consumer Price Index {i}",
+                release_date=now - timedelta(days=30 * i),
+                actual=3.0 + (i % 3) * 0.1,
+                consensus=3.1,
+                previous=3.0 + ((i - 1) % 3) * 0.1,
+                importance=5,
+                source="paper",
+            )
+            for i in range(1, 7)
+        ])
 
     def _process_bls_data(self, data: dict) -> None:
-        """Process BLS API response."""
-        for series in data.get('Results', {}).get('series', []):
-            series_id = series.get('seriesID')
-            indicator = self._map_series_to_indicator(series_id)
-
+        results = data.get("Results", {})
+        if not isinstance(results, dict):
+            return
+        for series in results.get("series", []):
+            series_id = series.get("seriesID", "")
+            indicator = _BLS_SERIES_MAP.get(series_id)
             if not indicator:
                 continue
 
-            for item in series.get('data', []):
+            prev_value: float | None = None
+            for item in series.get("data", []):
                 try:
-                    year = int(item.get('year'))
-                    period = item.get('period', '')
-
-                    if not period:
-                        continue
-                    if period.startswith('M'):
+                    year = int(item["year"])
+                    period = item.get("period", "")
+                    if period.startswith("M"):
                         month = int(period[1:])
-                    elif period.startswith('Q'):
-                        quarter = int(period[1:])
-                        month = quarter * 3
+                    elif period.startswith("Q"):
+                        month = int(period[1:]) * 3
                     else:
                         continue
 
-                    release_date = datetime(year, month, 1)
-                    value = float(item.get('value', 0))
+                    release_date = datetime(year, month, 1, tzinfo=timezone.utc)
+                    value = float(item["value"])
 
                     release = EconomicRelease(
                         release_id=f"{series_id}_{year}_{month}",
@@ -139,28 +159,18 @@ class EconomicReleases:
                         title=f"{indicator.value} {year}-{month:02d}",
                         release_date=release_date,
                         actual=value,
+                        previous=prev_value,
                         importance=5,
                         source="BLS",
                     )
-
                     self.releases.append(release)
+                    prev_value = value
 
-                except (ValueError, TypeError) as e:
+                except (ValueError, TypeError, KeyError):
                     continue
 
-    def _map_series_to_indicator(self, series_id: str) -> Optional[IndicatorType]:
-        """Map BLS series ID to indicator type."""
-        if "CUUR" in series_id:
-            return IndicatorType.CPI
-        elif "WPS" in series_id:
-            return IndicatorType.PPI
-        elif "CES" in series_id:
-            return IndicatorType.NFP
-        return None
-
     async def _load_scheduled_releases(self) -> None:
-        """Load scheduled economic releases."""
-        now = datetime.now()
+        now = datetime.now(tz=timezone.utc)
         scheduled = [
             (IndicatorType.CPI, "Consumer Price Index", 5),
             (IndicatorType.PPI, "Producer Price Index", 4),
@@ -174,8 +184,6 @@ class EconomicReleases:
             if release.release_date > now
         }
 
-        # Keep the system operational even without a dedicated schedule API by
-        # adding deterministic upcoming entries for missing indicators.
         for i, (indicator, title, importance) in enumerate(scheduled):
             if indicator in existing_upcoming_types:
                 continue
@@ -185,7 +193,7 @@ class EconomicReleases:
                 title=title,
                 release_date=now + timedelta(days=7 + i * 5),
                 importance=importance,
-                source="BLS",
+                source="scheduled",
             )
             self.releases.append(release)
 
@@ -194,25 +202,22 @@ class EconomicReleases:
         release_id: str,
         consensus: float,
     ) -> Optional[float]:
-        """Calculate deviation from consensus."""
         for release in self.releases:
-            if release.release_id == release_id and release.actual:
+            if release.release_id == release_id and release.actual is not None:
                 deviation = release.actual - consensus
+                release.consensus = consensus
                 release.deviation = deviation
                 release.deviation_pct = (deviation / consensus * 100) if consensus != 0 else None
                 return deviation
-
         return None
 
     def get_upcoming_releases(
         self,
         days: int = 14,
         min_importance: int = 3,
-    ) -> List[EconomicRelease]:
-        """Get upcoming economic releases."""
-        now = datetime.now()
+    ) -> list[EconomicRelease]:
+        now = datetime.now(tz=timezone.utc)
         cutoff = now + timedelta(days=days)
-
         return [
             release
             for release in self.releases
@@ -220,14 +225,9 @@ class EconomicReleases:
             and release.importance >= min_importance
         ]
 
-    def get_recent_releases(
-        self,
-        days: int = 30,
-    ) -> List[EconomicRelease]:
-        """Get recent economic releases."""
-        now = datetime.now()
+    def get_recent_releases(self, days: int = 30) -> list[EconomicRelease]:
+        now = datetime.now(tz=timezone.utc)
         cutoff = now - timedelta(days=days)
-
         return [
             release
             for release in self.releases
@@ -238,24 +238,18 @@ class EconomicReleases:
         self,
         threshold_pct: float = 10.0,
         days: int = 90,
-    ) -> List[EconomicRelease]:
-        """Get releases with high deviation from consensus."""
-        now = datetime.now()
+    ) -> list[EconomicRelease]:
+        now = datetime.now(tz=timezone.utc)
         cutoff = now - timedelta(days=days)
-
         return [
             release
             for release in self.releases
             if release.release_date >= cutoff
-            and release.deviation_pct
+            and release.deviation_pct is not None
             and abs(release.deviation_pct) >= threshold_pct
         ]
 
-    def get_indicator_impact_score(
-        self,
-        indicator_type: IndicatorType,
-    ) -> float:
-        """Get market impact score for indicator."""
+    def get_indicator_impact_score(self, indicator_type: IndicatorType) -> float:
         impact_scores = {
             IndicatorType.CPI: 0.95,
             IndicatorType.NFP: 0.93,
@@ -268,6 +262,5 @@ class EconomicReleases:
         return impact_scores.get(indicator_type, 0.70)
 
     async def close(self) -> None:
-        """Clean up resources."""
-        if self._http_session:
+        if self._http_session and not self._http_session.closed:
             await self._http_session.close()

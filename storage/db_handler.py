@@ -163,8 +163,8 @@ class DBHandler:
                 for stmt in TIMESCALE_HYPERTABLES:
                     try:
                         await conn.execute(stmt)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("TimescaleDB hypertable creation skipped: {}", exc)
         logger.info("Database schema up to date")
 
     async def insert_tick(self, exchange: str, symbol: str, price: float, volume: float, side: str = "") -> None:

@@ -99,70 +99,100 @@ class Normalizer:
         ticks = self.normalize_tick_batch(exchange, raw)
         return ticks[0] if ticks else None
 
-    def normalize_tick_batch(self, exchange: str, raw: dict[str, Any]) -> list[Tick]:
+    def normalize_tick_batch(self, exchange: str, raw: dict[str, Any] | list) -> list[Tick]:
         """Return all ticks from a single websocket message (Kraken sends batches)."""
         try:
             if exchange == "binance":
+                if not isinstance(raw, dict):
+                    return []
+                price = float(raw.get("p", 0))
+                volume = float(raw.get("q", 0))
+                if price <= 0 or volume <= 0:
+                    return []
                 return [Tick(
                     exchange=exchange,
                     symbol=self._unify_symbol(exchange, raw.get("s", "")),
                     timestamp_us=int(raw.get("T", time.time_ns() // 1_000_000)) * 1000,
-                    price=float(raw.get("p", 0)),
-                    volume=float(raw.get("q", 0)),
+                    price=price,
+                    volume=volume,
                     side="buy" if raw.get("m") is False else "sell",
                     trade_id=str(raw.get("t", "")),
                 )]
+
             if exchange == "bybit":
+                if not isinstance(raw, dict):
+                    return []
                 data = raw.get("data", [{}])
                 if isinstance(data, list):
                     data = data[0] if data else {}
+                if not isinstance(data, dict):
+                    return []
+                price = float(data.get("p", 0))
+                volume = float(data.get("v", 0))
+                if price <= 0:
+                    return []
                 return [Tick(
                     exchange=exchange,
                     symbol=self._unify_symbol(exchange, data.get("s", "")),
                     timestamp_us=int(data.get("T", time.time_ns() // 1_000_000)) * 1000,
-                    price=float(data.get("p", 0)),
-                    volume=float(data.get("v", 0)),
+                    price=price,
+                    volume=volume,
                     side=data.get("S", "").lower(),
                     trade_id=str(data.get("i", "")),
                 )]
+
             if exchange == "okx":
+                if not isinstance(raw, dict):
+                    return []
                 data = raw.get("data", [{}])
                 if isinstance(data, list):
                     data = data[0] if data else {}
+                if not isinstance(data, dict):
+                    return []
+                price = float(data.get("px", 0))
+                volume = float(data.get("sz", 0))
+                if price <= 0:
+                    return []
                 return [Tick(
                     exchange=exchange,
                     symbol=self._unify_symbol(exchange, data.get("instId", "")),
                     timestamp_us=int(data.get("ts", time.time_ns() // 1_000_000)) * 1000,
-                    price=float(data.get("px", 0)),
-                    volume=float(data.get("sz", 0)),
+                    price=price,
+                    volume=volume,
                     side=data.get("side", "").lower(),
                     trade_id=str(data.get("tradeId", "")),
                 )]
+
             if exchange == "kraken":
                 # Canonical Kraken trade payload shape:
                 # [channel_id, [[price, volume, time, side, order_type, misc], ...], "trade", "XBT/USD"]
-                if isinstance(raw, list) and len(raw) >= 2:
-                    symbol_raw = str(raw[-1]) if len(raw) >= 4 else ""
-                    trades = raw[1] if isinstance(raw[1], list) else []
-                    results: list[Tick] = []
+                if not isinstance(raw, list) or len(raw) < 2:
+                    return []
+                symbol_raw = str(raw[-1]) if len(raw) >= 4 else ""
+                trades = raw[1] if isinstance(raw[1], list) else []
+                results: list[Tick] = []
 
-                    for entry in trades:
-                        if isinstance(entry, list):
-                            t = entry
-                        else:
-                            t = raw
-                        results.append(Tick(
-                            exchange=exchange,
-                            symbol=self._unify_symbol(exchange, symbol_raw),
-                            timestamp_us=int(float(t[2]) * 1_000_000) if len(t) > 2 else int(time.time_ns() // 1000),
-                            price=float(t[0]) if len(t) > 0 else 0.0,
-                            volume=float(t[1]) if len(t) > 1 else 0.0,
-                            side="buy" if len(t) > 3 and t[3] == "b" else "sell",
-                            trade_id=str(t[5]) if len(t) > 5 else "",
-                        ))
-                    return results
-        except (KeyError, ValueError, IndexError) as exc:
-            logger.debug("normalize_tick failed for exchange {}: {}", exchange, exc)
+                for entry in trades:
+                    if not isinstance(entry, list) or len(entry) < 2:
+                        continue
+                    price = float(entry[0])
+                    volume = float(entry[1])
+                    if price <= 0:
+                        continue
+                    results.append(Tick(
+                        exchange=exchange,
+                        symbol=self._unify_symbol(exchange, symbol_raw),
+                        timestamp_us=int(float(entry[2]) * 1_000_000) if len(entry) > 2 else int(time.time_ns() // 1000),
+                        price=price,
+                        volume=volume,
+                        side="buy" if len(entry) > 3 and entry[3] == "b" else "sell",
+                        trade_id=str(entry[5]) if len(entry) > 5 else "",
+                    ))
+                return results
+
+            logger.debug("normalize_tick: unsupported exchange '{}'", exchange)
+        except (KeyError, ValueError, IndexError, TypeError) as exc:
+            logger.warning("normalize_tick failed for exchange {}: {}", exchange, exc)
         return []
 
     def _unify_symbol(self, exchange: str, symbol: str) -> str:

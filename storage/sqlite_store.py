@@ -383,6 +383,83 @@ class SQLiteStore:
             "ORDER BY close_time_ns DESC LIMIT ?", (limit,),
         )
 
+    # ── Tick batch insert ────────────────────────────────────────────────
+    def insert_ticks_batch(self, ticks: list[dict[str, Any]]) -> int:
+        """Batch insert ticks for high-throughput ingestion."""
+        if not ticks:
+            return 0
+        with self._lock:
+            assert self._conn is not None
+            rows = [
+                (
+                    t.get("time_ns", self._now_ns()),
+                    t["exchange"],
+                    t["symbol"],
+                    t["price"],
+                    t.get("volume", 0),
+                    t.get("side", ""),
+                )
+                for t in ticks
+            ]
+            self._conn.executemany(
+                "INSERT INTO ticks(time_ns, exchange, symbol, price, volume, side) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
+            return len(rows)
+
+    # ── Signal queries ─────────────────────────────────────────────────
+    def get_signals(self, symbol: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        if symbol:
+            return self.query(
+                "SELECT * FROM signals WHERE symbol=? ORDER BY time_ns DESC LIMIT ?",
+                (symbol, limit),
+            )
+        return self.query("SELECT * FROM signals ORDER BY time_ns DESC LIMIT ?", (limit,))
+
+    # ── Order queries ──────────────────────────────────────────────────
+    def get_order(self, order_id: str) -> dict[str, Any] | None:
+        rows = self.query("SELECT * FROM orders WHERE order_id=?", (order_id,))
+        return rows[0] if rows else None
+
+    def get_orders(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        if status:
+            return self.query(
+                "SELECT * FROM orders WHERE status=? ORDER BY updated_ns DESC LIMIT ?",
+                (status, limit),
+            )
+        return self.query("SELECT * FROM orders ORDER BY updated_ns DESC LIMIT ?", (limit,))
+
+    def get_open_orders(self) -> list[dict[str, Any]]:
+        return self.query("SELECT * FROM orders WHERE status IN ('NEW', 'PARTIALLY_FILLED')")
+
+    # ── Position queries ───────────────────────────────────────────────
+    def get_position(self, pos_id: int) -> dict[str, Any] | None:
+        rows = self.query("SELECT * FROM positions WHERE id=?", (pos_id,))
+        return rows[0] if rows else None
+
+    # ── Aggregate stats ────────────────────────────────────────────────
+    def get_trade_stats(self, days: int = 30) -> dict[str, Any]:
+        """Return win rate, avg PnL, total trades for the given period."""
+        cutoff_ns = self._now_ns() - (days * 86400 * 10**9)
+        closed = self.query(
+            "SELECT pnl, pnl_pct FROM positions WHERE close_time_ns IS NOT NULL AND close_time_ns > ?",
+            (cutoff_ns,),
+        )
+        if not closed:
+            return {"total_trades": 0, "win_rate": 0.0, "avg_pnl": 0.0, "total_pnl": 0.0}
+        wins = sum(1 for r in closed if (r.get("pnl") or 0) > 0)
+        pnls = [r.get("pnl") or 0.0 for r in closed]
+        return {
+            "total_trades": len(closed),
+            "win_rate": wins / len(closed) if closed else 0.0,
+            "avg_pnl": sum(pnls) / len(pnls),
+            "total_pnl": sum(pnls),
+            "best_trade": max(pnls),
+            "worst_trade": min(pnls),
+        }
+
     # ── Retention ─────────────────────────────────────────────────────────
     def apply_retention(self, max_age_days: int = 30) -> int:
         """Delete tick/candle data older than max_age_days."""

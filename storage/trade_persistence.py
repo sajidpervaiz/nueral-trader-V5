@@ -343,18 +343,18 @@ class TradePersistence:
             for stmt in AUDIT_ALTER_COLUMNS:
                 try:
                     await conn.execute(stmt)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Audit ALTER column skipped (may already exist): {}", exc)
             for idx in TRADING_INDEXES:
                 try:
                     await conn.execute(idx)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Trading index creation skipped: {}", exc)
             for stmt in TRADING_HYPERTABLES:
                 try:
                     await conn.execute(stmt)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Trading hypertable creation skipped: {}", exc)
         logger.info("Trade persistence schema migrated (incl. audit tables)")
 
     def subscribe_events(self) -> None:

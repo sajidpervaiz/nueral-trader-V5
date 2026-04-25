@@ -900,7 +900,8 @@ class SignalGenerator:
             df = self.data_manager.get_dataframe("binance", target_symbol, self._primary_tf)
         except TypeError:
             df = self.data_manager.get_dataframe("binance", target_symbol)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to get dataframe for {}: {}", target_symbol, exc)
             df = None
 
         if df is None or len(df) < 30:
@@ -1045,7 +1046,8 @@ class SignalGenerator:
                 df = self.data_manager.get_dataframe("binance", symbol, self._primary_tf)
             except TypeError:
                 df = self.data_manager.get_dataframe("binance", symbol)
-            except Exception:
+            except Exception as exc:
+                logger.warning("ML bootstrap: failed to get dataframe for {}: {}", symbol, exc)
                 df = None
 
             if df is None or len(df) < self._ml_bootstrap_min_rows:

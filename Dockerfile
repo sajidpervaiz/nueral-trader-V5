@@ -53,14 +53,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install TA-Lib
-RUN curl -L http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz | tar xz \
+# Install TA-Lib from GitHub releases (HTTPS, not SourceForge HTTP)
+RUN curl -fsSL https://github.com/ta-lib/ta-lib/releases/download/v0.6.4/ta-lib-0.6.4-src.tar.gz -o ta-lib.tar.gz \
+    && tar xzf ta-lib.tar.gz \
     && cd ta-lib/ \
     && ./configure --prefix=/usr \
     && make -j$(nproc) \
     && make install \
     && cd .. \
-    && rm -rf ta-lib/
+    && rm -rf ta-lib/ ta-lib.tar.gz
 
 # Stage 4: Python gateway service
 FROM python-base AS python-gateway

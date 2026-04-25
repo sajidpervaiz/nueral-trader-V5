@@ -70,8 +70,8 @@ class Cache:
             return
         try:
             await self._client.delete(key)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Cache delete failed for key '{}': {}", key, exc)
 
     async def publish(self, channel: str, message: Any) -> None:
         if self._client is None:

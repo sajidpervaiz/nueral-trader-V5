@@ -17,6 +17,7 @@ Triggers:
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -52,6 +53,7 @@ class SafeModeManager:
     def __init__(self) -> None:
         self._active_reasons: dict[SafeModeReason, SafeModeEvent] = {}
         self._history: list[dict[str, Any]] = []
+        self._lock = asyncio.Lock()
 
     # ── Queries ───────────────────────────────────────────────────────────
     @property
@@ -67,8 +69,25 @@ class SafeModeManager:
         return list(self._active_reasons.values())
 
     # ── Mutations ─────────────────────────────────────────────────────────
-    def activate(self, reason: SafeModeReason, detail: str = "") -> None:
+    async def activate(self, reason: SafeModeReason, detail: str = "") -> None:
         """Activate safe mode for *reason*.  Idempotent — re-activation updates detail."""
+        async with self._lock:
+            was_active = self.is_active
+            event = SafeModeEvent(reason=reason, timestamp=time.time(), detail=detail)
+            self._active_reasons[reason] = event
+            self._history.append({
+                "action": "activate",
+                "reason": reason.value,
+                "detail": detail,
+                "timestamp": event.timestamp,
+            })
+        if not was_active:
+            logger.critical("SAFE MODE ACTIVATED — reason: {} ({})", reason.value, detail)
+        else:
+            logger.warning("Safe mode reason added: {} ({})", reason.value, detail)
+
+    def activate_sync(self, reason: SafeModeReason, detail: str = "") -> None:
+        """Synchronous activate for non-async contexts (e.g. callbacks)."""
         was_active = self.is_active
         event = SafeModeEvent(reason=reason, timestamp=time.time(), detail=detail)
         self._active_reasons[reason] = event
@@ -83,28 +102,30 @@ class SafeModeManager:
         else:
             logger.warning("Safe mode reason added: {} ({})", reason.value, detail)
 
-    def deactivate(self, reason: SafeModeReason) -> bool:
+    async def deactivate(self, reason: SafeModeReason) -> bool:
         """Clear a single reason.  Returns True if safe mode is now fully clear."""
-        removed = self._active_reasons.pop(reason, None)
-        if removed:
+        async with self._lock:
+            removed = self._active_reasons.pop(reason, None)
+            if removed:
+                self._history.append({
+                    "action": "deactivate",
+                    "reason": reason.value,
+                    "timestamp": time.time(),
+                })
+                logger.info("Safe mode reason cleared: {}", reason.value)
+            fully_clear = not self.is_active
+        if fully_clear:
+            logger.info("SAFE MODE FULLY CLEARED — normal operation resumed")
+        return fully_clear
+
+    async def clear_all(self) -> None:
+        """Force-clear all reasons (admin override)."""
+        async with self._lock:
+            self._active_reasons.clear()
             self._history.append({
-                "action": "deactivate",
-                "reason": reason.value,
+                "action": "clear_all",
                 "timestamp": time.time(),
             })
-            logger.info("Safe mode reason cleared: {}", reason.value)
-        if not self.is_active:
-            logger.info("SAFE MODE FULLY CLEARED — normal operation resumed")
-            return True
-        return False
-
-    def clear_all(self) -> None:
-        """Force-clear all reasons (admin override)."""
-        self._active_reasons.clear()
-        self._history.append({
-            "action": "clear_all",
-            "timestamp": time.time(),
-        })
         logger.info("SAFE MODE force-cleared (all reasons)")
 
     def get_status(self) -> dict[str, Any]:

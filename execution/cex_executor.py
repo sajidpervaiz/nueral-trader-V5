@@ -99,8 +99,8 @@ class CEXExecutor:
                 try:
                     pm = await self._client.fapiPrivateGetPositionSideDual()
                     hedge_mode = bool(pm.get("dualSidePosition", False))
-                except Exception:
-                    pass  # default to one-way
+                except Exception as exc:
+                    logger.debug("Hedge mode detection failed, defaulting to one-way: {}", exc)
             # Create exchange-side order placer for SL/TP
             working_type = str(cfg.get("working_type", "CONTRACT_PRICE"))
             self._order_placer = ExchangeOrderPlacer(
@@ -128,8 +128,8 @@ class CEXExecutor:
             # Pre-warm HTTP connection pool to eliminate cold-start latency
             try:
                 await self._client.fetch_ticker(symbols[0] if symbols else "BTC/USDT:USDT")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Pre-warm fetch_ticker failed: {}", exc)
         except Exception as exc:
             logger.warning("{} client init failed: {}", self.exchange_id, exc)
             self._client = None
@@ -319,7 +319,8 @@ class CEXExecutor:
             try:
                 await self._rate_limiter.acquire()
                 fetched = await self._client.fetch_order(order_id, signal.symbol)
-            except Exception:
+            except Exception as exc:
+                logger.debug("fetch_order failed during fill wait (will retry): {}", exc)
                 continue
             status = fetched.get("status", "")
             if status in ("closed", "filled"):
@@ -353,7 +354,8 @@ class CEXExecutor:
             already_filled = float(final_state.get("filled", 0))
             if final_state.get("status") in ("closed", "filled"):
                 return final_state  # fully filled during cancel — no market needed
-        except Exception:
+        except Exception as exc:
+            logger.warning("fetch_order after cancel failed, assuming no fill: {}", exc)
             already_filled = 0.0
 
         remaining = amount - already_filled
@@ -551,7 +553,7 @@ class CEXExecutor:
         # Trip the circuit breaker to prevent new entries while stream is down
         self.risk_manager._circuit_breaker.trip("user_stream_disconnected")
         # Activate safe mode
-        self.risk_manager.safe_mode.activate(
+        await self.risk_manager.safe_mode.activate(
             SafeModeReason.USER_STREAM_LOST,
             detail=f"exchange={self.exchange_id}",
         )
@@ -565,7 +567,7 @@ class CEXExecutor:
         elif cb.tripped and cb.trip_reason.startswith("reconciliation_mismatch"):
             cb.reset()
             logger.info("Circuit breaker reset after reconciliation recovery")
-        self.risk_manager.safe_mode.deactivate(SafeModeReason.USER_STREAM_LOST)
+        await self.risk_manager.safe_mode.deactivate(SafeModeReason.USER_STREAM_LOST)
 
     async def run(self) -> None:
         self._running = True

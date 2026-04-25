@@ -86,8 +86,8 @@ class UserDataStream:
         risk_cfg = {}
         try:
             risk_cfg = config.get_value("risk") or {}
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to read risk config: {}", exc)
         self._safe_mode_threshold: float = float(
             risk_cfg.get("user_stream_safe_mode_seconds", 0)
         )
@@ -172,8 +172,8 @@ class UserDataStream:
         if self._ws:
             try:
                 await self._ws.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("WebSocket close error during reconnect: {}", exc)
 
     async def _keepalive_loop(self) -> None:
         """Background task to send keepalive every 30 minutes."""
@@ -544,6 +544,6 @@ class UserDataStream:
         if self._ws:
             try:
                 await self._ws.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("WebSocket close error during stop: {}", exc)
         logger.info("User data stream stopped")
