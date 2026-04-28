@@ -30,14 +30,14 @@ class TestCandleAggregator:
         assert candle is None
 
     def test_second_tick_same_bucket_no_candle(self, aggregator: CandleAggregator) -> None:
-        aggregator.add_tick(_tick(1_000.0, 50000))
-        candle = aggregator.add_tick(_tick(1_030.0, 50100))
+        aggregator.add_tick(_tick(960.0, 50000))
+        candle = aggregator.add_tick(_tick(1_010.0, 50100))
         assert candle is None
 
     def test_new_bucket_completes_candle(self, aggregator: CandleAggregator) -> None:
-        aggregator.add_tick(_tick(1_000.0, 50000))
-        aggregator.add_tick(_tick(1_030.0, 50100))
-        candle = aggregator.add_tick(_tick(1_061.0, 50200))
+        aggregator.add_tick(_tick(960.0, 50000))
+        aggregator.add_tick(_tick(1_010.0, 50100))
+        candle = aggregator.add_tick(_tick(1_020.0, 50200))
         assert candle is not None
         assert candle.open == 50000.0
         assert candle.high == 50100.0
@@ -47,8 +47,8 @@ class TestCandleAggregator:
         assert candle.num_trades == 2
 
     def test_single_tick_candle(self, aggregator: CandleAggregator) -> None:
-        aggregator.add_tick(_tick(1_000.0, 50000, volume=3.0))
-        candle = aggregator.add_tick(_tick(1_061.0, 50200))
+        aggregator.add_tick(_tick(960.0, 50000, volume=3.0))
+        candle = aggregator.add_tick(_tick(1_020.0, 50200))
         assert candle is not None
         assert candle.open == candle.high == candle.low == candle.close == 50000.0
         assert candle.volume == pytest.approx(3.0)

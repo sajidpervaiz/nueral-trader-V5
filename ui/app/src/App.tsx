@@ -127,6 +127,30 @@ type ShadowSLSnapshot = {
   stops: Record<string, { symbol: string; stop_price: number; primary_placed: boolean; shadow_active: boolean; fallback_triggered: boolean }>;
 };
 
+type GeoPolState = {
+  config: {
+    enabled: boolean;
+    dry_run: boolean;
+    scan_interval_sec: number;
+    max_concurrent_trades: number;
+    margin_usd: number;
+    leverage: number;
+    min_phase1_confidence: number;
+    min_phase2_score: number;
+    llm_api_key: string;
+    llm_base_url: string;
+    llm_model: string;
+  };
+  running: boolean;
+  open_trades: number;
+  stats: {
+    total_trades?: number;
+    win_rate?: number;
+    avg_pnl_pct?: number;
+    total_pnl_usd?: number;
+  };
+};
+
 const API_BASE = import.meta.env.VITE_API_BASE ?? "/api";
 
 async function getJSON<T>(path: string): Promise<T> {
@@ -164,6 +188,8 @@ export default function App() {
   const [safeMode, setSafeMode] = useState<SafeModeInfo | null>(null);
   const [tradeHistory, setTradeHistory] = useState<TradeHistory[]>([]);
   const [shadowSL, setShadowSL] = useState<ShadowSLSnapshot | null>(null);
+  const [geoState, setGeoState] = useState<GeoPolState | null>(null);
+  const [geoSaving, setGeoSaving] = useState(false);
   const [symbol, setSymbol] = useState("BTC");
   const [timeframe, setTimeframe] = useState("1m");
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
@@ -179,7 +205,7 @@ export default function App() {
 
     const load = async () => {
       try {
-        const [statusData, marketData, candleData, indicatorData, fgData, obData, poolsData, newsData, logsData, autoData, armsSnap, tradesData, shadowData] = await Promise.all([
+        const [statusData, marketData, candleData, indicatorData, fgData, obData, poolsData, newsData, logsData, autoData, armsSnap, tradesData, shadowData, geoData] = await Promise.all([
           getJSON<Status>("/status"),
           getJSON<{ coins: Coin[] }>("/market?per_page=12"),
           getJSON<{ candles: Candle[] }>(`/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=160`),
@@ -193,6 +219,7 @@ export default function App() {
           getJSON<ArmsSnapshot>("/risk/arms/snapshot").catch(() => null),
           getJSON<{ trades: TradeHistory[] }>("/trades/history?limit=20").catch(() => ({ trades: [] })),
           getJSON<ShadowSLSnapshot>("/orders/shadow-sl").catch(() => null),
+          getJSON<GeoPolState>("/config/geo-political").catch(() => null),
         ]);
 
         if (!active) return;
@@ -212,6 +239,7 @@ export default function App() {
         }
         setTradeHistory(tradesData.trades ?? []);
         if (shadowData) setShadowSL(shadowData);
+        if (geoData) setGeoState(geoData);
       } catch (error: any) {
         if (!active) return;
         setMessage(`Data refresh failed: ${error?.message ?? "unknown"}`);
@@ -307,6 +335,27 @@ export default function App() {
       setMessage("Kill switch deactivated");
     } catch (error: any) {
       setMessage(`Kill switch deactivate failed: ${error?.message ?? "unknown"}`);
+    }
+  };
+
+  const saveGeoConfig = async (updates: Partial<GeoPolState["config"]>) => {
+    if (!geoState) return;
+    setGeoSaving(true);
+    try {
+      const body = { ...geoState.config, ...updates };
+      const res = await fetch(`${API_BASE}/config/geo-political`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.detail ?? `HTTP ${res.status}`);
+      setGeoState((prev) => prev ? { ...prev, config: data.config } : prev);
+      setMessage("Geo-political config saved");
+    } catch (error: any) {
+      setMessage(`Geo config save failed: ${error?.message ?? "unknown"}`);
+    } finally {
+      setGeoSaving(false);
     }
   };
 
@@ -646,6 +695,142 @@ export default function App() {
                   <span>{s.primary_placed ? "✓" : s.shadow_active ? "⚠" : "..."} @ {s.stop_price.toFixed(2)}</span>
                 </div>
               ))}
+            </section>
+          )}
+
+          {/* Geo-Political Strategy Config */}
+          {geoState && (
+            <section className="panel-block">
+              <div className="panel-title">
+                Geo-Political Strategy
+                <span className={geoState.running ? "pos" : "neg"} style={{ marginLeft: 8, fontSize: "0.75em" }}>
+                  {geoState.running ? "RUNNING" : "STOPPED"}
+                </span>
+              </div>
+              <div className="arms-grid">
+                <div className="arms-item">
+                  <span>Open Trades</span>
+                  <span>{geoState.open_trades}</span>
+                </div>
+                <div className="arms-item">
+                  <span>Total Trades</span>
+                  <span>{geoState.stats.total_trades ?? 0}</span>
+                </div>
+                <div className="arms-item">
+                  <span>Win Rate</span>
+                  <span>{geoState.stats.win_rate?.toFixed(1) ?? "0"}%</span>
+                </div>
+                <div className="arms-item">
+                  <span>Total PnL</span>
+                  <span className={(geoState.stats.total_pnl_usd ?? 0) >= 0 ? "pos" : "neg"}>
+                    ${(geoState.stats.total_pnl_usd ?? 0).toFixed(2)}
+                  </span>
+                </div>
+              </div>
+              <div className="trade-form" style={{ marginTop: 8 }}>
+                <div className="form-row two">
+                  <label>
+                    Dry Run
+                    <select
+                      value={geoState.config.dry_run ? "true" : "false"}
+                      onChange={(e) => saveGeoConfig({ dry_run: e.target.value === "true" })}
+                      disabled={geoSaving}
+                    >
+                      <option value="true">Yes (log only)</option>
+                      <option value="false">No (paper trade)</option>
+                    </select>
+                  </label>
+                  <label>
+                    Scan Interval
+                    <select
+                      value={geoState.config.scan_interval_sec}
+                      onChange={(e) => saveGeoConfig({ scan_interval_sec: Number(e.target.value) })}
+                      disabled={geoSaving}
+                    >
+                      <option value="60">60s</option>
+                      <option value="120">120s</option>
+                      <option value="300">300s</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="form-row two">
+                  <label>
+                    Margin $
+                    <input
+                      type="number" min="1" max="100" step="1"
+                      value={geoState.config.margin_usd}
+                      onChange={(e) => saveGeoConfig({ margin_usd: Number(e.target.value) })}
+                      disabled={geoSaving}
+                    />
+                  </label>
+                  <label>
+                    Leverage
+                    <input
+                      type="number" min="1" max="20"
+                      value={geoState.config.leverage}
+                      onChange={(e) => saveGeoConfig({ leverage: Number(e.target.value) })}
+                      disabled={geoSaving}
+                    />
+                  </label>
+                </div>
+                <div className="form-row two">
+                  <label>
+                    Max Concurrent
+                    <input
+                      type="number" min="1" max="10"
+                      value={geoState.config.max_concurrent_trades}
+                      onChange={(e) => saveGeoConfig({ max_concurrent_trades: Number(e.target.value) })}
+                      disabled={geoSaving}
+                    />
+                  </label>
+                  <label>
+                    Min P1 Conf
+                    <input
+                      type="number" min="0" max="100"
+                      value={geoState.config.min_phase1_confidence}
+                      onChange={(e) => saveGeoConfig({ min_phase1_confidence: Number(e.target.value) })}
+                      disabled={geoSaving}
+                    />
+                  </label>
+                </div>
+                <div className="form-row two">
+                  <label>
+                    Min P2 Score
+                    <input
+                      type="number" min="0" max="100"
+                      value={geoState.config.min_phase2_score}
+                      onChange={(e) => saveGeoConfig({ min_phase2_score: Number(e.target.value) })}
+                      disabled={geoSaving}
+                    />
+                  </label>
+                  <label>
+                    LLM Model
+                    <input
+                      value={geoState.config.llm_model}
+                      onChange={(e) => saveGeoConfig({ llm_model: e.target.value })}
+                      disabled={geoSaving}
+                    />
+                  </label>
+                </div>
+                <label style={{ display: "block", marginTop: 4 }}>
+                  LLM API Key
+                  <input
+                    type="password"
+                    placeholder={geoState.config.llm_api_key || "Not set"}
+                    onBlur={(e) => { if (e.target.value) saveGeoConfig({ llm_api_key: e.target.value }); }}
+                    disabled={geoSaving}
+                  />
+                </label>
+                <label style={{ display: "block", marginTop: 4 }}>
+                  LLM Base URL
+                  <input
+                    placeholder={geoState.config.llm_base_url || "https://api.openai.com/v1"}
+                    defaultValue={geoState.config.llm_base_url}
+                    onBlur={(e) => saveGeoConfig({ llm_base_url: e.target.value })}
+                    disabled={geoSaving}
+                  />
+                </label>
+              </div>
             </section>
           )}
 

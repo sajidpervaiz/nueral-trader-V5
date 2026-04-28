@@ -567,7 +567,7 @@ class TestHealthEndpoint:
         from interface.dashboard_api import build_app
 
         sm = SafeModeManager()
-        sm.activate(SafeModeReason.MANUAL)
+        sm.activate_sync(SafeModeReason.MANUAL)
 
         @dataclass
         class FakeRM:

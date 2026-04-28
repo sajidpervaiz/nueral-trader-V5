@@ -275,6 +275,20 @@ jupyter:
   token: "${JUPYTER_TOKEN:-}"
   allow_root: false
 
+# ── Geo-Political News-Driven Strategy ────────────────────────────────────────
+geo_political:
+  enabled: true
+  scan_interval_sec: 120
+  max_concurrent_trades: 3
+  margin_usd: 5.0
+  leverage: 5
+  min_phase1_confidence: 60
+  min_phase2_score: 60
+  dry_run: false
+  llm_api_key: "${GEO_LLM_API_KEY:-}"
+  llm_base_url: "${GEO_LLM_BASE_URL:-}"
+  llm_model: "${GEO_LLM_MODEL:-gpt-4o-mini}"
+
 # ── ARMS-V2.1 Strategy Configuration ─────────────────────────────────────────
 arms:
   regime:

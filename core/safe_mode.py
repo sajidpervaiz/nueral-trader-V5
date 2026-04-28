@@ -105,28 +105,46 @@ class SafeModeManager:
     async def deactivate(self, reason: SafeModeReason) -> bool:
         """Clear a single reason.  Returns True if safe mode is now fully clear."""
         async with self._lock:
-            removed = self._active_reasons.pop(reason, None)
-            if removed:
-                self._history.append({
-                    "action": "deactivate",
-                    "reason": reason.value,
-                    "timestamp": time.time(),
-                })
-                logger.info("Safe mode reason cleared: {}", reason.value)
-            fully_clear = not self.is_active
-        if fully_clear:
+            result = self._deactivate_internal(reason)
+        if result:
             logger.info("SAFE MODE FULLY CLEARED — normal operation resumed")
-        return fully_clear
+        return result
+
+    def deactivate_sync(self, reason: SafeModeReason) -> bool:
+        """Synchronous deactivate for non-async contexts."""
+        result = self._deactivate_internal(reason)
+        if result:
+            logger.info("SAFE MODE FULLY CLEARED — normal operation resumed")
+        return result
+
+    def _deactivate_internal(self, reason: SafeModeReason) -> bool:
+        removed = self._active_reasons.pop(reason, None)
+        if removed:
+            self._history.append({
+                "action": "deactivate",
+                "reason": reason.value,
+                "timestamp": time.time(),
+            })
+            logger.info("Safe mode reason cleared: {}", reason.value)
+        return not self.is_active
 
     async def clear_all(self) -> None:
         """Force-clear all reasons (admin override)."""
         async with self._lock:
-            self._active_reasons.clear()
-            self._history.append({
-                "action": "clear_all",
-                "timestamp": time.time(),
-            })
+            self._clear_all_internal()
         logger.info("SAFE MODE force-cleared (all reasons)")
+
+    def clear_all_sync(self) -> None:
+        """Synchronous clear_all for non-async contexts."""
+        self._clear_all_internal()
+        logger.info("SAFE MODE force-cleared (all reasons)")
+
+    def _clear_all_internal(self) -> None:
+        self._active_reasons.clear()
+        self._history.append({
+            "action": "clear_all",
+            "timestamp": time.time(),
+        })
 
     def get_status(self) -> dict[str, Any]:
         return {

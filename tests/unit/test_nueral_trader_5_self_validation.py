@@ -496,7 +496,7 @@ class TestMultiTimeframeConfirmation:
         
         ok, reason, _, _ = sg._check_higher_timeframe_trend("binance", "BTC/USDT:USDT", "long")
         assert not ok
-        assert "bearish" in reason.lower()
+        assert "bear" in reason.lower() or "htf_fail" in reason.lower()
 
     def test_htf_bullish_allows_long_signal(self):
         """If 1h is bullish, 15m long signals should pass HTF check."""

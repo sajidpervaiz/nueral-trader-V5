@@ -354,6 +354,21 @@ async def main() -> None:
     if app is not None:
         tasks.append(asyncio.create_task(run_dashboard(config, app), name="dashboard"))
 
+    # ── Geo-Political News-Driven Strategy ────────────────────────────────
+    geo_strategy = None
+    geo_cfg = config.get_value("geo_political") or {}
+    if geo_cfg.get("enabled", False):
+        try:
+            from strategies.geo_political_strategy import GeoPolStrategy
+            geo_strategy = GeoPolStrategy(config=geo_cfg, event_bus=event_bus)
+            tasks.append(asyncio.create_task(geo_strategy.run(), name="geo_political"))
+            logger.info("Geo-political strategy enabled")
+            # Expose to dashboard config API for runtime updates
+            from interface.routes.config import set_geo_strategy
+            set_geo_strategy(geo_strategy)
+        except Exception as exc:
+            logger.warning("Geo-political strategy init failed: {}", exc)
+
     await stop_event.wait()
     logger.info("Initiating graceful shutdown…")
 
@@ -395,6 +410,8 @@ async def main() -> None:
     await orderbook_feed.stop()
     await telegram.stop()
     await order_mgr.stop()
+    if geo_strategy is not None:
+        await geo_strategy.stop()
     await db.close()
 
     logger.info("Shutdown complete")

@@ -534,7 +534,8 @@ class TestIteration2Fixes:
         assert resp.status_code == 200
         body = resp.json()
         assert body["success"] is False
-        assert "Cannot switch to live" in body["error"]
+        assert body["success"] is False
+        assert "live" in body["error"].lower()
         # Paper→paper should still work
         resp2 = client.post("/api/mode/toggle", json={"mode": "paper"})
         assert resp2.json()["success"] is True

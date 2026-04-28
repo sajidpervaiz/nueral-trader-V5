@@ -1,7 +1,7 @@
 """Unit tests for FedCalendar behavior."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -23,7 +23,7 @@ async def test_initialize_builds_event_index_for_countdown() -> None:
 
 def test_is_fomc_week_uses_next_upcoming_event() -> None:
     calendar = FedCalendar(enable_paper_mode=True)
-    now = datetime.now()
+    now = datetime.now(tz=timezone.utc)
     calendar.events = [
         FedEvent(
             event_id="past_fomc",

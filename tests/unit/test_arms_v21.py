@@ -100,7 +100,7 @@ def _make_config(**overrides: Any) -> MagicMock:
         "stop_loss_pct": 0.015,
     }
     risk.update(overrides)
-    cfg.get_value = lambda key: risk if key == "risk" else {}
+    cfg.get_value = lambda *args, **kwargs: risk if args and args[0] == "risk" else {}
     return cfg
 
 

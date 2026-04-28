@@ -16,6 +16,7 @@ router = APIRouter(prefix="/config", tags=["config"])
 _CONFIG: Optional[Config] = None
 _RISK_MANAGER: Optional[RiskManager] = None
 _ORDER_MANAGER: Optional[OrderManager] = None
+_GEO_STRATEGY: Any = None
 
 
 def configure_config_routes(
@@ -29,6 +30,12 @@ def configure_config_routes(
     _ORDER_MANAGER = order_manager
     if _CONFIG is not None:
         _TRADING_MODE = TradingMode.PAPER if bool(getattr(_CONFIG, "paper_mode", True)) else TradingMode.LIVE
+
+
+def set_geo_strategy(strategy: Any) -> None:
+    """Set the geo-political strategy instance for runtime config updates."""
+    global _GEO_STRATEGY
+    _GEO_STRATEGY = strategy
 
 
 class TradingMode(str, Enum):
@@ -342,4 +349,121 @@ async def get_config_history(
 
     except Exception as e:
         logger.error(f"Error fetching config history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Geo-Political Strategy Config ────────────────────────────────────────────
+
+
+class GeoPolConfig(BaseModel):
+    enabled: bool = True
+    dry_run: bool = False
+    scan_interval_sec: int = Field(120, ge=30, le=600)
+    max_concurrent_trades: int = Field(3, ge=1, le=10)
+    margin_usd: float = Field(5.0, ge=1.0, le=100.0)
+    leverage: int = Field(5, ge=1, le=20)
+    min_phase1_confidence: int = Field(60, ge=0, le=100)
+    min_phase2_score: int = Field(60, ge=0, le=100)
+    llm_api_key: str = ""
+    llm_base_url: str = ""
+    llm_model: str = "gpt-4o-mini"
+
+
+class GeoPolStatus(BaseModel):
+    config: GeoPolConfig
+    running: bool
+    open_trades: int
+    stats: Dict[str, Any]
+
+
+def _read_geo_config() -> GeoPolConfig:
+    """Read current geo-political config from strategy instance or settings."""
+    if _GEO_STRATEGY is not None:
+        return GeoPolConfig(
+            enabled=True,
+            dry_run=bool(_GEO_STRATEGY._dry_run),
+            scan_interval_sec=int(_GEO_STRATEGY._scan_interval),
+            max_concurrent_trades=int(_GEO_STRATEGY._max_concurrent),
+            margin_usd=float(_GEO_STRATEGY._margin_usd),
+            leverage=int(_GEO_STRATEGY._leverage),
+            min_phase1_confidence=int(_GEO_STRATEGY._min_p1_conf),
+            min_phase2_score=int(_GEO_STRATEGY._min_p2_score),
+            llm_api_key=_mask_key(_GEO_STRATEGY._llm.api_key),
+            llm_base_url=_GEO_STRATEGY._llm.base_url,
+            llm_model=_GEO_STRATEGY._llm.model,
+        )
+    cfg = _CONFIG.get_value("geo_political", default={}) if _CONFIG else {}
+    return GeoPolConfig(
+        enabled=bool(cfg.get("enabled", False)),
+        dry_run=bool(cfg.get("dry_run", False)),
+        scan_interval_sec=int(cfg.get("scan_interval_sec", 120)),
+        max_concurrent_trades=int(cfg.get("max_concurrent_trades", 3)),
+        margin_usd=float(cfg.get("margin_usd", 5.0)),
+        leverage=int(cfg.get("leverage", 5)),
+        min_phase1_confidence=int(cfg.get("min_phase1_confidence", 60)),
+        min_phase2_score=int(cfg.get("min_phase2_score", 60)),
+        llm_api_key=_mask_key(str(cfg.get("llm_api_key", ""))),
+        llm_base_url=str(cfg.get("llm_base_url", "")),
+        llm_model=str(cfg.get("llm_model", "gpt-4o-mini")),
+    )
+
+
+def _mask_key(key: str) -> str:
+    if not key or len(key) < 8:
+        return "***" if key else ""
+    return key[:4] + "***" + key[-4:]
+
+
+@router.get("/geo-political")
+async def get_geo_config():
+    """Get geo-political strategy configuration and status."""
+    try:
+        cfg = _read_geo_config()
+        running = bool(_GEO_STRATEGY is not None and _GEO_STRATEGY._running)
+        open_trades = 0
+        stats: Dict[str, Any] = {}
+        if _GEO_STRATEGY is not None:
+            open_trades = _GEO_STRATEGY._ledger.get_open_count()
+            stats = _GEO_STRATEGY._ledger.get_stats()
+        return GeoPolStatus(config=cfg, running=running, open_trades=open_trades, stats=stats).dict()
+    except Exception as e:
+        logger.error(f"Error fetching geo config: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/geo-political")
+async def set_geo_config(update: GeoPolConfig = Body(...)):
+    """Update geo-political strategy configuration at runtime."""
+    try:
+        if _GEO_STRATEGY is None:
+            raise HTTPException(status_code=400, detail="Geo-political strategy is not running")
+
+        _GEO_STRATEGY._dry_run = update.dry_run
+        _GEO_STRATEGY._scan_interval = update.scan_interval_sec
+        _GEO_STRATEGY._max_concurrent = update.max_concurrent_trades
+        _GEO_STRATEGY._margin_usd = update.margin_usd
+        _GEO_STRATEGY._leverage = update.leverage
+        _GEO_STRATEGY._min_p1_conf = update.min_phase1_confidence
+        _GEO_STRATEGY._min_p2_score = update.min_phase2_score
+
+        # Update LLM settings (only if a real key is provided, not masked)
+        if update.llm_api_key and "***" not in update.llm_api_key:
+            _GEO_STRATEGY._llm.api_key = update.llm_api_key
+        if update.llm_base_url:
+            _GEO_STRATEGY._llm.base_url = update.llm_base_url
+        if update.llm_model:
+            _GEO_STRATEGY._llm.model = update.llm_model
+
+        _record_change("geo_political", update.dict(exclude={"llm_api_key"}))
+        logger.info("Geo-political config updated: dry_run={}, margin=${}", update.dry_run, update.margin_usd)
+
+        return {
+            "success": True,
+            "config": _read_geo_config().dict(),
+            "message": "Geo-political strategy configuration updated",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error setting geo config: {e}")
         raise HTTPException(status_code=500, detail=str(e))

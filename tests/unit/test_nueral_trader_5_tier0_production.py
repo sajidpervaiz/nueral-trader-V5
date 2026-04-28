@@ -387,7 +387,7 @@ class TestOrderManager:
         assert cancel_success is True
         assert cancelled_order.status == OrderStatus.CANCELLED
 
-    def test_order_manager_stats(self):
+    def test_order_manager_stats(self, tmp_path):
         """Should report accurate statistics"""
         from core.config import Config
         from core.event_bus import EventBus
@@ -395,7 +395,11 @@ class TestOrderManager:
         config = Config(config_path=CONFIG_PATH)
         event_bus = EventBus()
         breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=60)
-        manager = OrderManager(config, event_bus, breaker)
+        manager = OrderManager(
+            config, event_bus, breaker,
+            audit_log_path=str(tmp_path / "audit.jsonl"),
+            order_state_path=str(tmp_path / "order_state.json"),
+        )
 
         stats = manager.get_stats()
         assert stats["total_orders"] == 0

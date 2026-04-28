@@ -1,7 +1,7 @@
 """Unit tests for EconomicReleases schedule fallback behavior."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -18,7 +18,7 @@ async def test_scheduled_releases_added_in_non_paper_mode() -> None:
             release_id="hist_cpi",
             indicator_type=IndicatorType.CPI,
             title="Historical CPI",
-            release_date=datetime.now() - timedelta(days=30),
+            release_date=datetime.now(tz=timezone.utc) - timedelta(days=30),
             actual=3.0,
             importance=5,
         )
@@ -26,7 +26,7 @@ async def test_scheduled_releases_added_in_non_paper_mode() -> None:
 
     await releases._load_scheduled_releases()
 
-    upcoming = [r for r in releases.releases if r.release_date > datetime.now()]
+    upcoming = [r for r in releases.releases if r.release_date > datetime.now(tz=timezone.utc)]
     upcoming_types = {r.indicator_type for r in upcoming}
 
     assert IndicatorType.CPI in upcoming_types

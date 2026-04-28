@@ -912,6 +912,9 @@ class TestCEXExecutorUserStream:
         self.risk_mgr.close_position = AsyncMock(return_value=None)
         self.risk_mgr.open_position = AsyncMock()
         self.risk_mgr.activate_kill_switch = AsyncMock(return_value=[])
+        self.risk_mgr.safe_mode = MagicMock()
+        self.risk_mgr.safe_mode.activate = AsyncMock()
+        self.risk_mgr.safe_mode.deactivate = AsyncMock()
 
         self.executor = CEXExecutor(self.config, self.event_bus, self.risk_mgr, "binance")
 

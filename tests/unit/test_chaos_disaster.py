@@ -128,48 +128,48 @@ class TestSafeModeManager:
 
     def test_activate_single_reason(self):
         sm = SafeModeManager()
-        sm.activate(SafeModeReason.WEBSOCKET_DISCONNECT, "test")
+        sm.activate_sync(SafeModeReason.WEBSOCKET_DISCONNECT, "test")
         assert sm.is_active
         assert SafeModeReason.WEBSOCKET_DISCONNECT in sm.active_reasons
 
     def test_deactivate_clears_reason(self):
         sm = SafeModeManager()
-        sm.activate(SafeModeReason.DB_OUTAGE)
-        sm.deactivate(SafeModeReason.DB_OUTAGE)
+        sm.activate_sync(SafeModeReason.DB_OUTAGE)
+        sm.deactivate_sync(SafeModeReason.DB_OUTAGE)
         assert not sm.is_active
 
     def test_multiple_reasons_require_all_cleared(self):
         sm = SafeModeManager()
-        sm.activate(SafeModeReason.WEBSOCKET_DISCONNECT)
-        sm.activate(SafeModeReason.DB_OUTAGE)
-        sm.deactivate(SafeModeReason.WEBSOCKET_DISCONNECT)
+        sm.activate_sync(SafeModeReason.WEBSOCKET_DISCONNECT)
+        sm.activate_sync(SafeModeReason.DB_OUTAGE)
+        sm.deactivate_sync(SafeModeReason.WEBSOCKET_DISCONNECT)
         assert sm.is_active  # DB_OUTAGE still active
-        sm.deactivate(SafeModeReason.DB_OUTAGE)
+        sm.deactivate_sync(SafeModeReason.DB_OUTAGE)
         assert not sm.is_active
 
     def test_clear_all_force_clears(self):
         sm = SafeModeManager()
-        sm.activate(SafeModeReason.WEBSOCKET_DISCONNECT)
-        sm.activate(SafeModeReason.DB_OUTAGE)
-        sm.activate(SafeModeReason.EXTREME_VOLATILITY)
-        sm.clear_all()
+        sm.activate_sync(SafeModeReason.WEBSOCKET_DISCONNECT)
+        sm.activate_sync(SafeModeReason.DB_OUTAGE)
+        sm.activate_sync(SafeModeReason.EXTREME_VOLATILITY)
+        sm.clear_all_sync()
         assert not sm.is_active
 
     def test_idempotent_activation(self):
         sm = SafeModeManager()
-        sm.activate(SafeModeReason.WEBSOCKET_DISCONNECT, "first")
-        sm.activate(SafeModeReason.WEBSOCKET_DISCONNECT, "updated")
+        sm.activate_sync(SafeModeReason.WEBSOCKET_DISCONNECT, "first")
+        sm.activate_sync(SafeModeReason.WEBSOCKET_DISCONNECT, "updated")
         assert len(sm.active_reasons) == 1
         assert sm.active_events[0].detail == "updated"
 
     def test_deactivate_nonexistent_is_safe(self):
         sm = SafeModeManager()
-        result = sm.deactivate(SafeModeReason.DB_OUTAGE)
+        result = sm.deactivate_sync(SafeModeReason.DB_OUTAGE)
         assert result is True  # no reasons left = fully clear
 
     def test_get_status(self):
         sm = SafeModeManager()
-        sm.activate(SafeModeReason.MANUAL, "test")
+        sm.activate_sync(SafeModeReason.MANUAL, "test")
         status = sm.get_status()
         assert status["safe_mode_active"] is True
         assert len(status["active_reasons"]) == 1
@@ -177,8 +177,8 @@ class TestSafeModeManager:
 
     def test_history_records_all_actions(self):
         sm = SafeModeManager()
-        sm.activate(SafeModeReason.DB_OUTAGE)
-        sm.deactivate(SafeModeReason.DB_OUTAGE)
+        sm.activate_sync(SafeModeReason.DB_OUTAGE)
+        sm.deactivate_sync(SafeModeReason.DB_OUTAGE)
         history = sm.get_history()
         assert len(history) == 2
         assert history[0]["action"] == "activate"
@@ -193,7 +193,7 @@ class TestSafeModeBlocksTrades:
     def test_safe_mode_rejects_signal(self):
         sm = SafeModeManager()
         rm, bus = _make_risk_manager(safe_mode=sm)
-        sm.activate(SafeModeReason.WEBSOCKET_DISCONNECT)
+        sm.activate_sync(SafeModeReason.WEBSOCKET_DISCONNECT)
         signal = _make_signal()
         approved, reason, size = rm.approve_signal(signal)
         assert not approved
@@ -203,18 +203,17 @@ class TestSafeModeBlocksTrades:
     def test_safe_mode_cleared_allows_signal(self):
         sm = SafeModeManager()
         rm, bus = _make_risk_manager(safe_mode=sm)
-        sm.activate(SafeModeReason.WEBSOCKET_DISCONNECT)
-        sm.deactivate(SafeModeReason.WEBSOCKET_DISCONNECT)
+        sm.activate_sync(SafeModeReason.WEBSOCKET_DISCONNECT)
+        sm.deactivate_sync(SafeModeReason.WEBSOCKET_DISCONNECT)
         signal = _make_signal()
         approved, reason, size = rm.approve_signal(signal)
-        # May be rejected for other reasons (score, etc.) but NOT safe_mode
         assert "safe_mode_active" not in reason
 
     @pytest.mark.asyncio
     async def test_approve_and_open_blocked_in_safe_mode(self):
         sm = SafeModeManager()
         rm, bus = _make_risk_manager(safe_mode=sm)
-        sm.activate(SafeModeReason.DB_OUTAGE)
+        sm.activate_sync(SafeModeReason.DB_OUTAGE)
         signal = _make_signal()
         approved, reason, size, pos = await rm.approve_and_open(signal)
         assert not approved
@@ -225,8 +224,7 @@ class TestSafeModeBlocksTrades:
         sm = SafeModeManager()
         rm, bus = _make_risk_manager(safe_mode=sm)
         pos = _open_test_position(rm)
-        sm.activate(SafeModeReason.WEBSOCKET_DISCONNECT)
-        # Position should still exist
+        sm.activate_sync(SafeModeReason.WEBSOCKET_DISCONNECT)
         assert "binance:BTCUSDT" in rm._positions
         assert rm._positions["binance:BTCUSDT"].entry_price == 50_000.0
 
@@ -505,9 +503,9 @@ class TestMultipleSimultaneousFailures:
         injector = FaultInjector(event_bus=bus, risk_manager=rm, safe_mode=sm)
         await injector.simulate_websocket_disconnect()
         await injector.simulate_db_outage()
-        sm.deactivate(SafeModeReason.WEBSOCKET_DISCONNECT)
+        sm.deactivate_sync(SafeModeReason.WEBSOCKET_DISCONNECT)
         assert sm.is_active  # DB_OUTAGE still on
-        sm.deactivate(SafeModeReason.DB_OUTAGE)
+        sm.deactivate_sync(SafeModeReason.DB_OUTAGE)
         assert not sm.is_active
 
     @pytest.mark.asyncio
@@ -516,7 +514,7 @@ class TestMultipleSimultaneousFailures:
         rm, bus = _make_risk_manager(safe_mode=sm)
         injector = FaultInjector(event_bus=bus, risk_manager=rm, safe_mode=sm)
         await injector.run_all_faults()
-        sm.clear_all()
+        sm.clear_all_sync()
         assert not sm.is_active
 
 
@@ -736,7 +734,7 @@ class TestFullChaosRun:
         assert not approved
 
         # Recovery: clear all faults
-        sm.clear_all()
+        sm.clear_all_sync()
         assert not sm.is_active
 
         # New trades allowed again (safe_mode no longer blocking)
